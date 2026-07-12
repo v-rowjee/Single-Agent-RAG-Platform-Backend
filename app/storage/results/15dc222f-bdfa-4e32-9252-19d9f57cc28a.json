@@ -1,0 +1,418 @@
+{
+  "status": "success",
+  "sessionId": "15dc222f-bdfa-4e32-9252-19d9f57cc28a",
+  "dashboard": {
+    "title": "BMW Sales Data Analysis",
+    "executiveSummary": "This report provides an overview of BMW sales data from 2010 to 2024, highlighting key trends and insights.",
+    "kpis": [
+      {
+        "id": "kpi_engine_size_l",
+        "title": "Total Engine Size L",
+        "value": "162,359.00",
+        "rawValue": 162359.0,
+        "indicator": {
+          "kind": "note",
+          "text": "Calculated from Engine_Size_L"
+        }
+      },
+      {
+        "id": "kpi_mileage_km",
+        "title": "Total Mileage Km",
+        "value": "5,015,360,157.00",
+        "rawValue": 5015360157.0,
+        "indicator": {
+          "kind": "note",
+          "text": "Calculated from Mileage_KM"
+        }
+      },
+      {
+        "id": "kpi_price_usd",
+        "title": "Average Price Usd",
+        "value": "75,034.60",
+        "rawValue": 75034.6,
+        "indicator": {
+          "kind": "note",
+          "text": "Calculated from Price_USD"
+        }
+      },
+      {
+        "id": "kpi_sales_volume",
+        "title": "Total Sales Volume",
+        "value": "253,375,734.00",
+        "rawValue": 253375734.0,
+        "indicator": {
+          "kind": "note",
+          "text": "Calculated from Sales_Volume"
+        }
+      }
+    ],
+    "timeline": {
+      "id": "timeline_main",
+      "title": "Engine Size L over time",
+      "subtitle": "Sum by year",
+      "granularity": "year",
+      "unit": null,
+      "valueFormat": "number",
+      "actual": [
+        {
+          "period": "2010",
+          "label": "2010",
+          "value": 10850.2
+        },
+        {
+          "period": "2011",
+          "label": "2011",
+          "value": 10698.2
+        },
+        {
+          "period": "2012",
+          "label": "2012",
+          "value": 10793.2
+        },
+        {
+          "period": "2013",
+          "label": "2013",
+          "value": 10816.4
+        },
+        {
+          "period": "2014",
+          "label": "2014",
+          "value": 10810.4
+        },
+        {
+          "period": "2015",
+          "label": "2015",
+          "value": 10896.6
+        },
+        {
+          "period": "2016",
+          "label": "2016",
+          "value": 10940.4
+        },
+        {
+          "period": "2017",
+          "label": "2017",
+          "value": 10689.1
+        },
+        {
+          "period": "2018",
+          "label": "2018",
+          "value": 10601.4
+        },
+        {
+          "period": "2019",
+          "label": "2019",
+          "value": 10966.8
+        },
+        {
+          "period": "2020",
+          "label": "2020",
+          "value": 10405.8
+        },
+        {
+          "period": "2021",
+          "label": "2021",
+          "value": 11067.0
+        },
+        {
+          "period": "2022",
+          "label": "2022",
+          "value": 11337.7
+        },
+        {
+          "period": "2023",
+          "label": "2023",
+          "value": 10447.7
+        },
+        {
+          "period": "2024",
+          "label": "2024",
+          "value": 11038.1
+        }
+      ],
+      "anomalies": [],
+      "forecast": [],
+      "forecastMetadata": {
+        "available": false,
+        "model": null,
+        "horizon": 0,
+        "horizonUnit": "year",
+        "target": "Engine_Size_L",
+        "confidenceLevel": null
+      }
+    },
+    "supportingCharts": [
+      {
+        "id": "chart_bar",
+        "type": "bar",
+        "title": "Engine Size L by Model",
+        "subtitle": "Sum aggregation",
+        "valueFormat": "number",
+        "categories": [
+          "7 Series",
+          "i3",
+          "3 Series",
+          "i8",
+          "5 Series",
+          "X1"
+        ],
+        "series": [
+          {
+            "id": "series_bar",
+            "name": "Engine Size L",
+            "data": [
+              15204.5,
+              15067.1,
+              14946.9,
+              14927.2,
+              14892.0,
+              14770.3
+            ]
+          }
+        ],
+        "layout": {
+          "columnSpan": 1,
+          "rowSpan": 1
+        }
+      },
+      {
+        "id": "chart_donut",
+        "type": "donut",
+        "title": "Distribution by Model",
+        "subtitle": null,
+        "valueFormat": "number",
+        "segments": [
+          {
+            "id": "segment_1",
+            "label": "7 Series",
+            "value": 4666.0
+          },
+          {
+            "id": "segment_2",
+            "label": "i3",
+            "value": 4618.0
+          },
+          {
+            "id": "segment_3",
+            "label": "i8",
+            "value": 4606.0
+          },
+          {
+            "id": "segment_4",
+            "label": "3 Series",
+            "value": 4595.0
+          },
+          {
+            "id": "segment_5",
+            "label": "5 Series",
+            "value": 4592.0
+          },
+          {
+            "id": "segment_6",
+            "label": "X1",
+            "value": 4570.0
+          }
+        ],
+        "layout": {
+          "columnSpan": 1,
+          "rowSpan": 1
+        }
+      }
+    ],
+    "analysis": {
+      "businessSummary": "The data shows a steady increase in sales volume and engine size over the years, with the 7 Series being the top model in terms of engine size and sales volume.",
+      "keyFindings": [
+        "The average engine size of BMW cars is 3.25 liters.",
+        "The total sales volume from 2010 to 2024 is 253,375,734 units.",
+        "The 7 Series is the top model in terms of engine size and sales volume.",
+        "The sales volume has been steadily increasing over the years.",
+        "The average price of BMW cars is $75,034.6."
+      ]
+    },
+    "insights": {
+      "criticalAnomalies": [],
+      "warnings": [],
+      "limitations": [
+        {
+          "id": "limitation_1",
+          "title": "The data only includes sales data from 2010 to 2024.",
+          "description": "The data only includes sales data from 2010 to 2024.",
+          "severity": "warning",
+          "sourceIds": [
+            "kpi_engine_size_l",
+            "kpi_mileage_km",
+            "kpi_price_usd"
+          ]
+        },
+        {
+          "id": "limitation_2",
+          "title": "The data does not include information on market trends or competitor sales.",
+          "description": "The data does not include information on market trends or competitor sales.",
+          "severity": "warning",
+          "sourceIds": [
+            "kpi_engine_size_l",
+            "kpi_mileage_km",
+            "kpi_price_usd"
+          ]
+        },
+        {
+          "id": "limitation_3",
+          "title": "The data does not provide insights into customer preferences or demographics.",
+          "description": "The data does not provide insights into customer preferences or demographics.",
+          "severity": "warning",
+          "sourceIds": [
+            "kpi_engine_size_l",
+            "kpi_mileage_km",
+            "kpi_price_usd"
+          ]
+        }
+      ],
+      "opportunities": [
+        {
+          "id": "opportunity_1",
+          "title": "Expanding the product line to include more electric and hybrid models.",
+          "description": "Expanding the product line to include more electric and hybrid models.",
+          "severity": "info",
+          "sourceIds": [
+            "kpi_engine_size_l",
+            "kpi_mileage_km",
+            "kpi_price_usd"
+          ]
+        },
+        {
+          "id": "opportunity_2",
+          "title": "Increasing marketing efforts to target younger demographics.",
+          "description": "Increasing marketing efforts to target younger demographics.",
+          "severity": "info",
+          "sourceIds": [
+            "kpi_engine_size_l",
+            "kpi_mileage_km",
+            "kpi_price_usd"
+          ]
+        },
+        {
+          "id": "opportunity_3",
+          "title": "Improving customer service to increase customer loyalty.",
+          "description": "Improving customer service to increase customer loyalty.",
+          "severity": "info",
+          "sourceIds": [
+            "kpi_engine_size_l",
+            "kpi_mileage_km",
+            "kpi_price_usd"
+          ]
+        }
+      ]
+    },
+    "recommendedActions": [
+      {
+        "id": "action_1",
+        "title": "Conduct Market Research",
+        "description": "Conduct market research to understand customer preferences and demographics.",
+        "priority": "high",
+        "sourceIds": [
+          "kpi_engine_size_l",
+          "kpi_mileage_km",
+          "kpi_price_usd"
+        ]
+      },
+      {
+        "id": "action_2",
+        "title": "Expand Product Line",
+        "description": "Expand the product line to include more electric and hybrid models.",
+        "priority": "medium",
+        "sourceIds": [
+          "kpi_engine_size_l",
+          "kpi_mileage_km",
+          "kpi_price_usd"
+        ]
+      },
+      {
+        "id": "action_3",
+        "title": "Improve Customer Service",
+        "description": "Improve customer service to increase customer loyalty.",
+        "priority": "low",
+        "sourceIds": [
+          "kpi_engine_size_l",
+          "kpi_mileage_km",
+          "kpi_price_usd"
+        ]
+      }
+    ],
+    "datasetSummary": {
+      "fileName": "bmw_sales_data_2010_2024.csv",
+      "rowCount": 50000,
+      "columnCount": 11,
+      "timeField": "Year",
+      "period": {
+        "start": "2010-01-01T00:00:00",
+        "end": "2024-01-01T00:00:00",
+        "label": "2010-01-01 \u2013 2024-01-01"
+      },
+      "measures": [
+        "Engine_Size_L",
+        "Mileage_KM",
+        "Price_USD",
+        "Sales_Volume"
+      ],
+      "dimensions": [
+        "Model",
+        "Region",
+        "Color",
+        "Fuel_Type",
+        "Transmission",
+        "Sales_Classification"
+      ],
+      "quality": {
+        "completenessPercent": 100.0,
+        "missingValueCount": 0,
+        "duplicateRowCount": 0
+      },
+      "generatedAt": "2026-07-12T17:18:35.029921Z"
+    },
+    "sections": [
+      {
+        "id": "kpis",
+        "title": "Key Performance Indicators",
+        "order": 1,
+        "visible": true
+      },
+      {
+        "id": "timeline",
+        "title": "Timeline",
+        "order": 2,
+        "visible": true
+      },
+      {
+        "id": "supportingCharts",
+        "title": "Supporting Charts",
+        "order": 3,
+        "visible": true
+      },
+      {
+        "id": "details",
+        "title": "Business Details",
+        "order": 4,
+        "visible": true
+      }
+    ],
+    "layout": {
+      "kpis": {
+        "columns": 4,
+        "maxRows": 2
+      },
+      "timeline": {
+        "columnSpan": 12
+      },
+      "supportingCharts": {
+        "columns": 2,
+        "maxRows": 2
+      },
+      "details": {
+        "columns": 2,
+        "maxRows": 2
+      }
+    }
+  },
+  "warnings": [],
+  "errors": []
+}
