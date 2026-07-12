@@ -296,9 +296,10 @@ class BusinessIntelligenceService:
             )
 
             return (
-                f'You asked: "{query}". '
-                f"The active dataset is {session['fileName']}. "
-                "The AI business intelligence agent is currently unavailable."
+                "**Answer:** I cannot answer from the dataset profile because "
+                "the AI business intelligence agent is currently unavailable.\n\n"
+                f"**Grounding:** Dataset `{session['fileName']}`; user asked "
+                f"`{query}`."
             )
 
     @staticmethod

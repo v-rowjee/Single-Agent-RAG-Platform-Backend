@@ -1,0 +1,449 @@
+{
+  "status": "success",
+  "sessionId": "fd811931-4a62-41e8-993b-f68d61e3a677",
+  "dashboard": {
+    "title": "BMW Sales Data Analysis",
+    "executiveSummary": "The analysis of BMW sales data from 2010 to 2024 reveals a steady increase in sales volume, with an average annual growth rate of 7.74%. The data also shows a slight decrease in price, with an average annual change of -0.22%. The top-selling models are the 7 Series, i3, and 3 Series.",
+    "kpis": [
+      {
+        "id": "kpi_engine_size_l",
+        "title": "Total Engine Size L",
+        "value": "162.36K",
+        "rawValue": 162359.0,
+        "indicator": {
+          "kind": "increase",
+          "text": "5.7% vs previous period"
+        }
+      },
+      {
+        "id": "kpi_mileage_km",
+        "title": "Total Mileage Km",
+        "value": "5.02B",
+        "rawValue": 5015360157.0,
+        "indicator": {
+          "kind": "increase",
+          "text": "6.1% vs previous period"
+        }
+      },
+      {
+        "id": "kpi_price_usd",
+        "title": "Average Price Usd",
+        "value": "$75.03K",
+        "rawValue": 75034.6,
+        "indicator": {
+          "kind": "decrease",
+          "text": "0.2% vs previous period"
+        }
+      },
+      {
+        "id": "kpi_sales_volume",
+        "title": "Total Sales Volume",
+        "value": "253.38M",
+        "rawValue": 253375734.0,
+        "indicator": {
+          "kind": "increase",
+          "text": "7.7% vs previous period"
+        }
+      }
+    ],
+    "timeline": {
+      "id": "timeline_main",
+      "title": "Engine Size L over time",
+      "subtitle": "Sum by year",
+      "granularity": "year",
+      "unit": null,
+      "valueFormat": "number",
+      "actual": [
+        {
+          "period": "2010",
+          "label": "2010",
+          "value": 10850.2
+        },
+        {
+          "period": "2011",
+          "label": "2011",
+          "value": 10698.2
+        },
+        {
+          "period": "2012",
+          "label": "2012",
+          "value": 10793.2
+        },
+        {
+          "period": "2013",
+          "label": "2013",
+          "value": 10816.4
+        },
+        {
+          "period": "2014",
+          "label": "2014",
+          "value": 10810.4
+        },
+        {
+          "period": "2015",
+          "label": "2015",
+          "value": 10896.6
+        },
+        {
+          "period": "2016",
+          "label": "2016",
+          "value": 10940.4
+        },
+        {
+          "period": "2017",
+          "label": "2017",
+          "value": 10689.1
+        },
+        {
+          "period": "2018",
+          "label": "2018",
+          "value": 10601.4
+        },
+        {
+          "period": "2019",
+          "label": "2019",
+          "value": 10966.8
+        },
+        {
+          "period": "2020",
+          "label": "2020",
+          "value": 10405.8
+        },
+        {
+          "period": "2021",
+          "label": "2021",
+          "value": 11067.0
+        },
+        {
+          "period": "2022",
+          "label": "2022",
+          "value": 11337.7
+        },
+        {
+          "period": "2023",
+          "label": "2023",
+          "value": 10447.7
+        },
+        {
+          "period": "2024",
+          "label": "2024",
+          "value": 11038.1
+        }
+      ],
+      "anomalies": [
+        {
+          "period": "2022",
+          "label": "2022",
+          "value": 11337.7,
+          "id": "anomaly_13",
+          "severity": "warning",
+          "reason": "Value is 2.2 standard deviations from the timeline mean."
+        }
+      ],
+      "forecast": [
+        {
+          "period": "2025",
+          "label": "2025",
+          "value": 10884.64,
+          "lowerBound": 10433.75,
+          "upperBound": 11335.53
+        },
+        {
+          "period": "2026",
+          "label": "2026",
+          "value": 10892.23,
+          "lowerBound": 10441.34,
+          "upperBound": 11343.12
+        },
+        {
+          "period": "2027",
+          "label": "2027",
+          "value": 10899.82,
+          "lowerBound": 10448.93,
+          "upperBound": 11350.71
+        }
+      ],
+      "forecastMetadata": {
+        "available": true,
+        "model": "linear_trend",
+        "horizon": 3,
+        "horizonUnit": "year",
+        "target": "Engine_Size_L",
+        "confidenceLevel": 0.95
+      }
+    },
+    "supportingCharts": [
+      {
+        "id": "chart_bar",
+        "type": "bar",
+        "title": "Engine Size L by Model",
+        "subtitle": "Sum aggregation",
+        "valueFormat": "number",
+        "categories": [
+          "7 Series",
+          "i3",
+          "3 Series",
+          "i8",
+          "5 Series",
+          "X1"
+        ],
+        "series": [
+          {
+            "id": "series_bar",
+            "name": "Engine Size L",
+            "data": [
+              15204.5,
+              15067.1,
+              14946.9,
+              14927.2,
+              14892.0,
+              14770.3
+            ]
+          }
+        ],
+        "layout": {
+          "columnSpan": 1,
+          "rowSpan": 1
+        }
+      },
+      {
+        "id": "chart_donut",
+        "type": "donut",
+        "title": "Distribution by Model",
+        "subtitle": null,
+        "valueFormat": "number",
+        "segments": [
+          {
+            "id": "segment_1",
+            "label": "7 Series",
+            "value": 4666.0
+          },
+          {
+            "id": "segment_2",
+            "label": "i3",
+            "value": 4618.0
+          },
+          {
+            "id": "segment_3",
+            "label": "i8",
+            "value": 4606.0
+          },
+          {
+            "id": "segment_4",
+            "label": "3 Series",
+            "value": 4595.0
+          },
+          {
+            "id": "segment_5",
+            "label": "5 Series",
+            "value": 4592.0
+          },
+          {
+            "id": "segment_6",
+            "label": "X1",
+            "value": 4570.0
+          }
+        ],
+        "layout": {
+          "columnSpan": 1,
+          "rowSpan": 1
+        }
+      }
+    ],
+    "analysis": {
+      "businessSummary": "The BMW sales data analysis provides insights into the company's performance over the past 14 years. The data highlights the importance of the 7 Series, i3, and 3 Series models, which account for the majority of sales. The analysis also reveals opportunities for growth and improvement, including expanding sales in new regions and optimizing pricing strategies.",
+      "keyFindings": [
+        "The average engine size of BMW cars is 3.25 liters, with a sum of 162,359 liters.",
+        "The total mileage of BMW cars is 5,015,360,157 kilometers, with an average of 100,307 kilometers.",
+        "The total price of BMW cars is $3,751,730,045, with an average price of $75,034.60.",
+        "The sales volume of BMW cars has increased by 7.74% annually, with a total of 253,375,734 units sold.",
+        "The top-selling models are the 7 Series, i3, and 3 Series, which account for the majority of sales."
+      ]
+    },
+    "insights": {
+      "criticalAnomalies": [],
+      "warnings": [],
+      "limitations": [
+        {
+          "id": "limitation_1",
+          "title": "The data only includes sales data from 2010 to 2024, and does not account for ex",
+          "description": "The data only includes sales data from 2010 to 2024, and does not account for external factors such as economic trends and competitor activity.",
+          "severity": "warning",
+          "sourceIds": [
+            "kpi_engine_size_l",
+            "kpi_mileage_km",
+            "kpi_price_usd"
+          ]
+        },
+        {
+          "id": "limitation_2",
+          "title": "The data is limited to BMW sales data, and does not provide a comprehensive view",
+          "description": "The data is limited to BMW sales data, and does not provide a comprehensive view of the automotive market.",
+          "severity": "warning",
+          "sourceIds": [
+            "kpi_engine_size_l",
+            "kpi_mileage_km",
+            "kpi_price_usd"
+          ]
+        },
+        {
+          "id": "limitation_3",
+          "title": "The analysis is based on historical data, and may not accurately predict future ",
+          "description": "The analysis is based on historical data, and may not accurately predict future sales trends.",
+          "severity": "warning",
+          "sourceIds": [
+            "kpi_engine_size_l",
+            "kpi_mileage_km",
+            "kpi_price_usd"
+          ]
+        }
+      ],
+      "opportunities": [
+        {
+          "id": "opportunity_1",
+          "title": "Expanding sales in new regions, such as Asia and Latin America, to increase mark",
+          "description": "Expanding sales in new regions, such as Asia and Latin America, to increase market share.",
+          "severity": "info",
+          "sourceIds": [
+            "kpi_engine_size_l",
+            "kpi_mileage_km",
+            "kpi_price_usd"
+          ]
+        },
+        {
+          "id": "opportunity_2",
+          "title": "Optimizing pricing strategies to improve profitability and competitiveness.",
+          "description": "Optimizing pricing strategies to improve profitability and competitiveness.",
+          "severity": "info",
+          "sourceIds": [
+            "kpi_engine_size_l",
+            "kpi_mileage_km",
+            "kpi_price_usd"
+          ]
+        },
+        {
+          "id": "opportunity_3",
+          "title": "Developing new models and features to attract new customers and increase sales.",
+          "description": "Developing new models and features to attract new customers and increase sales.",
+          "severity": "info",
+          "sourceIds": [
+            "kpi_engine_size_l",
+            "kpi_mileage_km",
+            "kpi_price_usd"
+          ]
+        }
+      ]
+    },
+    "recommendedActions": [
+      {
+        "id": "action_1",
+        "title": "Expand Sales in New Regions",
+        "description": "Develop a strategy to expand sales in new regions, such as Asia and Latin America, to increase market share.",
+        "priority": "high",
+        "sourceIds": [
+          "kpi_engine_size_l",
+          "kpi_mileage_km",
+          "kpi_price_usd"
+        ]
+      },
+      {
+        "id": "action_2",
+        "title": "Optimize Pricing Strategies",
+        "description": "Analyze pricing data to identify opportunities to improve profitability and competitiveness.",
+        "priority": "medium",
+        "sourceIds": [
+          "kpi_engine_size_l",
+          "kpi_mileage_km",
+          "kpi_price_usd"
+        ]
+      },
+      {
+        "id": "action_3",
+        "title": "Develop New Models and Features",
+        "description": "Develop new models and features to attract new customers and increase sales.",
+        "priority": "low",
+        "sourceIds": [
+          "kpi_engine_size_l",
+          "kpi_mileage_km",
+          "kpi_price_usd"
+        ]
+      }
+    ],
+    "datasetSummary": {
+      "fileName": "bmw_sales_data_2010_2024.csv",
+      "rowCount": 50000,
+      "columnCount": 11,
+      "timeField": "Year",
+      "period": {
+        "start": "2010-01-01T00:00:00",
+        "end": "2024-01-01T00:00:00",
+        "label": "2010-01-01 \u2013 2024-01-01"
+      },
+      "measures": [
+        "Engine_Size_L",
+        "Mileage_KM",
+        "Price_USD",
+        "Sales_Volume"
+      ],
+      "dimensions": [
+        "Model",
+        "Region",
+        "Color",
+        "Fuel_Type",
+        "Transmission",
+        "Sales_Classification"
+      ],
+      "quality": {
+        "completenessPercent": 100.0,
+        "missingValueCount": 0,
+        "duplicateRowCount": 0
+      },
+      "generatedAt": "2026-07-12T18:28:19.605791Z"
+    },
+    "sections": [
+      {
+        "id": "kpis",
+        "title": "Key Performance Indicators",
+        "order": 1,
+        "visible": true
+      },
+      {
+        "id": "timeline",
+        "title": "Timeline",
+        "order": 2,
+        "visible": true
+      },
+      {
+        "id": "supportingCharts",
+        "title": "Supporting Charts",
+        "order": 3,
+        "visible": true
+      },
+      {
+        "id": "details",
+        "title": "Business Details",
+        "order": 4,
+        "visible": true
+      }
+    ],
+    "layout": {
+      "kpis": {
+        "columns": 4,
+        "maxRows": 2
+      },
+      "timeline": {
+        "columnSpan": 12
+      },
+      "supportingCharts": {
+        "columns": 2,
+        "maxRows": 2
+      },
+      "details": {
+        "columns": 2,
+        "maxRows": 2
+      }
+    }
+  },
+  "warnings": [],
+  "errors": []
+}

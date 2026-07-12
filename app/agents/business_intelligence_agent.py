@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, TypedDict
@@ -22,6 +23,7 @@ from app.schemas.business_intelligence import (
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 MODEL_NAME = "llama-3.3-70b-versatile"
+CHAT_MAX_TOKENS = 220
 
 
 class DraftAction(BaseModel):
@@ -135,6 +137,13 @@ class BusinessIntelligenceAgent:
         return {"dashboard_response": self._response(agent_input, profile, narrative)}
 
     def _chat(self, state: AgentState) -> dict[str, str]:
+        deterministic_response = self._deterministic_chat_response(
+            agent_input=state["agent_input"],
+            query=state["query"],
+        )
+        if deterministic_response:
+            return {"chat_response": deterministic_response}
+
         self._create_chains()
         response = self._chat_chain.invoke(
             {
@@ -144,6 +153,89 @@ class BusinessIntelligenceAgent:
             }
         )
         return {"chat_response": response.strip()}
+
+    def _deterministic_chat_response(
+        self,
+        agent_input: BusinessIntelligenceAgentInput,
+        query: str,
+    ) -> str | None:
+        lowered = query.casefold()
+        asks_for_forecast = any(
+            word in lowered for word in ("forecast", "predict", "project")
+        )
+        if not asks_for_forecast or "revenue" not in lowered:
+            return None
+
+        try:
+            return self._forecast_revenue_response(agent_input, query)
+        except Exception:
+            return None
+
+    def _forecast_revenue_response(
+        self,
+        agent_input: BusinessIntelligenceAgentInput,
+        query: str,
+    ) -> str | None:
+        df = self._read(agent_input.filePath)
+        year_column = self._column(df, "Year")
+        price_column = self._column(df, "Price_USD")
+        volume_column = self._column(df, "Sales_Volume")
+        if not year_column or not price_column or not volume_column:
+            return None
+
+        match = re.search(r"\b(19\d{2}|20\d{2})\b", query)
+        if not match:
+            return None
+        target_year = int(match.group(1))
+
+        working = df[[year_column, price_column, volume_column]].copy()
+        region_column = self._column(df, "Region")
+        region = (
+            self._query_category(df, region_column, query)
+            if region_column
+            else None
+        )
+        if region_column and region:
+            working[region_column] = df[region_column]
+            working = working[
+                working[region_column].astype(str).str.casefold()
+                == region.casefold()
+            ]
+
+        working[year_column] = pd.to_numeric(working[year_column], errors="coerce")
+        working[price_column] = pd.to_numeric(working[price_column], errors="coerce")
+        working[volume_column] = pd.to_numeric(working[volume_column], errors="coerce")
+        working = working.dropna(subset=[year_column, price_column, volume_column])
+        if working.empty:
+            return None
+
+        working["revenue"] = working[price_column] * working[volume_column]
+        grouped = working.groupby(year_column)["revenue"].sum().sort_index()
+        grouped = grouped[grouped.index.astype(int) == grouped.index]
+        if len(grouped) < 4:
+            return None
+
+        years = [int(year) for year in grouped.index]
+        last_year = max(years)
+        if target_year <= last_year:
+            return None
+
+        values = grouped.astype(float).to_numpy()
+        x = np.arange(len(values), dtype=float)
+        slope, intercept = np.polyfit(x, values, 1)
+        steps_ahead = target_year - last_year
+        prediction = float(slope * (len(values) - 1 + steps_ahead) + intercept)
+
+        region_text = f" for {region}" if region else ""
+        filter_text = f", filtered to `Region = {region}`" if region else ""
+        return (
+            f"**Answer:** The forecasted total revenue{region_text} in "
+            f"{target_year} is **{self._display_currency(prediction)}**, using "
+            "a linear trend on annual revenue.\n\n"
+            f"**Grounding:** Dataset `{agent_input.fileName}`; revenue = "
+            f"`{price_column} * {volume_column}`{filter_text}, using "
+            f"`{year_column}` {min(years)}-{last_year}."
+        )
 
     def _create_chains(self) -> None:
         if self._dashboard_chain is not None:
@@ -158,6 +250,14 @@ class BusinessIntelligenceAgent:
             api_key=SecretStr(api_key),
             temperature=0,
             max_tokens=1000,
+            timeout=120,
+            max_retries=1,
+        )
+        chat_llm = ChatGroq(
+            model=MODEL_NAME,
+            api_key=SecretStr(api_key),
+            temperature=0,
+            max_tokens=CHAT_MAX_TOKENS,
             timeout=120,
             max_retries=1,
         )
@@ -187,7 +287,18 @@ three opportunities, three limitations and three recommended actions.""",
             [
                 (
                     "system",
-                    "Answer only from the dataset profile. Be concise and grounded.",
+                    """Answer only from the supplied dataset profile.
+Return short Markdown under 90 words.
+
+Format exactly:
+**Answer:** 1-2 direct sentences.
+**Grounding:** Dataset `actual fileName from the profile`; mention 1-3
+concrete fields, counts, metrics, chart ids, or time periods from the profile
+that support the answer.
+
+If the profile does not contain enough evidence, say that directly in the
+Answer and still include the closest available grounding facts. Do not include
+raw JSON, long lists, tables, code blocks, or unsupported recommendations.""",
                 ),
                 (
                     "human",
@@ -195,7 +306,7 @@ three opportunities, three limitations and three recommended actions.""",
                 ),
             ]
         )
-        self._chat_chain = chat_prompt | llm | StrOutputParser()
+        self._chat_chain = chat_prompt | chat_llm | StrOutputParser()
 
     def _profile(self, agent_input: BusinessIntelligenceAgentInput) -> dict[str, Any]:
         df = self._read(agent_input.filePath)
@@ -712,6 +823,38 @@ three opportunities, three limitations and three recommended actions.""",
             symbol = "£" if "gbp" in lowered else "€" if "eur" in lowered else "$" if "usd" in lowered else ""
             return f"{symbol}{text}"
         return f"{text}%" if cls._format(name) == "percentage" else text
+
+    @classmethod
+    def _display_currency(cls, value: float) -> str:
+        return cls._display("revenue_usd", value)
+
+    @staticmethod
+    def _column(df: pd.DataFrame, name: str) -> str | None:
+        expected = name.casefold()
+        for column in df.columns:
+            if str(column).casefold() == expected:
+                return str(column)
+        return None
+
+    @staticmethod
+    def _query_category(
+        df: pd.DataFrame,
+        column: str | None,
+        query: str,
+    ) -> str | None:
+        if not column:
+            return None
+
+        lowered = query.casefold()
+        values = sorted(
+            (str(value) for value in df[column].dropna().unique()),
+            key=len,
+            reverse=True,
+        )
+        for value in values:
+            if re.search(rf"\b{re.escape(value.casefold())}\b", lowered):
+                return value
+        return None
 
     @staticmethod
     def _average(name: str) -> bool:
