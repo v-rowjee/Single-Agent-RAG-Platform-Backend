@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from datetime import datetime, timezone
@@ -20,10 +21,13 @@ from app.schemas.business_intelligence import (
     BusinessIntelligenceAgentInput,
     DashboardResponse,
 )
+from app.rag.models import RerankedDocument, RetrievedDocument
+from app.rag.rag_service import compact_profile_for_chat, rag_service
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 MODEL_NAME = "llama-3.3-70b-versatile"
 CHAT_MAX_TOKENS = 220
+logger = logging.getLogger(__name__)
 
 
 class DraftAction(BaseModel):
@@ -48,6 +52,12 @@ class AgentState(TypedDict, total=False):
     query: str
     history: list[dict[str, str]]
     profile: dict[str, Any]
+    query_type: str
+    calculated_evidence: str | None
+    direct_answer: str | None
+    retrieved_documents: list[RetrievedDocument]
+    reranked_documents: list[RerankedDocument]
+    retrieved_context: str
     dashboard_response: DashboardResponse
     chat_response: str
 
@@ -57,7 +67,8 @@ class BusinessIntelligenceAgent:
 
     def __init__(self) -> None:
         self._dashboard_chain: Any | None = None
-        self._chat_chain: Any | None = None
+        self._rag_chat_chain: Any | None = None
+        self._profile_chat_chain: Any | None = None
         self._profiles: dict[str, dict[str, Any]] = {}
         self._history: dict[str, list[dict[str, str]]] = {}
         self.graph = self._build_graph()
@@ -71,6 +82,16 @@ class BusinessIntelligenceAgent:
         self, agent_input: BusinessIntelligenceAgentInput
     ) -> DashboardResponse:
         return self.run(agent_input)
+
+    def profile_for_session(
+        self,
+        agent_input: BusinessIntelligenceAgentInput,
+    ) -> dict[str, Any]:
+        profile = self._profiles.get(agent_input.sessionId)
+        if profile is None:
+            profile = self._profile(agent_input)
+            self._profiles[agent_input.sessionId] = profile
+        return profile
 
     def chat(
         self,
@@ -107,15 +128,23 @@ class BusinessIntelligenceAgent:
         graph = StateGraph(AgentState)
         graph.add_node("prepare", self._prepare)
         graph.add_node("dashboard", self._dashboard)
-        graph.add_node("chat", self._chat)
+        graph.add_node("route_chat_query", self._route_chat_query)
+        graph.add_node("calculate_evidence", self._calculate_evidence)
+        graph.add_node("retrieve_documents", self._retrieve_documents)
+        graph.add_node("rerank_documents", self._rerank_documents)
+        graph.add_node("answer_chat", self._answer_chat)
         graph.add_edge(START, "prepare")
         graph.add_conditional_edges(
             "prepare",
             lambda state: state["mode"],
-            {"dashboard": "dashboard", "chat": "chat"},
+            {"dashboard": "dashboard", "chat": "route_chat_query"},
         )
         graph.add_edge("dashboard", END)
-        graph.add_edge("chat", END)
+        graph.add_edge("route_chat_query", "calculate_evidence")
+        graph.add_edge("calculate_evidence", "retrieve_documents")
+        graph.add_edge("retrieve_documents", "rerank_documents")
+        graph.add_edge("rerank_documents", "answer_chat")
+        graph.add_edge("answer_chat", END)
         return graph.compile()
 
     def _prepare(self, state: AgentState) -> dict[str, Any]:
@@ -145,23 +174,98 @@ class BusinessIntelligenceAgent:
 
         return {"dashboard_response": self._response(agent_input, profile, narrative)}
 
-    def _chat(self, state: AgentState) -> dict[str, str]:
-        deterministic_response = self._deterministic_chat_response(
+    def _route_chat_query(self, state: AgentState) -> dict[str, str]:
+        query_type = rag_service.route_query(state["query"], state["profile"])
+        return {"query_type": query_type}
+
+    def _calculate_evidence(self, state: AgentState) -> dict[str, str | None]:
+        evidence = rag_service.calculate_evidence(
             agent_input=state["agent_input"],
             query=state["query"],
+            query_type=state["query_type"],
+            profile=state["profile"],
         )
-        if deterministic_response:
-            return {"chat_response": deterministic_response}
+        if evidence is None:
+            return {"calculated_evidence": None, "direct_answer": None}
+        return {
+            "calculated_evidence": evidence.text,
+            "direct_answer": evidence.direct_answer,
+        }
 
-        self._create_chains()
-        response = self._chat_chain.invoke(
-            {
-                "profile": self._json(state["profile"]),
-                "history": self._history_text(state.get("history", [])),
-                "query": state["query"],
-            }
+    def _retrieve_documents(
+        self,
+        state: AgentState,
+    ) -> dict[str, list[RetrievedDocument]]:
+        agent_input = state["agent_input"]
+        if not rag_service.ensure_index(agent_input, state["profile"]):
+            return {"retrieved_documents": []}
+        documents = rag_service.retrieve(agent_input=agent_input, query=state["query"])
+        return {"retrieved_documents": documents}
+
+    def _rerank_documents(
+        self,
+        state: AgentState,
+    ) -> dict[str, list[RerankedDocument] | str]:
+        retrieved = state.get("retrieved_documents", [])
+        reranked = rag_service.rerank(state["query"], retrieved)
+        context_documents = reranked if reranked else retrieved
+        context = rag_service.build_context(
+            context_documents,
+            calculated_evidence=state.get("calculated_evidence"),
         )
-        return {"chat_response": response.strip()}
+        return {
+            "reranked_documents": reranked,
+            "retrieved_context": context,
+        }
+
+    def _answer_chat(self, state: AgentState) -> dict[str, str]:
+        context = state.get("retrieved_context", "").strip()
+        calculated_evidence = state.get("calculated_evidence")
+        direct_answer = state.get("direct_answer")
+        source_ids = self._source_ids(
+            state.get("reranked_documents") or state.get("retrieved_documents", [])
+        )
+
+        if not context and direct_answer:
+            return {"chat_response": direct_answer}
+
+        if context:
+            try:
+                self._create_chains()
+                response = self._rag_chat_chain.invoke(
+                    {
+                        "history": self._history_text(state.get("history", [])),
+                        "context": context,
+                        "query": state["query"],
+                    }
+                )
+                logger.info(
+                    "RAG grounded answer generated session_id=%s sources=%s calculated=%s",
+                    state["agent_input"].sessionId,
+                    source_ids,
+                    bool(calculated_evidence),
+                )
+                return {"chat_response": response.strip()}
+            except Exception:
+                logger.exception(
+                    "Groq RAG answer generation failed session_id=%s",
+                    state["agent_input"].sessionId,
+                )
+                if direct_answer:
+                    return {"chat_response": direct_answer}
+
+        fallback = self._profile_based_chat_fallback(state)
+        if fallback:
+            return {"chat_response": fallback}
+
+        closest = ", ".join(f"`{source_id}`" for source_id in source_ids) or "none"
+        return {
+            "chat_response": (
+                "**Answer:** The indexed dataset evidence is not sufficient to "
+                "answer this question reliably.\n\n"
+                f"**Grounding:** The closest retrieved sources were {closest}."
+            )
+        }
 
     def _deterministic_chat_response(
         self,
@@ -292,30 +396,55 @@ three opportunities, three limitations and three recommended actions.""",
             Narrative, method="function_calling"
         )
 
-        chat_prompt = ChatPromptTemplate.from_messages(
+        rag_chat_prompt = ChatPromptTemplate.from_messages(
             [
                 (
                     "system",
-                    """Answer only from the supplied dataset profile.
+                    """Answer only from the supplied calculated evidence and retrieved dataset context.
+Do not invent values, rows, trends, forecasts or categories.
+Deterministic calculated evidence takes priority over retrieved evidence.
+If evidence is insufficient, say so directly.
+Do not use outside knowledge to make claims about the uploaded dataset.
+Keep the response concise.
+Cite retrieved sources using their source IDs.
+Distinguish historical values from forecast values.
+Do not claim that correlation proves causation.
+
+Format exactly:
+**Answer:** Direct answer in one to four sentences.
+
+**Grounding:** Mention the calculation fields and/or retrieved source IDs that support the answer.""",
+                ),
+                (
+                    "human",
+                    "History: {history}\nEvidence:\n{context}\n\nQuestion: {query}",
+                ),
+            ]
+        )
+        self._rag_chat_chain = rag_chat_prompt | chat_llm | StrOutputParser()
+
+        profile_chat_prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    """Answer only from the supplied compact dataset profile.
 Return short Markdown under 90 words.
 
 Format exactly:
 **Answer:** 1-2 direct sentences.
-**Grounding:** Dataset `actual fileName from the profile`; mention 1-3
-concrete fields, counts, metrics, chart ids, or time periods from the profile
-that support the answer.
 
-If the profile does not contain enough evidence, say that directly in the
-Answer and still include the closest available grounding facts. Do not include
-raw JSON, long lists, tables, code blocks, or unsupported recommendations.""",
+**Grounding:** Mention the compact profile fields that support the answer.
+
+If the compact profile does not contain enough evidence, say that directly.
+Do not include raw JSON, long lists, tables, code blocks, or unsupported recommendations.""",
                 ),
                 (
                     "human",
-                    "Profile: {profile}\nHistory: {history}\nQuestion: {query}",
+                    "Compact profile: {profile}\nHistory: {history}\nQuestion: {query}",
                 ),
             ]
         )
-        self._chat_chain = chat_prompt | chat_llm | StrOutputParser()
+        self._profile_chat_chain = profile_chat_prompt | chat_llm | StrOutputParser()
 
     def _profile(self, agent_input: BusinessIntelligenceAgentInput) -> dict[str, Any]:
         df = self._read(agent_input.filePath)
@@ -908,6 +1037,35 @@ raw JSON, long lists, tables, code blocks, or unsupported recommendations.""",
                 f"{item['role']}: {item['content']}" for item in history[-6:]
             )
         )
+
+    def _profile_based_chat_fallback(self, state: AgentState) -> str | None:
+        try:
+            self._create_chains()
+            response = self._profile_chat_chain.invoke(
+                {
+                    "profile": compact_profile_for_chat(state["profile"]),
+                    "history": self._history_text(state.get("history", [])),
+                    "query": state["query"],
+                }
+            )
+            return response.strip()
+        except Exception:
+            logger.exception(
+                "Compact profile fallback failed session_id=%s",
+                state["agent_input"].sessionId,
+            )
+            return None
+
+    @staticmethod
+    def _source_ids(
+        documents: list[RetrievedDocument] | list[RerankedDocument],
+    ) -> list[str]:
+        output: list[str] = []
+        for document in documents[:5]:
+            source_id = document.metadata.get("source_id")
+            if isinstance(source_id, str) and source_id not in output:
+                output.append(source_id)
+        return output
 
     @staticmethod
     def _json(value: Any) -> str:

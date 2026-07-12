@@ -13,3 +13,4 @@ langchain
 langchain-groq
 langchain-openai
 langgraph
+qdrant-client[fastembed]

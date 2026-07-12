@@ -83,6 +83,8 @@ class BusinessIntelligenceService:
                 dashboard_response,
             )
 
+            self._try_index_rag(session)
+
         except Exception:
             upload_path.unlink(missing_ok=True)
             (SESSIONS_DIR / f"{session_id}.json").unlink(missing_ok=True)
@@ -337,6 +339,23 @@ class BusinessIntelligenceService:
                 "the AI business intelligence agent is currently unavailable.\n\n"
                 f"**Grounding:** Dataset `{session['fileName']}`; user asked "
                 f"`{query}`."
+            )
+
+    def _try_index_rag(self, session: dict[str, Any]) -> None:
+        try:
+            from app.agents.business_intelligence_agent import (
+                business_intelligence_agent,
+            )
+            from app.rag.rag_service import rag_service
+
+            agent_input = self._build_agent_input(session)
+            profile = business_intelligence_agent.profile_for_session(agent_input)
+            rag_service.index_dataset(agent_input=agent_input, profile=profile)
+        except Exception:
+            logger.warning(
+                "Recoverable RAG indexing failure during upload session_id=%s",
+                session.get("sessionId"),
+                exc_info=True,
             )
 
     def _load_conversation_messages(
