@@ -72,23 +72,32 @@ class BusinessIntelligenceAgent:
     ) -> DashboardResponse:
         return self.run(agent_input)
 
-    def chat(self, agent_input: BusinessIntelligenceAgentInput, query: str) -> str:
+    def chat(
+        self,
+        agent_input: BusinessIntelligenceAgentInput,
+        query: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> str:
         query = query.strip()
         if not query:
             raise ValueError("The query cannot be empty.")
 
-        history = self._history.get(agent_input.sessionId, [])
+        conversation_history = (
+            history
+            if history is not None
+            else self._history.get(agent_input.sessionId, [])
+        )
         response = self.graph.invoke(
             {
                 "mode": "chat",
                 "agent_input": agent_input,
                 "query": query,
-                "history": history,
+                "history": conversation_history,
             }
         )["chat_response"]
 
         self._history[agent_input.sessionId] = [
-            *history,
+            *conversation_history,
             {"role": "user", "content": query},
             {"role": "assistant", "content": response},
         ][-12:]

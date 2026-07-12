@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
@@ -18,8 +18,24 @@ class ChatRequest(BaseModel):
     query: str = Field(min_length=1)
 
 
+class ChatMessage(BaseModel):
+    id: str
+    role: Literal["user", "assistant"]
+    content: str
+    grounded: bool = False
+    createdAt: str
+
+
 class ChatResponse(BaseModel):
     response: str
+    userMessage: ChatMessage
+    assistantMessage: ChatMessage
+    messages: list[ChatMessage]
+
+
+class ChatHistoryResponse(BaseModel):
+    sessionId: str
+    messages: list[ChatMessage]
 
 
 @router.post("/upload")
@@ -90,4 +106,24 @@ def chat(request: ChatRequest) -> ChatResponse:
         raise HTTPException(
             status_code=500,
             detail="An unexpected error occurred while processing the query.",
+        ) from error
+
+
+@router.get("/chat/{session_id}/history", response_model=ChatHistoryResponse)
+def get_chat_history(session_id: str) -> ChatHistoryResponse:
+    try:
+        result = business_intelligence_service.get_chat_history(session_id)
+
+        return ChatHistoryResponse(**result)
+
+    except SessionNotFoundError as error:
+        raise HTTPException(
+            status_code=404,
+            detail=str(error),
+        ) from error
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while loading the chat history.",
         ) from error

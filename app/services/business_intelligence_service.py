@@ -18,8 +18,9 @@ STORAGE_ROOT = Path("app/storage")
 UPLOADS_DIR = STORAGE_ROOT / "uploads"
 SESSIONS_DIR = STORAGE_ROOT / "sessions"
 RESULTS_DIR = STORAGE_ROOT / "results"
+CONVERSATIONS_DIR = STORAGE_ROOT / "conversations"
 
-for directory in (UPLOADS_DIR, SESSIONS_DIR, RESULTS_DIR):
+for directory in (UPLOADS_DIR, SESSIONS_DIR, RESULTS_DIR, CONVERSATIONS_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 
@@ -111,7 +112,7 @@ class BusinessIntelligenceService:
         self,
         session_id: str,
         query: str,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         session = self._load_session(session_id)
 
         cleaned_query = query.strip()
@@ -119,12 +120,46 @@ class BusinessIntelligenceService:
         if not cleaned_query:
             raise ValueError("The chat query cannot be empty.")
 
+        previous_messages = self._load_conversation_messages(session_id)
+        agent_history = [
+            {"role": message["role"], "content": message["content"]}
+            for message in previous_messages
+            if message["role"] in {"user", "assistant"}
+        ]
+
         response = self._chat_with_agent(
             session=session,
             query=cleaned_query,
+            history=agent_history,
         )
 
-        return {"response": response}
+        user_message = self._build_chat_message(
+            role="user",
+            content=cleaned_query,
+            grounded=False,
+        )
+        assistant_message = self._build_chat_message(
+            role="assistant",
+            content=response,
+            grounded=True,
+        )
+        messages = [*previous_messages, user_message, assistant_message]
+        self._write_conversation_messages(session_id, messages)
+
+        return {
+            "response": response,
+            "userMessage": user_message,
+            "assistantMessage": assistant_message,
+            "messages": messages,
+        }
+
+    def get_chat_history(self, session_id: str) -> dict[str, Any]:
+        self._load_session(session_id)
+
+        return {
+            "sessionId": session_id,
+            "messages": self._load_conversation_messages(session_id),
+        }
 
     def _load_session(self, session_id: str) -> dict[str, Any]:
         session_path = SESSIONS_DIR / f"{session_id}.json"
@@ -278,6 +313,7 @@ class BusinessIntelligenceService:
         self,
         session: dict[str, Any],
         query: str,
+        history: list[dict[str, str]],
     ) -> str:
         try:
             from app.agents.business_intelligence_agent import (
@@ -287,6 +323,7 @@ class BusinessIntelligenceService:
             return business_intelligence_agent.chat(
                 agent_input=self._build_agent_input(session),
                 query=query,
+                history=history,
             )
 
         except Exception:
@@ -301,6 +338,81 @@ class BusinessIntelligenceService:
                 f"**Grounding:** Dataset `{session['fileName']}`; user asked "
                 f"`{query}`."
             )
+
+    def _load_conversation_messages(
+        self,
+        session_id: str,
+    ) -> list[dict[str, Any]]:
+        conversation_path = CONVERSATIONS_DIR / f"{session_id}.json"
+
+        if not conversation_path.exists():
+            return []
+
+        payload = self._read_json(conversation_path)
+        messages = payload.get("messages", [])
+
+        if not isinstance(messages, list):
+            return []
+
+        normalized_messages: list[dict[str, Any]] = []
+
+        for message in messages:
+            if (
+                not isinstance(message, dict)
+                or message.get("role") not in {"user", "assistant"}
+                or not isinstance(message.get("content"), str)
+            ):
+                continue
+
+            message_id = message.get("id")
+            created_at = message.get("createdAt")
+
+            normalized_messages.append(
+                {
+                    "id": message_id if isinstance(message_id, str) else str(uuid4()),
+                    "role": message["role"],
+                    "content": message["content"],
+                    "grounded": bool(message.get("grounded", False)),
+                    "createdAt": (
+                        created_at
+                        if isinstance(created_at, str)
+                        else self._current_timestamp()
+                    ),
+                }
+            )
+
+        return normalized_messages
+
+    def _write_conversation_messages(
+        self,
+        session_id: str,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        now = self._current_timestamp()
+        conversation_path = CONVERSATIONS_DIR / f"{session_id}.json"
+
+        self._write_json(
+            conversation_path,
+            {
+                "sessionId": session_id,
+                "updatedAt": now,
+                "messages": messages,
+            },
+        )
+
+    def _build_chat_message(
+        self,
+        role: str,
+        content: str,
+        grounded: bool,
+    ) -> dict[str, Any]:
+        return {
+            "id": str(uuid4()),
+            "role": role,
+            "content": content,
+            "grounded": grounded,
+            "createdAt": self._current_timestamp(),
+        }
 
     @staticmethod
     def _build_agent_input(session: dict[str, Any]) -> Any:
