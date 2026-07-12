@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from langchain_core.output_parsers import StrOutputParser
@@ -234,7 +235,7 @@ three opportunities, three limitations and three recommended actions.""",
                 },
                 "generatedAt": self._now(),
             },
-            "metrics": self._metrics(df, measures),
+            "metrics": self._metrics(df, measures, date_field),
             "bar": self._bar_data(df, dimensions, measures),
             "donut": self._donut_data(df, dimensions),
             "timeline": self._timeline_data(df, date_field, measures),
@@ -343,18 +344,39 @@ three opportunities, three limitations and three recommended actions.""",
         }
         return DashboardResponse.model_validate(result)
 
-    def _metrics(self, df: pd.DataFrame, measures: list[str]) -> list[dict[str, Any]]:
+    def _metrics(
+        self, df: pd.DataFrame, measures: list[str], date_field: str | None
+    ) -> list[dict[str, Any]]:
         output = []
         for name in measures:
             values = pd.to_numeric(df[name], errors="coerce").dropna()
-            if not values.empty:
-                output.append(
-                    {
-                        "name": name,
-                        "sum": round(float(values.sum()), 2),
-                        "average": round(float(values.mean()), 2),
-                    }
-                )
+            if values.empty:
+                continue
+
+            change = None
+            if date_field:
+                working = df[[date_field, name]].dropna().copy()
+                if not working.empty:
+                    _, code = self._grain(working[date_field])
+                    working["period"] = working[date_field].dt.to_period(code)
+                    aggregation = "mean" if self._average(name) else "sum"
+                    grouped = working.groupby("period")[name].agg(aggregation)
+                    if len(grouped) >= 2 and float(grouped.iloc[-2]) != 0:
+                        change = round(
+                            (float(grouped.iloc[-1]) - float(grouped.iloc[-2]))
+                            / abs(float(grouped.iloc[-2]))
+                            * 100,
+                            2,
+                        )
+
+            output.append(
+                {
+                    "name": name,
+                    "sum": round(float(values.sum()), 2),
+                    "average": round(float(values.mean()), 2),
+                    "change": change,
+                }
+            )
         return output
 
     def _bar_data(
@@ -413,21 +435,52 @@ three opportunities, three limitations and three recommended actions.""",
         if dates.empty:
             return None
 
-        days = int((dates.max() - dates.min()).days)
-        granularity, code = (
-            ("year", "Y")
-            if days > 730
-            else (
-                ("month", "M")
-                if days > 120
-                else ("week", "W") if days > 30 else ("day", "D")
-            )
-        )
+        granularity, code = self._grain(dates)
         measure = measures[0]
         aggregation = "mean" if self._average(measure) else "sum"
         working = df[[date_field, measure]].dropna().copy()
-        working["period"] = working[date_field].dt.to_period(code).astype(str)
+        working["period"] = working[date_field].dt.to_period(code)
         grouped = working.groupby("period")[measure].agg(aggregation).tail(18)
+        if grouped.empty:
+            return None
+
+        values = grouped.astype(float).to_numpy()
+        anomalies = []
+        standard_deviation = float(values.std())
+        if len(values) >= 4 and standard_deviation > 0:
+            mean = float(values.mean())
+            for index, (period, value) in enumerate(grouped.items(), 1):
+                score = abs((float(value) - mean) / standard_deviation)
+                if score >= 2:
+                    anomalies.append(
+                        {
+                            "id": f"anomaly_{index}",
+                            "period": str(period),
+                            "label": str(period),
+                            "value": round(float(value), 2),
+                            "severity": "critical" if score >= 3 else "warning",
+                            "reason": f"Value is {score:.1f} standard deviations from the timeline mean.",
+                        }
+                    )
+
+        forecast = []
+        if len(values) >= 4:
+            x = np.arange(len(values), dtype=float)
+            slope, intercept = np.polyfit(x, values, 1)
+            residual_spread = float(np.std(values - (slope * x + intercept))) * 1.96
+            for step in range(1, 4):
+                prediction = float(slope * (len(values) - 1 + step) + intercept)
+                period = str(grouped.index[-1] + step)
+                forecast.append(
+                    {
+                        "period": period,
+                        "label": period,
+                        "value": round(prediction, 2),
+                        "lowerBound": round(prediction - residual_spread, 2),
+                        "upperBound": round(prediction + residual_spread, 2),
+                    }
+                )
+
         return {
             "measure": measure,
             "aggregation": aggregation,
@@ -440,6 +493,8 @@ three opportunities, three limitations and three recommended actions.""",
                 }
                 for period, value in grouped.items()
             ],
+            "anomalies": anomalies,
+            "forecast": forecast,
         }
 
     def _kpis(self, metrics: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -447,16 +502,22 @@ three opportunities, three limitations and three recommended actions.""",
         for metric in metrics[:8]:
             average = self._average(metric["name"])
             value = metric["average"] if average else metric["sum"]
+            change = metric.get("change")
+            kind = "note" if change in (None, 0) else "increase" if change > 0 else "decrease"
+            text = (
+                "No previous-period comparison"
+                if change is None
+                else "No change from previous period"
+                if change == 0
+                else f"{abs(change):.1f}% vs previous period"
+            )
             output.append(
                 {
                     "id": f"kpi_{self._slug(metric['name'])}",
                     "title": f"{'Average' if average else 'Total'} {self._title(metric['name'])}",
-                    "value": f"{value:,.2f}",
+                    "value": self._display(metric["name"], value),
                     "rawValue": value,
-                    "indicator": {
-                        "kind": "note",
-                        "text": f"Calculated from {metric['name']}",
-                    },
+                    "indicator": {"kind": kind, "text": text},
                 }
             )
         return output
@@ -509,6 +570,7 @@ three opportunities, three limitations and three recommended actions.""",
     def _timeline(self, item: dict[str, Any] | None) -> dict[str, Any] | None:
         if not item:
             return None
+        forecast = item["forecast"]
         return {
             "id": "timeline_main",
             "title": f"{self._title(item['measure'])} over time",
@@ -517,15 +579,15 @@ three opportunities, three limitations and three recommended actions.""",
             "unit": None,
             "valueFormat": self._format(item["measure"]),
             "actual": item["points"],
-            "anomalies": [],
-            "forecast": [],
+            "anomalies": item["anomalies"],
+            "forecast": forecast,
             "forecastMetadata": {
-                "available": False,
-                "model": None,
-                "horizon": 0,
+                "available": bool(forecast),
+                "model": "linear_trend" if forecast else None,
+                "horizon": len(forecast),
                 "horizonUnit": item["granularity"],
                 "target": item["measure"],
-                "confidenceLevel": None,
+                "confidenceLevel": 0.95 if forecast else None,
             },
         }
 
@@ -620,6 +682,36 @@ three opportunities, three limitations and three recommended actions.""",
         return looks_like_id and (
             len(df) == 0 or df[column].nunique(dropna=True) / len(df) >= 0.5
         )
+
+    @staticmethod
+    def _grain(dates: pd.Series) -> tuple[str, str]:
+        days = int((dates.max() - dates.min()).days)
+        if days > 730:
+            return "year", "Y"
+        if days > 120:
+            return "month", "M"
+        if days > 30:
+            return "week", "W"
+        return "day", "D"
+
+    @classmethod
+    def _display(cls, name: str, value: float) -> str:
+        absolute = abs(value)
+        divisor, suffix = (
+            (1_000_000_000, "B")
+            if absolute >= 1_000_000_000
+            else (1_000_000, "M")
+            if absolute >= 1_000_000
+            else (1_000, "K")
+            if absolute >= 1_000
+            else (1, "")
+        )
+        text = f"{value / divisor:,.2f}{suffix}"
+        lowered = name.lower()
+        if cls._format(name) == "currency":
+            symbol = "£" if "gbp" in lowered else "€" if "eur" in lowered else "$" if "usd" in lowered else ""
+            return f"{symbol}{text}"
+        return f"{text}%" if cls._format(name) == "percentage" else text
 
     @staticmethod
     def _average(name: str) -> bool:

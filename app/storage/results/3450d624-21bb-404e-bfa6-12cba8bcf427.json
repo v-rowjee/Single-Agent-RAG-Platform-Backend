@@ -1,0 +1,447 @@
+{
+  "status": "success",
+  "sessionId": "3450d624-21bb-404e-bfa6-12cba8bcf427",
+  "dashboard": {
+    "title": "Tesla Deliveries Analysis",
+    "executiveSummary": "This report analyzes Tesla's deliveries from 2015 to 2025, highlighting key trends and insights.",
+    "kpis": [
+      {
+        "id": "kpi_month",
+        "title": "Total Month",
+        "value": "17.16K",
+        "rawValue": 17160.0,
+        "indicator": {
+          "kind": "note",
+          "text": "No change from previous period"
+        }
+      },
+      {
+        "id": "kpi_estimated_deliveries",
+        "title": "Total Estimated Deliveries",
+        "value": "26.19M",
+        "rawValue": 26194607.0,
+        "indicator": {
+          "kind": "decrease",
+          "text": "1.6% vs previous period"
+        }
+      },
+      {
+        "id": "kpi_production_units",
+        "title": "Total Production Units",
+        "value": "28.13M",
+        "rawValue": 28131437.0,
+        "indicator": {
+          "kind": "decrease",
+          "text": "2.0% vs previous period"
+        }
+      },
+      {
+        "id": "kpi_avg_price_usd",
+        "title": "Average Avg Price Usd",
+        "value": "$84.91K",
+        "rawValue": 84907.34,
+        "indicator": {
+          "kind": "decrease",
+          "text": "1.5% vs previous period"
+        }
+      },
+      {
+        "id": "kpi_battery_capacity_kwh",
+        "title": "Total Battery Capacity Kwh",
+        "value": "229.84K",
+        "rawValue": 229837.0,
+        "indicator": {
+          "kind": "increase",
+          "text": "1.7% vs previous period"
+        }
+      },
+      {
+        "id": "kpi_range_km",
+        "title": "Total Range Km",
+        "value": "1.32M",
+        "rawValue": 1320680.0,
+        "indicator": {
+          "kind": "increase",
+          "text": "2.2% vs previous period"
+        }
+      },
+      {
+        "id": "kpi_co2_saved_tons",
+        "title": "Total Co2 Saved Tons",
+        "value": "1.96M",
+        "rawValue": 1964363.25,
+        "indicator": {
+          "kind": "increase",
+          "text": "1.8% vs previous period"
+        }
+      },
+      {
+        "id": "kpi_charging_stations",
+        "title": "Total Charging Stations",
+        "value": "23.58M",
+        "rawValue": 23580833.0,
+        "indicator": {
+          "kind": "decrease",
+          "text": "3.6% vs previous period"
+        }
+      }
+    ],
+    "timeline": {
+      "id": "timeline_main",
+      "title": "Month over time",
+      "subtitle": "Sum by year",
+      "granularity": "year",
+      "unit": null,
+      "valueFormat": "number",
+      "actual": [
+        {
+          "period": "2015",
+          "label": "2015",
+          "value": 1560.0
+        },
+        {
+          "period": "2016",
+          "label": "2016",
+          "value": 1560.0
+        },
+        {
+          "period": "2017",
+          "label": "2017",
+          "value": 1560.0
+        },
+        {
+          "period": "2018",
+          "label": "2018",
+          "value": 1560.0
+        },
+        {
+          "period": "2019",
+          "label": "2019",
+          "value": 1560.0
+        },
+        {
+          "period": "2020",
+          "label": "2020",
+          "value": 1560.0
+        },
+        {
+          "period": "2021",
+          "label": "2021",
+          "value": 1560.0
+        },
+        {
+          "period": "2022",
+          "label": "2022",
+          "value": 1560.0
+        },
+        {
+          "period": "2023",
+          "label": "2023",
+          "value": 1560.0
+        },
+        {
+          "period": "2024",
+          "label": "2024",
+          "value": 1560.0
+        },
+        {
+          "period": "2025",
+          "label": "2025",
+          "value": 1560.0
+        }
+      ],
+      "anomalies": [],
+      "forecast": [
+        {
+          "period": "2026",
+          "label": "2026",
+          "value": 1560.0,
+          "lowerBound": 1560.0,
+          "upperBound": 1560.0
+        },
+        {
+          "period": "2027",
+          "label": "2027",
+          "value": 1560.0,
+          "lowerBound": 1560.0,
+          "upperBound": 1560.0
+        },
+        {
+          "period": "2028",
+          "label": "2028",
+          "value": 1560.0,
+          "lowerBound": 1560.0,
+          "upperBound": 1560.0
+        }
+      ],
+      "forecastMetadata": {
+        "available": true,
+        "model": "linear_trend",
+        "horizon": 3,
+        "horizonUnit": "year",
+        "target": "Month",
+        "confidenceLevel": 0.95
+      }
+    },
+    "supportingCharts": [
+      {
+        "id": "chart_bar",
+        "type": "bar",
+        "title": "Month by Region",
+        "subtitle": "Sum aggregation",
+        "valueFormat": "number",
+        "categories": [
+          "Asia",
+          "Europe",
+          "Middle East",
+          "North America"
+        ],
+        "series": [
+          {
+            "id": "series_bar",
+            "name": "Month",
+            "data": [
+              4290.0,
+              4290.0,
+              4290.0,
+              4290.0
+            ]
+          }
+        ],
+        "layout": {
+          "columnSpan": 1,
+          "rowSpan": 1
+        }
+      },
+      {
+        "id": "chart_donut",
+        "type": "donut",
+        "title": "Distribution by Region",
+        "subtitle": null,
+        "valueFormat": "number",
+        "segments": [
+          {
+            "id": "segment_1",
+            "label": "Europe",
+            "value": 660.0
+          },
+          {
+            "id": "segment_2",
+            "label": "Asia",
+            "value": 660.0
+          },
+          {
+            "id": "segment_3",
+            "label": "North America",
+            "value": 660.0
+          },
+          {
+            "id": "segment_4",
+            "label": "Middle East",
+            "value": 660.0
+          }
+        ],
+        "layout": {
+          "columnSpan": 1,
+          "rowSpan": 1
+        }
+      }
+    ],
+    "analysis": {
+      "businessSummary": "The data shows a steady increase in deliveries, with a total of 26,194,607 units delivered over the period. The average price of Tesla vehicles has decreased by 1.53%.",
+      "keyFindings": [
+        "Total deliveries: 26,194,607 units",
+        "Average price decrease: 1.53%",
+        "Battery capacity increase: 1.74%",
+        "Range increase: 2.25%",
+        "CO2 savings: 1,964,363 tons"
+      ]
+    },
+    "insights": {
+      "criticalAnomalies": [],
+      "warnings": [],
+      "limitations": [
+        {
+          "id": "limitation_1",
+          "title": "Data only includes deliveries from 2015 to 2025",
+          "description": "Data only includes deliveries from 2015 to 2025",
+          "severity": "warning",
+          "sourceIds": [
+            "kpi_month",
+            "kpi_estimated_deliveries",
+            "kpi_production_units"
+          ]
+        },
+        {
+          "id": "limitation_2",
+          "title": "No data on sales or revenue",
+          "description": "No data on sales or revenue",
+          "severity": "warning",
+          "sourceIds": [
+            "kpi_month",
+            "kpi_estimated_deliveries",
+            "kpi_production_units"
+          ]
+        },
+        {
+          "id": "limitation_3",
+          "title": "No comparison to competitors",
+          "description": "No comparison to competitors",
+          "severity": "warning",
+          "sourceIds": [
+            "kpi_month",
+            "kpi_estimated_deliveries",
+            "kpi_production_units"
+          ]
+        }
+      ],
+      "opportunities": [
+        {
+          "id": "opportunity_1",
+          "title": "Expansion into new markets",
+          "description": "Expansion into new markets",
+          "severity": "info",
+          "sourceIds": [
+            "kpi_month",
+            "kpi_estimated_deliveries",
+            "kpi_production_units"
+          ]
+        },
+        {
+          "id": "opportunity_2",
+          "title": "Development of new vehicle models",
+          "description": "Development of new vehicle models",
+          "severity": "info",
+          "sourceIds": [
+            "kpi_month",
+            "kpi_estimated_deliveries",
+            "kpi_production_units"
+          ]
+        },
+        {
+          "id": "opportunity_3",
+          "title": "Investment in charging infrastructure",
+          "description": "Investment in charging infrastructure",
+          "severity": "info",
+          "sourceIds": [
+            "kpi_month",
+            "kpi_estimated_deliveries",
+            "kpi_production_units"
+          ]
+        }
+      ]
+    },
+    "recommendedActions": [
+      {
+        "id": "action_1",
+        "title": "Expand into new markets",
+        "description": "Identify and enter new markets to increase sales",
+        "priority": "high",
+        "sourceIds": [
+          "kpi_month",
+          "kpi_estimated_deliveries",
+          "kpi_production_units"
+        ]
+      },
+      {
+        "id": "action_2",
+        "title": "Develop new vehicle models",
+        "description": "Design and launch new vehicle models to attract new customers",
+        "priority": "medium",
+        "sourceIds": [
+          "kpi_month",
+          "kpi_estimated_deliveries",
+          "kpi_production_units"
+        ]
+      },
+      {
+        "id": "action_3",
+        "title": "Invest in charging infrastructure",
+        "description": "Increase investment in charging stations to support growing demand",
+        "priority": "medium",
+        "sourceIds": [
+          "kpi_month",
+          "kpi_estimated_deliveries",
+          "kpi_production_units"
+        ]
+      }
+    ],
+    "datasetSummary": {
+      "fileName": "tesla_deliveries_dataset_2015_2025.csv",
+      "rowCount": 2640,
+      "columnCount": 12,
+      "timeField": "Year",
+      "period": {
+        "start": "2015-01-01T00:00:00",
+        "end": "2025-01-01T00:00:00",
+        "label": "2015-01-01 \u2013 2025-01-01"
+      },
+      "measures": [
+        "Month",
+        "Estimated_Deliveries",
+        "Production_Units",
+        "Avg_Price_USD",
+        "Battery_Capacity_kWh",
+        "Range_km",
+        "CO2_Saved_tons",
+        "Charging_Stations"
+      ],
+      "dimensions": [
+        "Region",
+        "Model",
+        "Source_Type"
+      ],
+      "quality": {
+        "completenessPercent": 100.0,
+        "missingValueCount": 0,
+        "duplicateRowCount": 0
+      },
+      "generatedAt": "2026-07-12T18:15:42.387896Z"
+    },
+    "sections": [
+      {
+        "id": "kpis",
+        "title": "Key Performance Indicators",
+        "order": 1,
+        "visible": true
+      },
+      {
+        "id": "timeline",
+        "title": "Timeline",
+        "order": 2,
+        "visible": true
+      },
+      {
+        "id": "supportingCharts",
+        "title": "Supporting Charts",
+        "order": 3,
+        "visible": true
+      },
+      {
+        "id": "details",
+        "title": "Business Details",
+        "order": 4,
+        "visible": true
+      }
+    ],
+    "layout": {
+      "kpis": {
+        "columns": 4,
+        "maxRows": 2
+      },
+      "timeline": {
+        "columnSpan": 12
+      },
+      "supportingCharts": {
+        "columns": 2,
+        "maxRows": 2
+      },
+      "details": {
+        "columns": 2,
+        "maxRows": 2
+      }
+    }
+  },
+  "warnings": [],
+  "errors": []
+}
