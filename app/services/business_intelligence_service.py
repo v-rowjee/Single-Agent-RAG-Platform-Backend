@@ -1,27 +1,41 @@
 from __future__ import annotations
 
-import csv
+import hashlib
 import io
-import json
 import logging
+import re
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
-from uuid import uuid4
+from typing import Any, Iterator, Literal
+from uuid import UUID, uuid4
 
+import pandas as pd
 from fastapi import UploadFile
+
+from app.schemas.business_intelligence import (
+    BusinessIntelligenceAgentInput,
+    DashboardResponse,
+)
+from app.services.supabase_service import (
+    DatasetRecord,
+    MessageRecord,
+    SupabaseService,
+    supabase_service,
+)
 
 
 logger = logging.getLogger(__name__)
 
-STORAGE_ROOT = Path("app/storage")
-UPLOADS_DIR = STORAGE_ROOT / "uploads"
-SESSIONS_DIR = STORAGE_ROOT / "sessions"
-RESULTS_DIR = STORAGE_ROOT / "results"
-CONVERSATIONS_DIR = STORAGE_ROOT / "conversations"
-
-for directory in (UPLOADS_DIR, SESSIONS_DIR, RESULTS_DIR, CONVERSATIONS_DIR):
-    directory.mkdir(parents=True, exist_ok=True)
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+ALLOWED_EXTENSIONS = {".csv", ".xlsx"}
+ALLOWED_MIME_TYPES = {
+    "text/csv",
+    "application/csv",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
 
 
 class SessionNotFoundError(Exception):
@@ -33,62 +47,81 @@ class InvalidUploadError(Exception):
 
 
 class BusinessIntelligenceService:
+    def __init__(self, storage: SupabaseService | None = None) -> None:
+        self.storage = storage or supabase_service
+
     async def create_analysis(
         self,
         file: UploadFile,
         description: str | None = None,
     ) -> dict[str, Any]:
-        file_name = Path(file.filename or "uploaded-file").name
-        content = await file.read()
+        original_name = Path(file.filename or "").name
+        file_name = self._sanitize_file_name(original_name)
+        mime_type = (file.content_type or "").strip()
+        extension = Path(file_name).suffix.lower()
+        self._validate_upload_metadata(file_name, mime_type, extension)
 
+        content = await file.read()
         if not content:
             raise InvalidUploadError("The uploaded file is empty.")
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise InvalidUploadError("The uploaded file is too large.")
 
         session_id = str(uuid4())
-        created_at = self._current_timestamp()
+        storage_path = f"{session_id}/{file_name}"
+        file_hash = hashlib.sha256(content).hexdigest()
 
-        file_extension = Path(file_name).suffix.lower()
-        upload_path = UPLOADS_DIR / f"{session_id}{file_extension}"
+        self.storage.upload_file(
+            storage_path=storage_path,
+            content=content,
+            mime_type=mime_type,
+        )
 
+        dataset_inserted = False
         try:
-            upload_path.write_bytes(content)
-
-            dataset_info = self._inspect_file(
+            dataset = self.storage.create_dataset(
+                dataset_id=session_id,
                 file_name=file_name,
+                storage_path=storage_path,
+                mime_type=mime_type,
+                file_size=len(content),
+                file_hash=file_hash,
+                description=description,
+            )
+            dataset_inserted = True
+
+            dashboard_response = self._generate_dashboard_from_bytes(
+                dataset=dataset,
+                content=content,
+            )
+            self._save_dashboard(dataset.id, dashboard_response)
+
+            self._try_index_rag(
+                dataset=dataset,
                 content=content,
             )
 
-            session = {
-                "sessionId": session_id,
-                "fileName": file_name,
-                "contentType": file.content_type,
-                "description": description,
-                "fileSize": len(content),
-                "uploadPath": str(upload_path),
-                "createdAt": created_at,
-            }
-
-            dashboard_response = self._build_dashboard_with_agent(
-                session=session,
-                dataset_info=dataset_info,
+            self.storage.update_dataset_status(
+                dataset.id,
+                status="ready",
+                error_message=None,
             )
 
-            self._write_json(
-                SESSIONS_DIR / f"{session_id}.json",
-                session,
+        except Exception as error:
+            safe_error = self._safe_error(error)
+            logger.exception(
+                "Dataset processing failed session_id=%s operation=upload storage_path=%s",
+                session_id,
+                storage_path,
             )
-
-            self._write_json(
-                RESULTS_DIR / f"{session_id}.json",
-                dashboard_response,
-            )
-
-            self._try_index_rag(session)
-
-        except Exception:
-            upload_path.unlink(missing_ok=True)
-            (SESSIONS_DIR / f"{session_id}.json").unlink(missing_ok=True)
-            (RESULTS_DIR / f"{session_id}.json").unlink(missing_ok=True)
+            if dataset_inserted:
+                self.storage.update_dataset_status(
+                    session_id,
+                    status="failed",
+                    error_message=safe_error,
+                )
+            else:
+                self.storage.delete_file(storage_path)
             raise
 
         return {
@@ -99,419 +132,300 @@ class BusinessIntelligenceService:
         }
 
     def get_dashboard(self, session_id: str) -> dict[str, Any]:
-        self._load_session(session_id)
+        dataset = self._load_dataset(session_id)
+        dashboard = self.storage.get_dashboard(dataset.id)
 
-        result_path = RESULTS_DIR / f"{session_id}.json"
+        if dashboard is not None:
+            try:
+                return DashboardResponse.model_validate(
+                    dashboard.response
+                ).model_dump(mode="json")
+            except Exception:
+                logger.exception(
+                    "Saved dashboard validation failed session_id=%s operation=get_dashboard",
+                    dataset.id,
+                )
 
-        if not result_path.exists():
-            raise SessionNotFoundError(
-                f"No dashboard result was found for session '{session_id}'."
-            )
-
-        return self._read_json(result_path)
+        content = self.storage.download_file(dataset.storage_path)
+        dashboard_response = self._generate_dashboard_from_bytes(
+            dataset=dataset,
+            content=content,
+        )
+        self._save_dashboard(dataset.id, dashboard_response)
+        return dashboard_response.model_dump(mode="json")
 
     def chat(
         self,
         session_id: str,
         query: str,
     ) -> dict[str, Any]:
-        session = self._load_session(session_id)
-
+        dataset = self._load_dataset(session_id)
         cleaned_query = query.strip()
 
         if not cleaned_query:
             raise ValueError("The chat query cannot be empty.")
 
-        previous_messages = self._load_conversation_messages(session_id)
+        user_message = self.storage.save_message(
+            dataset_id=dataset.id,
+            role="user",
+            content=cleaned_query,
+            sources=[],
+        )
+        recent_messages = self.storage.get_recent_messages(dataset.id, limit=6)
         agent_history = [
-            {"role": message["role"], "content": message["content"]}
-            for message in previous_messages
-            if message["role"] in {"user", "assistant"}
+            {"role": message.role, "content": message.content}
+            for message in recent_messages
+            if message.role in {"user", "assistant"}
         ]
 
-        response = self._chat_with_agent(
-            session=session,
+        content = self.storage.download_file(dataset.storage_path)
+        response_text, source_ids = self._chat_with_agent(
+            dataset=dataset,
+            content=content,
             query=cleaned_query,
             history=agent_history,
         )
-
-        user_message = self._build_chat_message(
-            role="user",
-            content=cleaned_query,
-            grounded=False,
-        )
-        assistant_message = self._build_chat_message(
+        assistant_message = self.storage.save_message(
+            dataset_id=dataset.id,
             role="assistant",
-            content=response,
-            grounded=True,
+            content=response_text,
+            sources=source_ids,
         )
-        messages = [*previous_messages, user_message, assistant_message]
-        self._write_conversation_messages(session_id, messages)
+
+        messages = self.storage.get_recent_messages(dataset.id, limit=50)
 
         return {
-            "response": response,
-            "userMessage": user_message,
-            "assistantMessage": assistant_message,
-            "messages": messages,
+            "response": response_text,
+            "userMessage": self._chat_message(user_message),
+            "assistantMessage": self._chat_message(
+                assistant_message,
+                grounded=True,
+            ),
+            "messages": [self._chat_message(message) for message in messages],
         }
 
     def get_chat_history(self, session_id: str) -> dict[str, Any]:
-        self._load_session(session_id)
-
+        dataset = self._load_dataset(session_id)
         return {
-            "sessionId": session_id,
-            "messages": self._load_conversation_messages(session_id),
+            "sessionId": dataset.id,
+            "messages": [
+                self._chat_message(message)
+                for message in self.storage.get_recent_messages(dataset.id, limit=50)
+            ],
         }
 
-    def _load_session(self, session_id: str) -> dict[str, Any]:
-        session_path = SESSIONS_DIR / f"{session_id}.json"
-
-        if not session_path.exists():
+    def _load_dataset(self, session_id: str) -> DatasetRecord:
+        dataset_id = self._validate_session_id(session_id)
+        dataset = self.storage.get_dataset(dataset_id)
+        if dataset is None:
             raise SessionNotFoundError(
                 f"Analysis session '{session_id}' was not found."
             )
+        return dataset
 
-        return self._read_json(session_path)
+    def _generate_dashboard_from_bytes(
+        self,
+        dataset: DatasetRecord,
+        content: bytes,
+    ) -> DashboardResponse:
+        dataset_info = self._inspect_file(dataset.file_name, content)
+        with self._temporary_agent_input(dataset, content) as agent_input:
+            try:
+                from app.agents.business_intelligence_agent import (
+                    business_intelligence_agent,
+                )
+
+                return business_intelligence_agent.generate_dashboard(agent_input)
+            except Exception:
+                logger.exception(
+                    "Business intelligence agent failed session_id=%s operation=dashboard. Returning fallback dashboard.",
+                    dataset.id,
+                )
+                return DashboardResponse.model_validate(
+                    self._build_placeholder_dashboard(
+                        dataset=dataset,
+                        dataset_info=dataset_info,
+                    )
+                )
+
+    def _save_dashboard(
+        self,
+        dataset_id: str,
+        dashboard_response: DashboardResponse,
+    ) -> None:
+        self.storage.save_dashboard(
+            dataset_id=dataset_id,
+            status=dashboard_response.status,
+            response=dashboard_response.model_dump(mode="json"),
+        )
+
+    def _try_index_rag(
+        self,
+        dataset: DatasetRecord,
+        content: bytes,
+    ) -> None:
+        try:
+            self.storage.update_dataset_status(dataset.id, rag_status="indexing")
+
+            from app.agents.business_intelligence_agent import (
+                business_intelligence_agent,
+            )
+            from app.rag.rag_service import rag_service
+
+            with self._temporary_agent_input(dataset, content) as agent_input:
+                profile = business_intelligence_agent.profile_for_session(agent_input)
+                rag_service.index_dataset(
+                    agent_input=agent_input,
+                    profile=profile,
+                    force=True,
+                )
+
+            self.storage.update_dataset_status(dataset.id, rag_status="ready")
+        except Exception as error:
+            logger.warning(
+                "Recoverable RAG indexing failure session_id=%s operation=index_rag",
+                dataset.id,
+                exc_info=True,
+            )
+            self.storage.update_dataset_status(
+                dataset.id,
+                rag_status="failed",
+                error_message=self._safe_error(error),
+            )
+
+    def _chat_with_agent(
+        self,
+        dataset: DatasetRecord,
+        content: bytes,
+        query: str,
+        history: list[dict[str, str]],
+    ) -> tuple[str, list[str]]:
+        try:
+            from app.agents.business_intelligence_agent import (
+                business_intelligence_agent,
+            )
+
+            with self._temporary_agent_input(dataset, content) as agent_input:
+                response = business_intelligence_agent.chat(
+                    agent_input=agent_input,
+                    query=query,
+                    history=history,
+                )
+                source_ids = business_intelligence_agent.source_ids_for_session(
+                    dataset.id
+                )
+            return response, source_ids
+
+        except Exception:
+            logger.exception(
+                "Business intelligence agent failed session_id=%s operation=chat",
+                dataset.id,
+            )
+            return (
+                "**Answer:** I cannot answer from the dataset profile because "
+                "the AI business intelligence agent is currently unavailable.\n\n"
+                f"**Grounding:** Dataset `{dataset.file_name}`; user asked "
+                f"`{query}`.",
+                [],
+            )
+
+    @contextmanager
+    def _temporary_agent_input(
+        self,
+        dataset: DatasetRecord,
+        content: bytes,
+    ) -> Iterator[BusinessIntelligenceAgentInput]:
+        suffix = Path(dataset.file_name).suffix.lower()
+        with tempfile.TemporaryDirectory(prefix="bi_dataset_") as directory:
+            path = Path(directory) / dataset.file_name
+            if path.suffix.lower() != suffix:
+                path = Path(directory) / f"dataset{suffix}"
+            path.write_bytes(content)
+            yield BusinessIntelligenceAgentInput(
+                sessionId=dataset.id,
+                filePath=str(path),
+                fileName=dataset.file_name,
+                description=dataset.description,
+            )
 
     def _inspect_file(
         self,
         file_name: str,
         content: bytes,
     ) -> dict[str, Any]:
-        if not file_name.lower().endswith(".csv"):
-            return {
-                "rowCount": 0,
-                "columnCount": 0,
-                "measures": [],
-                "dimensions": [],
-                "missingValueCount": 0,
-                "duplicateRowCount": 0,
-                "completenessPercent": 100.0,
-            }
-
-        return self._inspect_csv(content)
-
-    def _inspect_csv(self, content: bytes) -> dict[str, Any]:
+        suffix = Path(file_name).suffix.lower()
         try:
-            text = content.decode("utf-8-sig")
-            reader = csv.reader(io.StringIO(text))
-
-            headers = next(reader, [])
-
-            if not headers:
-                raise InvalidUploadError(
-                    "The uploaded CSV does not contain a header row."
-                )
-
-            column_count = len(headers)
-            row_count = 0
-            missing_value_count = 0
-            duplicate_row_count = 0
-
-            seen_rows: set[tuple[str, ...]] = set()
-
-            numeric_columns = [True] * column_count
-            columns_with_values = [False] * column_count
-
-            for row in reader:
-                normalized_row = [
-                    row[index].strip() if index < len(row) else ""
-                    for index in range(column_count)
-                ]
-
-                if not any(normalized_row):
-                    continue
-
-                row_count += 1
-
-                row_key = tuple(normalized_row)
-
-                if row_key in seen_rows:
-                    duplicate_row_count += 1
-                else:
-                    seen_rows.add(row_key)
-
-                for index, value in enumerate(normalized_row):
-                    if value == "":
-                        missing_value_count += 1
-                        continue
-
-                    columns_with_values[index] = True
-
-                    if not self._is_number(value):
-                        numeric_columns[index] = False
-
-            measures = [
-                headers[index]
-                for index in range(column_count)
-                if numeric_columns[index] and columns_with_values[index]
-            ]
-
-            dimensions = [
-                headers[index]
-                for index in range(column_count)
-                if headers[index] not in measures
-            ]
-
-            total_cells = row_count * column_count
-
-            if total_cells == 0:
-                completeness_percent = 100.0
+            if suffix == ".csv":
+                df = pd.read_csv(io.BytesIO(content), low_memory=False)
+            elif suffix == ".xlsx":
+                df = pd.read_excel(io.BytesIO(content))
             else:
-                completeness_percent = round(
-                    ((total_cells - missing_value_count) / total_cells) * 100,
-                    2,
-                )
-
-            return {
-                "rowCount": row_count,
-                "columnCount": column_count,
-                "measures": measures,
-                "dimensions": dimensions,
-                "missingValueCount": missing_value_count,
-                "duplicateRowCount": duplicate_row_count,
-                "completenessPercent": completeness_percent,
-            }
-
+                raise InvalidUploadError("Only CSV and XLSX files are supported.")
         except UnicodeDecodeError as error:
             raise InvalidUploadError(
                 "The CSV file must use UTF-8 encoding."
             ) from error
-        except csv.Error as error:
+        except Exception as error:
             raise InvalidUploadError(
-                "The uploaded CSV could not be parsed."
+                "The uploaded file could not be parsed."
             ) from error
 
-    def _build_dashboard_with_agent(
-        self,
-        session: dict[str, Any],
-        dataset_info: dict[str, Any],
-    ) -> dict[str, Any]:
-        try:
-            from app.agents.business_intelligence_agent import (
-                business_intelligence_agent,
-            )
-
-            dashboard_response = business_intelligence_agent.generate_dashboard(
-                self._build_agent_input(session)
-            )
-
-            return dashboard_response.model_dump(mode="json")
-
-        except Exception:
-            logger.exception(
-                "Business intelligence agent failed while generating "
-                "dashboard. Returning fallback dashboard."
-            )
-
-            dashboard_response = self._build_placeholder_dashboard(
-                session=session,
-                dataset_info=dataset_info,
-            )
-
-            return dashboard_response
-
-    def _chat_with_agent(
-        self,
-        session: dict[str, Any],
-        query: str,
-        history: list[dict[str, str]],
-    ) -> str:
-        try:
-            from app.agents.business_intelligence_agent import (
-                business_intelligence_agent,
-            )
-
-            return business_intelligence_agent.chat(
-                agent_input=self._build_agent_input(session),
-                query=query,
-                history=history,
-            )
-
-        except Exception:
-            logger.exception(
-                "Business intelligence agent failed while answering chat. "
-                "Returning fallback response."
-            )
-
-            return (
-                "**Answer:** I cannot answer from the dataset profile because "
-                "the AI business intelligence agent is currently unavailable.\n\n"
-                f"**Grounding:** Dataset `{session['fileName']}`; user asked "
-                f"`{query}`."
-            )
-
-    def _try_index_rag(self, session: dict[str, Any]) -> None:
-        try:
-            from app.agents.business_intelligence_agent import (
-                business_intelligence_agent,
-            )
-            from app.rag.rag_service import rag_service
-
-            agent_input = self._build_agent_input(session)
-            profile = business_intelligence_agent.profile_for_session(agent_input)
-            rag_service.index_dataset(agent_input=agent_input, profile=profile)
-        except Exception:
-            logger.warning(
-                "Recoverable RAG indexing failure during upload session_id=%s",
-                session.get("sessionId"),
-                exc_info=True,
-            )
-
-    def _load_conversation_messages(
-        self,
-        session_id: str,
-    ) -> list[dict[str, Any]]:
-        conversation_path = CONVERSATIONS_DIR / f"{session_id}.json"
-
-        if not conversation_path.exists():
-            return []
-
-        payload = self._read_json(conversation_path)
-        messages = payload.get("messages", [])
-
-        if not isinstance(messages, list):
-            return []
-
-        normalized_messages: list[dict[str, Any]] = []
-
-        for message in messages:
-            if (
-                not isinstance(message, dict)
-                or message.get("role") not in {"user", "assistant"}
-                or not isinstance(message.get("content"), str)
-            ):
-                continue
-
-            message_id = message.get("id")
-            created_at = message.get("createdAt")
-
-            normalized_messages.append(
-                {
-                    "id": message_id if isinstance(message_id, str) else str(uuid4()),
-                    "role": message["role"],
-                    "content": message["content"],
-                    "grounded": bool(message.get("grounded", False)),
-                    "createdAt": (
-                        created_at
-                        if isinstance(created_at, str)
-                        else self._current_timestamp()
-                    ),
-                }
-            )
-
-        return normalized_messages
-
-    def _write_conversation_messages(
-        self,
-        session_id: str,
-        messages: list[dict[str, Any]],
-    ) -> None:
-        now = self._current_timestamp()
-        conversation_path = CONVERSATIONS_DIR / f"{session_id}.json"
-
-        self._write_json(
-            conversation_path,
-            {
-                "sessionId": session_id,
-                "updatedAt": now,
-                "messages": messages,
-            },
+        row_count = int(len(df))
+        column_count = int(len(df.columns))
+        missing_value_count = int(df.isna().sum().sum())
+        duplicate_row_count = int(df.duplicated().sum())
+        total_cells = row_count * column_count
+        completeness_percent = (
+            round(((total_cells - missing_value_count) / total_cells) * 100, 2)
+            if total_cells
+            else 100.0
         )
+        measures = [
+            str(column)
+            for column in df.select_dtypes(include="number").columns
+        ]
+        dimensions = [
+            str(column)
+            for column in df.columns
+            if str(column) not in measures
+        ]
 
-    def _build_chat_message(
-        self,
-        role: str,
-        content: str,
-        grounded: bool,
-    ) -> dict[str, Any]:
         return {
-            "id": str(uuid4()),
-            "role": role,
-            "content": content,
-            "grounded": grounded,
-            "createdAt": self._current_timestamp(),
+            "rowCount": row_count,
+            "columnCount": column_count,
+            "measures": measures,
+            "dimensions": dimensions,
+            "missingValueCount": missing_value_count,
+            "duplicateRowCount": duplicate_row_count,
+            "completenessPercent": completeness_percent,
         }
-
-    @staticmethod
-    def _build_agent_input(session: dict[str, Any]) -> Any:
-        from app.schemas.business_intelligence import (
-            BusinessIntelligenceAgentInput,
-        )
-
-        return BusinessIntelligenceAgentInput(
-            sessionId=session["sessionId"],
-            filePath=session["uploadPath"],
-            fileName=session["fileName"],
-            description=session.get("description"),
-        )
 
     def _build_placeholder_dashboard(
         self,
-        session: dict[str, Any],
+        dataset: DatasetRecord,
         dataset_info: dict[str, Any],
     ) -> dict[str, Any]:
-        session_id = session["sessionId"]
-        file_name = session["fileName"]
-
-        row_count = dataset_info["rowCount"]
-        column_count = dataset_info["columnCount"]
-        file_size = session["fileSize"]
+        generated_at = self._current_timestamp()
+        row_count = int(dataset_info["rowCount"])
+        column_count = int(dataset_info["columnCount"])
+        completeness = float(dataset_info["completenessPercent"])
+        file_size_kb = round(dataset.file_size / 1024, 1)
 
         return {
             "status": "partial",
-            "sessionId": session_id,
+            "sessionId": dataset.id,
             "dashboard": {
-                "title": f"Business Intelligence Dashboard — {file_name}",
+                "title": f"Business Intelligence Dashboard - {dataset.file_name}",
                 "executiveSummary": (
                     f"The uploaded dataset contains {row_count:,} rows and "
                     f"{column_count:,} columns. The AI analysis pipeline was "
-                    "unavailable, so the dashboard currently shows basic "
-                    "dataset information."
+                    "unavailable, so this dashboard shows basic dataset metrics."
                 ),
                 "kpis": [
-                    {
-                        "id": "dataset_rows",
-                        "title": "Dataset Rows",
-                        "value": f"{row_count:,}",
-                        "rawValue": row_count,
-                        "indicator": {
-                            "kind": "note",
-                            "text": "Rows detected during upload",
-                        },
-                    },
-                    {
-                        "id": "dataset_columns",
-                        "title": "Dataset Columns",
-                        "value": f"{column_count:,}",
-                        "rawValue": column_count,
-                        "indicator": {
-                            "kind": "note",
-                            "text": "Columns detected during upload",
-                        },
-                    },
-                    {
-                        "id": "dataset_completeness",
-                        "title": "Data Completeness",
-                        "value": (
-                            f"{dataset_info['completenessPercent']:.2f}%"
-                        ),
-                        "rawValue": dataset_info["completenessPercent"],
-                        "indicator": {
-                            "kind": "note",
-                            "text": "Based on non-empty CSV cells",
-                        },
-                    },
-                    {
-                        "id": "uploaded_file_size",
-                        "title": "File Size",
-                        "value": f"{file_size / 1024:.1f} KB",
-                        "rawValue": file_size,
-                        "indicator": {
-                            "kind": "note",
-                            "text": "Uploaded file size",
-                        },
-                    },
+                    self._kpi("dataset_rows", "Dataset Rows", row_count),
+                    self._kpi("dataset_columns", "Dataset Columns", column_count),
+                    self._kpi("data_completeness", "Data Completeness", completeness, "%"),
+                    self._kpi("file_size", "File Size", file_size_kb, " KB"),
                 ],
                 "timeline": None,
                 "supportingCharts": [
@@ -529,62 +443,39 @@ class BusinessIntelligenceService:
                                 "data": [row_count, column_count],
                             }
                         ],
-                        "layout": {
-                            "columnSpan": 1,
-                            "rowSpan": 1,
-                        },
+                        "layout": {"columnSpan": 1, "rowSpan": 1},
                     },
                     {
                         "id": "data_quality",
                         "type": "donut",
                         "title": "Data Completeness",
-                        "subtitle": "Complete and missing CSV values",
+                        "subtitle": "Complete and missing values",
                         "valueFormat": "percentage",
                         "segments": [
                             {
                                 "id": "complete_values",
                                 "label": "Complete",
-                                "value": dataset_info[
-                                    "completenessPercent"
-                                ],
+                                "value": completeness,
                             },
                             {
                                 "id": "missing_values",
                                 "label": "Missing",
-                                "value": round(
-                                    100
-                                    - dataset_info[
-                                        "completenessPercent"
-                                    ],
-                                    2,
-                                ),
+                                "value": round(100 - completeness, 2),
                             },
                         ],
-                        "layout": {
-                            "columnSpan": 1,
-                            "rowSpan": 1,
-                        },
+                        "layout": {"columnSpan": 1, "rowSpan": 1},
                     },
                 ],
                 "analysis": {
                     "businessSummary": (
-                        "The dataset was uploaded successfully and its basic "
-                        "structure was inspected. Business analysis could "
-                        "not be generated because the AI agent was "
-                        "unavailable."
+                        "The file was uploaded successfully and basic structure "
+                        "checks were completed."
                     ),
                     "keyFindings": [
-                        f"The uploaded file is named {file_name}.",
+                        f"The uploaded file is named {dataset.file_name}.",
                         f"The dataset contains {row_count:,} rows.",
                         f"The dataset contains {column_count:,} columns.",
-                        (
-                            f"{dataset_info['missingValueCount']:,} missing "
-                            "values were detected."
-                        ),
-                        (
-                            f"{dataset_info['duplicateRowCount']:,} duplicate "
-                            "rows were detected."
-                        ),
+                        f"{dataset_info['missingValueCount']:,} missing values were detected.",
                     ],
                 },
                 "insights": {
@@ -595,43 +486,29 @@ class BusinessIntelligenceService:
                             "id": "ai_pipeline_unavailable",
                             "title": "AI pipeline unavailable",
                             "description": (
-                                "Business KPIs, trends, forecasts, anomalies "
-                                "and recommendations could not be generated "
-                                "by the AI agent."
+                                "Advanced KPIs, trends, forecasts, anomalies and "
+                                "recommendations could not be generated by the AI agent."
                             ),
                             "severity": "info",
                             "sourceIds": [],
                         }
                     ],
-                    "opportunities": [
-                        {
-                            "id": "retry_business_intelligence_agent",
-                            "title": "Retry the analysis pipeline",
-                            "description": (
-                                "The stored dataset can now be passed to the "
-                                "business intelligence agent again for full "
-                                "analysis."
-                            ),
-                            "severity": "info",
-                            "sourceIds": [],
-                        }
-                    ],
+                    "opportunities": [],
                 },
                 "recommendedActions": [
                     {
                         "id": "retry_ai_analysis",
                         "title": "Retry AI analysis",
                         "description": (
-                            "Retry the business intelligence agent and replace "
-                            "the fallback dataset metrics with calculated "
-                            "business KPIs and insights."
+                            "Retry the business intelligence agent when the AI "
+                            "pipeline is available."
                         ),
                         "priority": "medium",
                         "sourceIds": [],
                     }
                 ],
                 "datasetSummary": {
-                    "fileName": file_name,
+                    "fileName": dataset.file_name,
                     "rowCount": row_count,
                     "columnCount": column_count,
                     "timeField": None,
@@ -639,68 +516,31 @@ class BusinessIntelligenceService:
                     "measures": dataset_info["measures"],
                     "dimensions": dataset_info["dimensions"],
                     "quality": {
-                        "completenessPercent": dataset_info[
-                            "completenessPercent"
-                        ],
-                        "missingValueCount": dataset_info[
-                            "missingValueCount"
-                        ],
-                        "duplicateRowCount": dataset_info[
-                            "duplicateRowCount"
-                        ],
+                        "completenessPercent": completeness,
+                        "missingValueCount": dataset_info["missingValueCount"],
+                        "duplicateRowCount": dataset_info["duplicateRowCount"],
                     },
-                    "generatedAt": session["createdAt"],
+                    "generatedAt": generated_at,
                 },
                 "sections": [
-                    {
-                        "id": "kpis",
-                        "title": "Key Performance Indicators",
-                        "order": 1,
-                        "visible": True,
-                    },
-                    {
-                        "id": "timeline",
-                        "title": "Performance Over Time",
-                        "order": 2,
-                        "visible": False,
-                    },
-                    {
-                        "id": "supportingCharts",
-                        "title": "Supporting Analysis",
-                        "order": 3,
-                        "visible": True,
-                    },
-                    {
-                        "id": "details",
-                        "title": "Insights and Recommendations",
-                        "order": 4,
-                        "visible": True,
-                    },
+                    {"id": "kpis", "title": "Key Performance Indicators", "order": 1, "visible": True},
+                    {"id": "timeline", "title": "Performance Over Time", "order": 2, "visible": False},
+                    {"id": "supportingCharts", "title": "Supporting Analysis", "order": 3, "visible": True},
+                    {"id": "details", "title": "Insights and Recommendations", "order": 4, "visible": True},
                 ],
                 "layout": {
-                    "kpis": {
-                        "columns": 4,
-                        "maxRows": 2,
-                    },
-                    "timeline": {
-                        "columnSpan": 12,
-                    },
-                    "supportingCharts": {
-                        "columns": 2,
-                        "maxRows": 2,
-                    },
-                    "details": {
-                        "columns": 3,
-                        "maxRows": 2,
-                    },
+                    "kpis": {"columns": 4, "maxRows": 2},
+                    "timeline": {"columnSpan": 12},
+                    "supportingCharts": {"columns": 2, "maxRows": 2},
+                    "details": {"columns": 2, "maxRows": 2},
                 },
             },
             "warnings": [
                 {
                     "code": "AI_PIPELINE_UNAVAILABLE",
                     "message": (
-                        "The AI agent could not generate the dashboard, so "
-                        "this fallback contains basic dataset information only."
+                        "The AI agent could not generate the dashboard, so this "
+                        "fallback contains basic dataset information only."
                     ),
                     "component": "business_intelligence_agent",
                     "recoverable": True,
@@ -710,43 +550,83 @@ class BusinessIntelligenceService:
         }
 
     @staticmethod
-    def _is_number(value: str) -> bool:
-        cleaned_value = (
-            value.replace(",", "")
-            .replace("£", "")
-            .replace("$", "")
-            .replace("€", "")
-            .replace("%", "")
-            .strip()
-        )
+    def _kpi(
+        item_id: str,
+        title: str,
+        value: int | float,
+        suffix: str = "",
+    ) -> dict[str, Any]:
+        display = f"{value:,.2f}" if isinstance(value, float) else f"{value:,}"
+        return {
+            "id": item_id,
+            "title": title,
+            "value": f"{display}{suffix}",
+            "rawValue": value,
+            "indicator": {
+                "kind": "note",
+                "text": "Detected during upload",
+            },
+        }
 
+    @staticmethod
+    def _validate_upload_metadata(
+        file_name: str,
+        mime_type: str,
+        extension: str,
+    ) -> None:
+        if not file_name or file_name in {".csv", ".xlsx"}:
+            raise InvalidUploadError("The uploaded file must have a valid name.")
+        if extension not in ALLOWED_EXTENSIONS:
+            raise InvalidUploadError("Only CSV and XLSX files are supported.")
+        if mime_type and mime_type not in ALLOWED_MIME_TYPES:
+            raise InvalidUploadError("The uploaded file type is not supported.")
+
+    @staticmethod
+    def _sanitize_file_name(file_name: str) -> str:
+        safe_name = Path(file_name or "uploaded-file").name.strip()
+        stem = Path(safe_name).stem
+        suffix = Path(safe_name).suffix.lower()
+        stem = re.sub(r"[^a-zA-Z0-9._-]+", "_", stem).strip("._-")
+        if not stem:
+            stem = "uploaded-file"
+        return f"{stem[:120]}{suffix}"
+
+    @staticmethod
+    def _validate_session_id(session_id: str) -> str:
         try:
-            float(cleaned_value)
-            return True
-        except ValueError:
-            return False
+            return str(UUID(session_id))
+        except ValueError as error:
+            raise SessionNotFoundError(
+                f"Analysis session '{session_id}' was not found."
+            ) from error
+
+    @staticmethod
+    def _chat_message(
+        message: MessageRecord,
+        grounded: bool | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "id": message.id,
+            "role": message.role,
+            "content": message.content,
+            "grounded": (
+                bool(grounded)
+                if grounded is not None
+                else message.role == "assistant"
+            ),
+            "createdAt": message.created_at,
+        }
+
+    @staticmethod
+    def _safe_error(error: Exception) -> str:
+        text = str(error).strip()
+        if not text:
+            return "Processing failed."
+        return text[:300]
 
     @staticmethod
     def _current_timestamp() -> str:
-        return (
-            datetime.now(timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z")
-        )
-
-    @staticmethod
-    def _write_json(
-        path: Path,
-        payload: dict[str, Any],
-    ) -> None:
-        path.write_text(
-            json.dumps(payload, indent=2),
-            encoding="utf-8",
-        )
-
-    @staticmethod
-    def _read_json(path: Path) -> dict[str, Any]:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 business_intelligence_service = BusinessIntelligenceService()

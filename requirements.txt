@@ -8,9 +8,11 @@ openpyxl
 xlrd
 
 python-dotenv
+supabase
 
 langchain
 langchain-groq
 langchain-openai
 langgraph
-qdrant-client[fastembed]
+fastembed
+pytest

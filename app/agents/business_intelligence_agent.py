@@ -71,6 +71,7 @@ class BusinessIntelligenceAgent:
         self._profile_chat_chain: Any | None = None
         self._profiles: dict[str, dict[str, Any]] = {}
         self._history: dict[str, list[dict[str, str]]] = {}
+        self._last_source_ids: dict[str, list[str]] = {}
         self.graph = self._build_graph()
 
     def run(self, agent_input: BusinessIntelligenceAgentInput) -> DashboardResponse:
@@ -123,6 +124,9 @@ class BusinessIntelligenceAgent:
             {"role": "assistant", "content": response},
         ][-12:]
         return response
+
+    def source_ids_for_session(self, session_id: str) -> list[str]:
+        return list(self._last_source_ids.get(session_id, []))
 
     def _build_graph(self):
         graph = StateGraph(AgentState)
@@ -225,6 +229,7 @@ class BusinessIntelligenceAgent:
         source_ids = self._source_ids(
             state.get("reranked_documents") or state.get("retrieved_documents", [])
         )
+        self._last_source_ids[state["agent_input"].sessionId] = source_ids
 
         if not context and direct_answer:
             return {"chat_response": direct_answer}

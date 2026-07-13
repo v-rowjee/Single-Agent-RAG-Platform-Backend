@@ -5,7 +5,6 @@ import logging
 import math
 import re
 import threading
-import atexit
 from pathlib import Path
 from typing import Any
 
@@ -17,22 +16,20 @@ from app.rag.document_builder import DatasetDocumentBuilder
 from app.rag.embedding_service import get_embedding_service
 from app.rag.models import CalculatedEvidence, IndexStatus, QueryType, RerankedDocument, RetrievedDocument
 from app.rag.reranker import get_reranker
-from app.rag.retriever import RagRetriever
-from app.rag.vector_store import RagVectorStore
 from app.schemas.business_intelligence import BusinessIntelligenceAgentInput
+from app.services.supabase_service import SupabaseService, supabase_service
 
 
 logger = logging.getLogger(__name__)
 
 
 class RagService:
-    def __init__(self) -> None:
+    def __init__(self, storage: SupabaseService | None = None) -> None:
         self._builder = DatasetDocumentBuilder()
         self._completed_signatures: dict[str, dict[str, str | int | float]] = {}
         self._index_locks: dict[str, threading.Lock] = {}
-        self._stores: dict[str, RagVectorStore] = {}
         self._service_lock = threading.Lock()
-        atexit.register(self.close)
+        self.storage = storage or supabase_service
 
     def index_dataset(
         self,
@@ -41,40 +38,33 @@ class RagService:
         force: bool = False,
     ) -> IndexStatus:
         signature = self._file_signature(agent_input.filePath)
-        store = self._store_for_session(agent_input.sessionId)
 
-        if not force and self._valid_index(store, signature):
-            meta = store.read_index_meta() or {}
+        if not force and self._completed_signatures.get(agent_input.sessionId) == signature:
             logger.info(
-                "RAG index cache hit session_id=%s collection=%s",
+                "RAG index cache hit session_id=%s",
                 agent_input.sessionId,
-                store.collection_name,
             )
-            self._completed_signatures[agent_input.sessionId] = signature
             return IndexStatus(
                 session_id=agent_input.sessionId,
-                collection_name=store.collection_name,
-                document_count=int(meta.get("document_count", 0)),
-                chunk_count=int(meta.get("document_count", 0)),
-                vector_size=int(meta.get("vector_size", 0)),
+                collection_name="document_chunks",
+                document_count=0,
+                chunk_count=0,
+                vector_size=384,
             )
 
         lock = self._lock_for_session(agent_input.sessionId)
         with lock:
-            if not force and self._valid_index(store, signature):
-                meta = store.read_index_meta() or {}
+            if not force and self._completed_signatures.get(agent_input.sessionId) == signature:
                 logger.info(
-                    "RAG index cache hit session_id=%s collection=%s",
+                    "RAG index cache hit session_id=%s",
                     agent_input.sessionId,
-                    store.collection_name,
                 )
-                self._completed_signatures[agent_input.sessionId] = signature
                 return IndexStatus(
                     session_id=agent_input.sessionId,
-                    collection_name=store.collection_name,
-                    document_count=int(meta.get("document_count", 0)),
-                    chunk_count=int(meta.get("document_count", 0)),
-                    vector_size=int(meta.get("vector_size", 0)),
+                    collection_name="document_chunks",
+                    document_count=0,
+                    chunk_count=0,
+                    vector_size=384,
                 )
 
             df = load_dataframe(agent_input.filePath)
@@ -87,16 +77,34 @@ class RagService:
             embeddings = get_embedding_service().embed_documents(
                 [document.page_content for document in documents]
             )
-            store.index_documents(
-                documents=documents,
-                embeddings=embeddings,
-                file_signature=signature,
-            )
+            if documents and len(documents) != len(embeddings):
+                raise ValueError("Document and embedding counts do not match.")
+
+            self.storage.delete_document_chunks(agent_input.sessionId)
+            rows: list[dict[str, object]] = []
+            for index, document in enumerate(documents):
+                metadata = dict(document.metadata)
+                source_id = str(metadata.get("source_id", f"document_{index}"))
+                document_type = str(metadata.get("document_type", "dataset_overview"))
+                chunk_index = int(metadata.get("chunk_index", index))
+                metadata["chunk_index"] = chunk_index
+                rows.append(
+                    {
+                        "dataset_id": agent_input.sessionId,
+                        "source_id": source_id,
+                        "document_type": document_type,
+                        "chunk_index": chunk_index,
+                        "content": document.page_content,
+                        "metadata": metadata,
+                        "embedding": [float(value) for value in embeddings[index]],
+                    }
+                )
+            self.storage.insert_document_chunks(rows, batch_size=50)
             self._completed_signatures[agent_input.sessionId] = signature
             vector_size = len(embeddings[0]) if embeddings else 0
             return IndexStatus(
                 session_id=agent_input.sessionId,
-                collection_name=store.collection_name,
+                collection_name="document_chunks",
                 document_count=len(documents),
                 chunk_count=len(documents),
                 vector_size=vector_size,
@@ -118,15 +126,14 @@ class RagService:
             return False
 
     def index_exists(self, session_id: str) -> bool:
-        return self._store_for_session(session_id).index_exists()
+        return session_id in self._completed_signatures
 
     def delete_session_index(self, session_id: str) -> None:
-        self._store_for_session(session_id).delete_session_index()
+        self.storage.delete_document_chunks(session_id)
         self._completed_signatures.pop(session_id, None)
 
     def close(self) -> None:
-        for store in list(self._stores.values()):
-            store.close()
+        return None
 
     def retrieve(
         self,
@@ -134,8 +141,31 @@ class RagService:
         query: str,
     ) -> list[RetrievedDocument]:
         try:
-            retriever = RagRetriever(self._store_for_session(agent_input.sessionId))
-            return retriever.retrieve(query=query, limit=VECTOR_SEARCH_LIMIT)
+            query_vector = get_embedding_service().embed_query(query)
+            rows = self.storage.match_document_chunks(
+                dataset_id=agent_input.sessionId,
+                query_embedding=[float(value) for value in query_vector],
+                match_count=VECTOR_SEARCH_LIMIT,
+                match_threshold=0.2,
+            )
+            documents = self._dedupe_retrieved(
+                [
+                    RetrievedDocument(
+                        page_content=str(row.get("content", "")).strip(),
+                        metadata=self._result_metadata(row),
+                        score=float(row.get("similarity") or 0.0),
+                    )
+                    for row in rows
+                    if str(row.get("content", "")).strip()
+                ]
+            )
+            logger.info(
+                "RAG retrieval session_id=%s query=%r candidates=%s",
+                agent_input.sessionId,
+                query[:120],
+                len(documents),
+            )
+            return documents
         except Exception:
             logger.exception(
                 "RAG retrieval failed session_id=%s",
@@ -251,32 +281,11 @@ class RagService:
             )
             return None
 
-    def _valid_index(
-        self,
-        store: RagVectorStore,
-        signature: dict[str, str | int | float],
-    ) -> bool:
-        cached = self._completed_signatures.get(store.session_id)
-        if cached == signature and store.index_exists():
-            return True
-        meta = store.read_index_meta()
-        return bool(
-            meta
-            and meta.get("file_signature") == signature
-            and store.index_exists()
-        )
-
     def _lock_for_session(self, session_id: str) -> threading.Lock:
         with self._service_lock:
             if session_id not in self._index_locks:
                 self._index_locks[session_id] = threading.Lock()
             return self._index_locks[session_id]
-
-    def _store_for_session(self, session_id: str) -> RagVectorStore:
-        with self._service_lock:
-            if session_id not in self._stores:
-                self._stores[session_id] = RagVectorStore(session_id)
-            return self._stores[session_id]
 
     @staticmethod
     def _file_signature(file_path: str) -> dict[str, str | int | float]:
@@ -286,6 +295,32 @@ class RagService:
             "path": str(path),
             "size": int(stat.st_size),
             "mtime_ns": int(stat.st_mtime_ns),
+        }
+
+    @staticmethod
+    def _dedupe_retrieved(documents: list[RetrievedDocument]) -> list[RetrievedDocument]:
+        output: list[RetrievedDocument] = []
+        seen: set[str] = set()
+        for document in documents:
+            key = f"{document.metadata.get('source_id')}:{document.page_content}"
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(document)
+        return output
+
+    @staticmethod
+    def _result_metadata(row: dict[str, object]) -> dict[str, str | int | float | bool]:
+        raw_metadata = row.get("metadata")
+        metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+        metadata["source_id"] = str(row.get("source_id", metadata.get("source_id", "")))
+        metadata["document_type"] = str(
+            row.get("document_type", metadata.get("document_type", "dataset_overview"))
+        )
+        return {
+            str(key): value
+            for key, value in metadata.items()
+            if isinstance(value, str | int | float | bool)
         }
 
 

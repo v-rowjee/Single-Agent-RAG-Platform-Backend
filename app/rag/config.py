@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
-
-RAG_STORAGE_ROOT = Path("app/storage/rag")
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 RERANKER_MODEL_NAME = "Xenova/ms-marco-MiniLM-L-6-v2"
 

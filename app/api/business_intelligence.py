@@ -56,6 +56,7 @@ async def upload_file(
         ) from error
 
     except Exception as error:
+        print(f"Unexpected error during file upload: {error}")
         raise HTTPException(
             status_code=500,
             detail="An unexpected error occurred while processing the file.",
