@@ -1,3 +1,85 @@
-/.env
-/app/storage/**
-**/__pycache__/
+# Environment and secrets
+.env
+.env.*
+!.env.sample
+*.pem
+*.key
+*.crt
+*.p12
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test, coverage, and quality reports
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+junit.xml
+test-results/
+
+# Logs and runtime files
+*.log
+logs/
+*.pid
+*.seed
+
+# Local app data and uploads
+/app/storage/*
+!/app/storage/.gitkeep
+/uploads/
+/tmp/
+/temp/
+
+# Local databases and generated data
+*.db
+*.sqlite
+*.sqlite3
+*.duckdb
+*.parquet
+*.pkl
+
+# RAG/vector index artifacts
+.chroma/
+chroma/
+faiss_index/
+*.faiss
+*.index
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+
+# IDE/editor files
+.idea/
+.vscode/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Dependency/tool caches
+.cache/
+.pip-cache/
