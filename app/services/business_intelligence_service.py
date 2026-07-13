@@ -231,7 +231,7 @@ class BusinessIntelligenceService:
         dataset_info = self._inspect_file(dataset.file_name, content)
         with self._temporary_agent_input(dataset, content) as agent_input:
             try:
-                from app.agents.business_intelligence_agent import (
+                from app.agents.single.business_intelligence_agent import (
                     business_intelligence_agent,
                 )
 
@@ -267,7 +267,7 @@ class BusinessIntelligenceService:
         try:
             self.storage.update_dataset_status(dataset.id, rag_status="indexing")
 
-            from app.agents.business_intelligence_agent import (
+            from app.agents.single.business_intelligence_agent import (
                 business_intelligence_agent,
             )
             from app.rag.rag_service import rag_service
@@ -301,7 +301,7 @@ class BusinessIntelligenceService:
         history: list[dict[str, str]],
     ) -> tuple[str, list[str]]:
         try:
-            from app.agents.business_intelligence_agent import (
+            from app.agents.single.business_intelligence_agent import (
                 business_intelligence_agent,
             )
 
