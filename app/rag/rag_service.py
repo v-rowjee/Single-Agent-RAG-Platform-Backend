@@ -22,6 +22,8 @@ from app.services.supabase_service import SupabaseService, supabase_service
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_RETRIEVAL_LIMIT = 6
+
 
 class RagService:
     def __init__(self, storage: SupabaseService | None = None) -> None:
@@ -74,13 +76,24 @@ class RagService:
                 session_id=agent_input.sessionId,
                 file_name=agent_input.fileName,
             )
+            logger.info(
+                "Retrieval replacement started session_id=%s document_count=%s",
+                agent_input.sessionId,
+                len(documents),
+            )
+            # document_chunks is keyed by dataset_id, which is the single-agent
+            # session identifier.  Delete only this session before replacements.
+            self.storage.delete_document_chunks(agent_input.sessionId)
+            logger.info(
+                "Existing session documents deleted session_id=%s",
+                agent_input.sessionId,
+            )
             embeddings = get_embedding_service().embed_documents(
                 [document.page_content for document in documents]
             )
             if documents and len(documents) != len(embeddings):
                 raise ValueError("Document and embedding counts do not match.")
 
-            self.storage.delete_document_chunks(agent_input.sessionId)
             rows: list[dict[str, object]] = []
             for index, document in enumerate(documents):
                 metadata = dict(document.metadata)
@@ -100,6 +113,11 @@ class RagService:
                     }
                 )
             self.storage.insert_document_chunks(rows, batch_size=50)
+            logger.info(
+                "New documents indexed session_id=%s indexed_count=%s",
+                agent_input.sessionId,
+                len(rows),
+            )
             self._completed_signatures[agent_input.sessionId] = signature
             vector_size = len(embeddings[0]) if embeddings else 0
             return IndexStatus(
@@ -172,6 +190,45 @@ class RagService:
                 agent_input.sessionId,
             )
             return []
+
+    def retrieve_for_session(
+        self,
+        session_id: str,
+        query: str,
+        limit: int = DEFAULT_RETRIEVAL_LIMIT,
+    ) -> list[RetrievedDocument]:
+        """Retrieve multi-agent evidence through the database-scoped vector query."""
+        if not session_id:
+            raise ValueError("A session ID is required for retrieval.")
+
+        query_vector = get_embedding_service().embed_query(query)
+        logger.info(
+            "RAG session filter applied session_id=%s dataset_id=%s",
+            session_id,
+            session_id,
+        )
+        rows = self.storage.match_document_chunks(
+            dataset_id=session_id,
+            query_embedding=[float(value) for value in query_vector],
+            match_count=limit,
+            match_threshold=0.2,
+        )
+        documents = self._dedupe_retrieved(
+            [
+                RetrievedDocument(
+                    page_content=str(row.get("content", "")).strip(),
+                    metadata=self._result_metadata(row),
+                    score=float(row.get("similarity") or 0.0),
+                )
+                for row in rows
+                if str(row.get("content", "")).strip()
+            ]
+        )
+        return [
+            document
+            for document in documents
+            if self._matches_session(document, session_id)
+        ][:limit]
 
     def rerank(
         self,
@@ -310,18 +367,26 @@ class RagService:
         return output
 
     @staticmethod
-    def _result_metadata(row: dict[str, object]) -> dict[str, str | int | float | bool]:
+    def _result_metadata(row: dict[str, object]) -> dict[str, Any]:
         raw_metadata = row.get("metadata")
         metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
         metadata["source_id"] = str(row.get("source_id", metadata.get("source_id", "")))
         metadata["document_type"] = str(
             row.get("document_type", metadata.get("document_type", "dataset_overview"))
         )
-        return {
-            str(key): value
-            for key, value in metadata.items()
-            if isinstance(value, str | int | float | bool)
-        }
+        if row.get("dataset_id") is not None:
+            metadata.setdefault("dataset_id", str(row["dataset_id"]))
+        return {str(key): value for key, value in metadata.items()}
+
+    @staticmethod
+    def _matches_session(document: RetrievedDocument, session_id: str) -> bool:
+        metadata = document.metadata
+        indexed_session_id = str(metadata.get("session_id") or "").strip()
+        indexed_dataset_id = str(metadata.get("dataset_id") or "").strip()
+        return (
+            (not indexed_session_id or indexed_session_id == session_id)
+            and (not indexed_dataset_id or indexed_dataset_id == session_id)
+        )
 
 
 class DeterministicAnalytics:

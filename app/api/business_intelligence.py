@@ -1,7 +1,9 @@
 from typing import Any, Literal
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
+from app.schemas.business_intelligence import ChatRequest, ChatResponse
 
 from app.services.business_intelligence_service import (
     InvalidUploadError,
@@ -13,24 +15,12 @@ from app.services.business_intelligence_service import (
 router = APIRouter(tags=["business-intelligence"])
 
 
-class ChatRequest(BaseModel):
-    sessionId: str = Field(min_length=1)
-    query: str = Field(min_length=1)
-
-
 class ChatMessage(BaseModel):
     id: str
     role: Literal["user", "assistant"]
     content: str
     grounded: bool = False
     createdAt: str
-
-
-class ChatResponse(BaseModel):
-    response: str
-    userMessage: ChatMessage
-    assistantMessage: ChatMessage
-    messages: list[ChatMessage]
 
 
 class ChatHistoryResponse(BaseModel):
@@ -64,9 +54,11 @@ async def upload_file(
 
 
 @router.get("/dashboard/{session_id}")
-def get_dashboard(session_id: str) -> dict[str, Any]:
+async def get_dashboard(session_id: str) -> dict[str, Any]:
     try:
-        return business_intelligence_service.get_dashboard(session_id)
+        return (
+            await business_intelligence_service.get_dashboard(session_id)
+        ).model_dump(mode="json")
 
     except SessionNotFoundError as error:
         raise HTTPException(
@@ -84,12 +76,10 @@ def get_dashboard(session_id: str) -> dict[str, Any]:
 @router.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest) -> ChatResponse:
     try:
-        result = business_intelligence_service.chat(
+        return business_intelligence_service.chat(
             session_id=request.sessionId,
             query=request.query,
         )
-
-        return ChatResponse(**result)
 
     except SessionNotFoundError as error:
         raise HTTPException(

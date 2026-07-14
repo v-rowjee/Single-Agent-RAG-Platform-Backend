@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 
 DocumentType = Literal[
@@ -26,13 +26,13 @@ QueryType = Literal[
 @dataclass(slots=True)
 class RagDocument:
     page_content: str
-    metadata: dict[str, str | int | float | bool] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
 class RetrievedDocument:
     page_content: str
-    metadata: dict[str, str | int | float | bool]
+    metadata: dict[str, Any]
     score: float
 
 

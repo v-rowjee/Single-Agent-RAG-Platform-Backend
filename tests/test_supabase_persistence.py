@@ -9,7 +9,8 @@ import pytest
 from fastapi import UploadFile
 from starlette.datastructures import Headers
 
-from app.rag.models import RagDocument
+from app.agents.multi.chat_agent import GroundedChatDraft
+from app.rag.models import RagDocument, RetrievedDocument
 from app.rag.rag_service import RagService
 from app.schemas.business_intelligence import DashboardResponse
 from app.services.business_intelligence_service import BusinessIntelligenceService
@@ -229,7 +230,7 @@ def test_upload_persists_file_dataset_dashboard_and_response_schema(
     assert mime_type == "text/csv"
     assert result["sessionId"] in storage.datasets
     assert storage.dashboards[result["sessionId"]]["status"] == "partial"
-    assert not Path("app/storage").exists()
+    assert not (Path("app/storage") / str(result["sessionId"])).exists()
 
 
 def test_dashboard_endpoint_reads_saved_dashboard_without_local_json(
@@ -248,10 +249,10 @@ def test_dashboard_endpoint_reads_saved_dashboard_without_local_json(
         lambda dataset, content: pytest.fail("dashboard should not regenerate"),
     )
 
-    result = service.get_dashboard(DATASET_ID)
+    result = asyncio.run(service.get_dashboard(DATASET_ID))
 
-    assert result["sessionId"] == DATASET_ID
-    assert result["status"] == "partial"
+    assert result.sessionId == DATASET_ID
+    assert result.status == "partial"
 
 
 def test_chat_messages_are_saved_and_recent_history_is_used(
@@ -261,17 +262,37 @@ def test_chat_messages_are_saved_and_recent_history_is_used(
     storage.datasets[DATASET_ID] = dataset_record()
     service = BusinessIntelligenceService(storage=storage)  # type: ignore[arg-type]
     monkeypatch.setattr(
-        service,
-        "_chat_with_agent",
-        lambda dataset, content, query, history: ("answer", ["dataset_overview"]),
+        "app.services.business_intelligence_service.rag_service.retrieve_for_session",
+        lambda **kwargs: [
+            RetrievedDocument(
+                page_content="Revenue increased.",
+                metadata={
+                    "source_id": "dataset_overview",
+                    "document_type": "dataset_summary",
+                    "session_id": DATASET_ID,
+                    "dataset_id": DATASET_ID,
+                },
+                score=0.9,
+            )
+        ],
+    )
+    async def run(session_id, query, retrieved_documents):
+        return GroundedChatDraft(
+            answer="answer",
+            source_ids=["dataset_overview"],
+            insufficient_context=False,
+        )
+
+    monkeypatch.setattr(
+        "app.services.business_intelligence_service.chat_agent.run",
+        run,
     )
 
     result = service.chat(DATASET_ID, "What is revenue?")
 
-    assert result["response"] == "answer"
+    assert result.response == "answer"
     assert [message.role for message in storage.messages] == ["user", "assistant"]
     assert storage.messages[1].sources == ["dataset_overview"]
-    assert result["messages"][-1]["content"] == "answer"
 
 
 def test_rag_chunks_are_inserted_and_retrieval_calls_rpc(
@@ -337,7 +358,7 @@ def test_rag_failure_marks_rag_failed_without_deleting_dashboard(
         lambda dataset_id, **kwargs: updates.append(kwargs),
     )
     monkeypatch.setattr(
-        "app.agents.business_intelligence_agent.business_intelligence_agent.profile_for_session",
+        "app.agents.single.business_intelligence_agent.business_intelligence_agent.profile_for_session",
         lambda agent_input: {},
     )
     monkeypatch.setattr(

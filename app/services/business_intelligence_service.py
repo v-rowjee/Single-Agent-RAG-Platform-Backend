@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import logging
@@ -14,10 +15,20 @@ from uuid import UUID, uuid4
 import pandas as pd
 from fastapi import UploadFile
 
+from app.agents.multi.chat_agent import GroundedChatDraft, chat_agent
+from app.core.config import Settings, get_settings
+from app.guardrails.chat_grounding import chat_grounding_guardrail
 from app.schemas.business_intelligence import (
+    ApiMessage,
     BusinessIntelligenceAgentInput,
+    ChatResponse,
     DashboardResponse,
 )
+from app.orchestration.business_intelligence_graph import (
+    business_intelligence_graph,
+)
+from app.rag.models import RetrievedDocument
+from app.rag.rag_service import DEFAULT_RETRIEVAL_LIMIT, rag_service
 from app.services.supabase_service import (
     DatasetRecord,
     MessageRecord,
@@ -47,8 +58,13 @@ class InvalidUploadError(Exception):
 
 
 class BusinessIntelligenceService:
-    def __init__(self, storage: SupabaseService | None = None) -> None:
+    def __init__(
+        self,
+        storage: SupabaseService | None = None,
+        settings: Settings | None = None,
+    ) -> None:
         self.storage = storage or supabase_service
+        self.settings = settings or get_settings()
 
     async def create_analysis(
         self,
@@ -90,21 +106,25 @@ class BusinessIntelligenceService:
             )
             dataset_inserted = True
 
-            dashboard_response = self._generate_dashboard_from_bytes(
-                dataset=dataset,
-                content=content,
-            )
+            dashboard_response = await self._run_selected_pipeline(dataset, content)
             self._save_dashboard(dataset.id, dashboard_response)
 
-            self._try_index_rag(
-                dataset=dataset,
-                content=content,
-            )
+            if self.settings.bi_pipeline_mode == "single":
+                self._try_index_rag(
+                    dataset=dataset,
+                    content=content,
+                )
 
             self.storage.update_dataset_status(
                 dataset.id,
-                status="ready",
-                error_message=None,
+                status=(
+                    "failed" if dashboard_response.status == "failed" else "ready"
+                ),
+                error_message=(
+                    "Business intelligence pipeline failed."
+                    if dashboard_response.status == "failed"
+                    else None
+                ),
             )
 
         except Exception as error:
@@ -131,78 +151,202 @@ class BusinessIntelligenceService:
             "message": "File uploaded and analysis session created successfully.",
         }
 
-    def get_dashboard(self, session_id: str) -> dict[str, Any]:
+    async def get_dashboard(self, session_id: str) -> DashboardResponse:
         dataset = self._load_dataset(session_id)
         dashboard = self.storage.get_dashboard(dataset.id)
 
         if dashboard is not None:
             try:
-                return DashboardResponse.model_validate(
-                    dashboard.response
-                ).model_dump(mode="json")
+                return DashboardResponse.model_validate(dashboard.response)
             except Exception:
                 logger.exception(
                     "Saved dashboard validation failed session_id=%s operation=get_dashboard",
                     dataset.id,
                 )
 
-        content = self.storage.download_file(dataset.storage_path)
-        dashboard_response = self._generate_dashboard_from_bytes(
-            dataset=dataset,
-            content=content,
-        )
-        self._save_dashboard(dataset.id, dashboard_response)
-        return dashboard_response.model_dump(mode="json")
+        return await self._run_selected_pipeline(dataset)
 
-    def chat(
+    async def _run_selected_pipeline(
         self,
-        session_id: str,
-        query: str,
-    ) -> dict[str, Any]:
+        session: DatasetRecord,
+        content: bytes | None = None,
+    ) -> DashboardResponse:
+        logger.info(
+            "Selected BI pipeline mode=%s session_id=%s",
+            self.settings.bi_pipeline_mode,
+            session.id,
+        )
+        if self.settings.bi_pipeline_mode == "multi":
+            return await self._run_multi_agent_pipeline(session, content)
+        return await self._run_single_agent_pipeline(session, content)
+
+    async def _run_single_agent_pipeline(
+        self,
+        session: DatasetRecord,
+        content: bytes | None = None,
+    ) -> DashboardResponse:
+        return self._generate_dashboard_from_bytes(
+            dataset=session,
+            content=(
+                content
+                if content is not None
+                else self.storage.download_file(session.storage_path)
+            ),
+        )
+
+    async def _run_multi_agent_pipeline(
+        self,
+        session: DatasetRecord,
+        content: bytes | None = None,
+    ) -> DashboardResponse:
+        """Run the compiled workflow and return only its canonical dashboard."""
+        session_id = session.id
+        content = (
+            content
+            if content is not None
+            else self.storage.download_file(session.storage_path)
+        )
+
+        with self._temporary_agent_input(session, content) as agent_input:
+            initial_state = {
+                "session_id": session_id,
+                "dataset_id": session.id,
+                "business_description": session.description,
+                "uploaded_file_path": agent_input.filePath,
+                "warnings": [],
+                "errors": [],
+                "completed_agents": [],
+                "failed_agents": [],
+                "skipped_agents": [],
+            }
+            logger.info("Multi-agent pipeline started session_id=%s", session_id)
+
+            try:
+                result = await business_intelligence_graph.ainvoke(initial_state)
+                dashboard_output = result.get("dashboard_output")
+                if not isinstance(dashboard_output, dict):
+                    raise ValueError("The workflow did not return a dashboard output.")
+
+                dashboard_output = dict(dashboard_output)
+                dashboard_output["sessionId"] = session_id
+                response = DashboardResponse.model_validate(dashboard_output)
+            except Exception:
+                logger.exception(
+                    "Unexpected multi-agent pipeline failure session_id=%s",
+                    session_id,
+                )
+                failed_response = DashboardResponse(
+                    status="failed",
+                    sessionId=session_id,
+                    dashboard=None,
+                    warnings=[],
+                    errors=[
+                        ApiMessage(
+                            code="MULTI_AGENT_PIPELINE_FAILED",
+                            message=(
+                                "The business intelligence workflow could not be "
+                                "completed."
+                            ),
+                            component="business_intelligence",
+                            recoverable=True,
+                        )
+                    ],
+                )
+                logger.info(
+                    "Multi-agent final workflow status session_id=%s status=%s",
+                    session_id,
+                    failed_response.status,
+                )
+                return failed_response
+
+        logger.info("Multi-agent pipeline completed session_id=%s", session_id)
+        logger.info(
+            "Multi-agent final workflow status session_id=%s status=%s",
+            session_id,
+            response.status,
+        )
+        return response
+
+    def chat(self, session_id: str, query: str) -> ChatResponse:
         dataset = self._load_dataset(session_id)
         cleaned_query = query.strip()
 
         if not cleaned_query:
             raise ValueError("The chat query cannot be empty.")
 
-        user_message = self.storage.save_message(
+        self.storage.save_message(
             dataset_id=dataset.id,
             role="user",
             content=cleaned_query,
             sources=[],
         )
-        recent_messages = self.storage.get_recent_messages(dataset.id, limit=6)
-        agent_history = [
-            {"role": message.role, "content": message.content}
-            for message in recent_messages
-            if message.role in {"user", "assistant"}
-        ]
+        logger.info("Chat retrieval started session_id=%s", dataset.id)
+        try:
+            documents = rag_service.retrieve_for_session(
+                session_id=dataset.id,
+                query=cleaned_query,
+                limit=DEFAULT_RETRIEVAL_LIMIT,
+            )
+            logger.info(
+                "Chat documents retrieved session_id=%s count=%s",
+                dataset.id,
+                len(documents),
+            )
+        except Exception:
+            logger.exception(
+                "Chat retrieval or generation failed session_id=%s operation=retrieval",
+                dataset.id,
+            )
+            return self._save_chat_response(
+                dataset.id,
+                "The analysis assistant could not answer this question at the moment.",
+                [],
+            )
 
-        content = self.storage.download_file(dataset.storage_path)
-        response_text, source_ids = self._chat_with_agent(
-            dataset=dataset,
-            content=content,
-            query=cleaned_query,
-            history=agent_history,
+        try:
+            draft = asyncio.run(
+                chat_agent.run(
+                    session_id=dataset.id,
+                    query=cleaned_query,
+                    retrieved_documents=documents,
+                )
+            )
+            guarded_draft = chat_grounding_guardrail.validate(
+                query=cleaned_query,
+                retrieved_documents=documents,
+                draft=draft,
+            )
+            logger.info("Chat response guarded session_id=%s", dataset.id)
+        except Exception:
+            logger.exception(
+                "Chat agent or grounding failed session_id=%s",
+                dataset.id,
+            )
+            guarded_draft = GroundedChatDraft(
+                answer="The analysis assistant could not answer this question at the moment.",
+                source_ids=[],
+                insufficient_context=True,
+            )
+
+        return self._save_chat_response(
+            dataset.id,
+            guarded_draft.answer,
+            guarded_draft.source_ids,
         )
-        assistant_message = self.storage.save_message(
-            dataset_id=dataset.id,
+
+    def _save_chat_response(
+        self,
+        dataset_id: str,
+        response_text: str,
+        source_ids: list[str],
+    ) -> ChatResponse:
+        self.storage.save_message(
+            dataset_id=dataset_id,
             role="assistant",
             content=response_text,
             sources=source_ids,
         )
-
-        messages = self.storage.get_recent_messages(dataset.id, limit=50)
-
-        return {
-            "response": response_text,
-            "userMessage": self._chat_message(user_message),
-            "assistantMessage": self._chat_message(
-                assistant_message,
-                grounded=True,
-            ),
-            "messages": [self._chat_message(message) for message in messages],
-        }
+        return ChatResponse(response=response_text)
 
     def get_chat_history(self, session_id: str) -> dict[str, Any]:
         dataset = self._load_dataset(session_id)

@@ -16,3 +16,4 @@ langchain-openai
 langgraph
 fastembed
 pytest
+timesfm[torch]
