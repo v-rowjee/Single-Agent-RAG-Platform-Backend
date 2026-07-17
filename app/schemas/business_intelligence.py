@@ -244,7 +244,10 @@ class Dashboard(BaseModel):
     supportingCharts: list[SupportingChart] = Field(max_length=4)
     analysis: DashboardAnalysis
     insights: DashboardInsights
-    recommendedActions: list[RecommendedAction]
+    recommendedActions: list[RecommendedAction] = Field(
+        min_length=3,
+        max_length=5,
+    )
     datasetSummary: DatasetSummary
     sections: list[Section]
     layout: DashboardLayout

@@ -9,10 +9,19 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pandas as pd
-from groq import AsyncGroq
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 
-MODEL_NAME = "llama-3.3-70b-versatile"
+from app.agents.multi.analysis_series import (
+    aggregation_for_measure,
+    period_frequency,
+    ranked_measures,
+    select_primary_series,
+    selected_date_column,
+    selected_granularity,
+)
+from app.core.agent_models import agent_model_policy
+from app.core.groq_structured import request_structured
+
 MAX_KPIS = 8
 MAX_TRENDS = 3
 MAX_TREND_SERIES = 10
@@ -61,6 +70,13 @@ class KPIResult(StrictModel):
     aggregation: str
     measure: str
     dimension: str | None = None
+    current_period: str | None = None
+    previous_period: str | None = None
+    previous_value: float | int | None = None
+    change_percent: float | None = None
+    baseline_period: str | None = None
+    baseline_value: float | int | None = None
+    baseline_change_percent: float | None = None
 
 
 class TrendPoint(StrictModel):
@@ -120,18 +136,17 @@ async def _request_groq_plan(prepared: dict[str, Any]) -> KPITrendPlan:
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         raise KPITrendError("GROQ_API_KEY is missing.")
-    response = await AsyncGroq(api_key=api_key).chat.completions.create(
-        model=MODEL_NAME, temperature=0.1, max_completion_tokens=800,
-        response_format={"type": "json_object"},
+    return await request_structured(
+        api_key=api_key,
+        policy=agent_model_policy("kpi_trend"),
+        response_model=KPITrendPlan,
+        schema_name="kpi_trend_plan",
+        temperature=0.1,
         messages=[
             {"role": "system", "content": "Return JSON only: {kpis:[{id,title,measure,aggregation,dimension?,dimension_value?}],trends:[{id,title,measure,aggregation,date_column,granularity,group_by?}],limitations:[]}. Use only supplied columns and supported aggregations sum, mean, median, count, distinct_count, min, max and granularities day, week, month, quarter, year. Do not calculate values."},
             {"role": "user", "content": json.dumps(_planning_payload(prepared), default=str, separators=(",", ":"))},
         ],
     )
-    try:
-        return KPITrendPlan.model_validate_json(response.choices[0].message.content or "{}")
-    except ValidationError as exc:
-        raise KPITrendError(f"Invalid Groq KPI plan: {exc}") from exc
 
 
 def _is_numeric(df: pd.DataFrame, column: str) -> bool:
@@ -139,7 +154,7 @@ def _is_numeric(df: pd.DataFrame, column: str) -> bool:
 
 
 def _frequency(granularity: str) -> str:
-    return {"day": "D", "week": "W-MON", "month": "M", "quarter": "Q", "year": "Y"}[granularity]
+    return period_frequency(granularity)
 
 
 def _slug(value: str) -> str:
@@ -147,18 +162,17 @@ def _slug(value: str) -> str:
 
 
 def _fallback_aggregation(measure: str) -> str:
-    additive_words = ("revenue", "sales", "amount", "cost", "profit", "order", "quantity", "count")
-    return "sum" if any(word in measure.lower() for word in additive_words) else "mean"
+    return aggregation_for_measure(measure)
 
 
 def _fallback_plan(prepared: dict[str, Any], df: pd.DataFrame) -> KPITrendPlan:
-    measures = [str(v) for v in prepared.get("primary_measures") or [] if _is_numeric(df, str(v))]
-    measures = measures or [str(c) for c in df if _is_numeric(df, str(c))]
+    measures = ranked_measures(prepared, df)
     kpis = [KPIDefinition(id=f"kpi_{_slug(measure)}", title=f"{_fallback_aggregation(measure).title()} {measure.replace('_', ' ').title()}", measure=measure, aggregation=_fallback_aggregation(measure)) for measure in measures[:4]]
-    date = prepared.get("date_column")
+    date = selected_date_column(prepared, df)
+    primary = select_primary_series(prepared, df)
     trends = []
-    if measures and isinstance(date, str) and date in df:
-        trends.append(TrendDefinition(id=f"trend_{_slug(measures[0])}_monthly", title=f"Monthly {measures[0].replace('_', ' ').title()}", measure=measures[0], aggregation=_fallback_aggregation(measures[0]), date_column=date, granularity="month"))
+    if primary and date:
+        trends.append(TrendDefinition(id=f"trend_{_slug(primary.measure)}_{primary.granularity}", title=f"{primary.granularity.title()} {primary.measure.replace('_', ' ').title()}", measure=primary.measure, aggregation=primary.aggregation, date_column=date, granularity=primary.granularity))
     return KPITrendPlan(kpis=kpis, trends=trends, limitations=["Deterministic planning was used because Groq planning was unavailable or invalid."])
 
 
@@ -174,6 +188,14 @@ def _valid_plan(plan: KPITrendPlan, df: pd.DataFrame, prepared: dict[str, Any]) 
             warnings.append(f"Rejected KPI `{item.id}` because its measure is not numeric."); continue
         if item.dimension and (item.dimension not in df or df[item.dimension].nunique(dropna=True) > MAX_TREND_SERIES):
             warnings.append(f"Rejected KPI `{item.id}` because its dimension is invalid or high-cardinality."); continue
+        if item.aggregation not in {"count", "distinct_count"}:
+            expected = aggregation_for_measure(item.measure)
+            if item.aggregation != expected:
+                warnings.append(
+                    f"Adjusted KPI `{item.id}` aggregation from "
+                    f"`{item.aggregation}` to `{expected}`."
+                )
+                item = item.model_copy(update={"aggregation": expected})
         used.add(item.id); kpis.append(item)
     for item in plan.trends[:MAX_TRENDS]:
         if item.id in used or item.measure not in df or item.date_column not in df or item.aggregation not in SUPPORTED_AGGREGATIONS or item.granularity not in SUPPORTED_GRANULARITIES:
@@ -182,8 +204,84 @@ def _valid_plan(plan: KPITrendPlan, df: pd.DataFrame, prepared: dict[str, Any]) 
             warnings.append(f"Rejected trend `{item.id}` because its measure is not numeric."); continue
         if item.group_by and (item.group_by not in df or df[item.group_by].nunique(dropna=True) > MAX_TREND_SERIES):
             warnings.append(f"Rejected trend `{item.id}` because its grouping is invalid or high-cardinality."); continue
+        if item.aggregation not in {"count", "distinct_count"}:
+            expected = aggregation_for_measure(item.measure)
+            if item.aggregation != expected:
+                warnings.append(
+                    f"Adjusted trend `{item.id}` aggregation from "
+                    f"`{item.aggregation}` to `{expected}`."
+                )
+                item = item.model_copy(update={"aggregation": expected})
         used.add(item.id); trends.append(item)
     return KPITrendPlan(kpis=kpis, trends=trends, limitations=plan.limitations), warnings
+
+
+def _ensure_core_definitions(
+    plan: KPITrendPlan,
+    prepared: dict[str, Any],
+    df: pd.DataFrame,
+) -> KPITrendPlan:
+    """Guarantee useful KPI coverage and one forecast-aligned primary trend."""
+    kpis = list(plan.kpis)
+    used_measures = {item.measure for item in kpis}
+    for measure in ranked_measures(prepared, df):
+        if len(kpis) >= 4:
+            break
+        if measure in used_measures:
+            continue
+        aggregation = aggregation_for_measure(measure)
+        kpis.append(
+            KPIDefinition(
+                id=f"kpi_{_slug(measure)}",
+                title=f"{aggregation.title()} {measure.replace('_', ' ').title()}",
+                measure=measure,
+                aggregation=aggregation,
+            )
+        )
+        used_measures.add(measure)
+
+    trends = list(plan.trends)
+    primary = select_primary_series(prepared, df)
+    if primary:
+        matching = next(
+            (
+                item
+                for item in trends
+                if item.measure == primary.measure
+                and item.date_column == primary.date_column
+            ),
+            None,
+        )
+        primary_trend = (
+            matching.model_copy(
+                update={
+                    "aggregation": primary.aggregation,
+                    "granularity": primary.granularity,
+                    "group_by": None,
+                }
+            )
+            if matching
+            else TrendDefinition(
+                id=f"trend_{_slug(primary.measure)}_{primary.granularity}",
+                title=(
+                    f"{primary.granularity.title()} "
+                    f"{primary.measure.replace('_', ' ').title()}"
+                ),
+                measure=primary.measure,
+                aggregation=primary.aggregation,
+                date_column=primary.date_column,
+                granularity=primary.granularity,
+            )
+        )
+        trends = [
+            primary_trend,
+            *[
+                item
+                for item in trends
+                if item.id != primary_trend.id and item is not matching
+            ],
+        ]
+    return plan.model_copy(update={"kpis": kpis[:MAX_KPIS], "trends": trends[:MAX_TRENDS]})
 
 
 def _aggregate(series: pd.Series, aggregation: str) -> float | int | None:
@@ -195,15 +293,91 @@ def _aggregate(series: pd.Series, aggregation: str) -> float | int | None:
     return round(value, 6) if math.isfinite(value) else None
 
 
-def _calculate_kpis(df: pd.DataFrame, plan: KPITrendPlan) -> list[KPIResult]:
+def _calculate_kpis(
+    df: pd.DataFrame,
+    plan: KPITrendPlan,
+    prepared: dict[str, Any],
+) -> list[KPIResult]:
     results: list[KPIResult] = []
+    date_column = selected_date_column(prepared, df)
+    granularity = selected_granularity(prepared)
     for item in plan.kpis:
         source = df
         if item.dimension and item.dimension_value is not None:
             source = df[df[item.dimension].astype(str) == str(item.dimension_value)]
-        value = _aggregate(source[item.measure], item.aggregation)
+        current_period: str | None = None
+        previous_period: str | None = None
+        previous_value: float | int | None = None
+        change_percent: float | None = None
+        baseline_period: str | None = None
+        baseline_value: float | int | None = None
+        baseline_change_percent: float | None = None
+        value: float | int | None = None
+        if date_column:
+            data = source[[date_column, item.measure]].copy()
+            data[date_column] = pd.to_datetime(data[date_column], errors="coerce")
+            data = data.dropna(subset=[date_column])
+            if not data.empty:
+                data["_period"] = data[date_column].dt.to_period(
+                    _frequency(granularity)
+                )
+                grouped = (
+                    data.groupby("_period", observed=True)[item.measure]
+                    .apply(lambda series: _aggregate(series, item.aggregation))
+                    .dropna()
+                    .sort_index()
+                )
+                if not grouped.empty:
+                    current_period = str(grouped.index[-1])
+                    value = grouped.iloc[-1]
+                    baseline_period = str(grouped.index[0])
+                    baseline_value = grouped.iloc[0]
+                    current_number = float(grouped.iloc[-1])
+                    baseline_number = float(grouped.iloc[0])
+                    if baseline_number != 0:
+                        baseline_change_percent = round(
+                            (current_number - baseline_number)
+                            / abs(baseline_number)
+                            * 100,
+                            2,
+                        )
+                    elif current_number == 0:
+                        baseline_change_percent = 0.0
+                if len(grouped) >= 2:
+                    previous_period = str(grouped.index[-2])
+                    previous_value = grouped.iloc[-2]
+                    current_number = float(grouped.iloc[-1])
+                    previous_number = float(grouped.iloc[-2])
+                    if previous_number != 0:
+                        change_percent = round(
+                            (current_number - previous_number)
+                            / abs(previous_number)
+                            * 100,
+                            2,
+                        )
+                    elif current_number == 0:
+                        change_percent = 0.0
+        if value is None:
+            value = _aggregate(source[item.measure], item.aggregation)
         if value is not None:
-            results.append(KPIResult(id=item.id, title=item.title, value=value, raw_value=value, aggregation=item.aggregation, measure=item.measure, dimension=item.dimension))
+            results.append(
+                KPIResult(
+                    id=item.id,
+                    title=item.title,
+                    value=value,
+                    raw_value=value,
+                    aggregation=item.aggregation,
+                    measure=item.measure,
+                    dimension=item.dimension,
+                    current_period=current_period,
+                    previous_period=previous_period,
+                    previous_value=previous_value,
+                    change_percent=change_percent,
+                    baseline_period=baseline_period,
+                    baseline_value=baseline_value,
+                    baseline_change_percent=baseline_change_percent,
+                )
+            )
     return results
 
 
@@ -239,7 +413,8 @@ class KPITrendAgent:
         except Exception as exc:
             warnings.append(f"{exc}")
             plan = _fallback_plan(prepared_dataset, df)
-        kpis = _calculate_kpis(df, plan)
+        plan = _ensure_core_definitions(plan, prepared_dataset, df)
+        kpis = _calculate_kpis(df, plan, prepared_dataset)
         trends, trend_warnings = _calculate_trends(df, plan)
         warnings.extend(trend_warnings)
         return KPITrendOutput(status="complete" if kpis or trends else "partial", kpis=kpis, trends=trends, warnings=warnings, limitations=[*(prepared_dataset.get("limitations") or []), *plan.limitations])

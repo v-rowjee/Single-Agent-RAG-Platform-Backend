@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable
+import logging
+from typing import Any, Awaitable, Callable, Mapping
 
 from langgraph.graph import END, START, StateGraph
 
@@ -33,6 +34,8 @@ from app.services.retrieval_indexing_service import retrieval_indexing_service
 from .routing import route_specialists
 from .state import BusinessIntelligenceState
 
+
+logger = logging.getLogger(__name__)
 
 StateNode = Callable[
     [BusinessIntelligenceState],
@@ -112,6 +115,21 @@ async def output_join_node(
 async def retrieval_indexing_node(
     state: BusinessIntelligenceState,
 ) -> dict[str, Any]:
+    if "retrieval_preparation" in set(state.get("failed_agents", [])):
+        return {
+            "retrieval_indexing_result": {
+                "status": "failed",
+                "document_count": 0,
+                "indexed_count": 0,
+                "failed_count": 0,
+                "message": "Retrieval preparation failed.",
+            },
+            "failed_agents": ["retrieval_indexing"],
+            "warnings": [
+                "Retrieval indexing was skipped because retrieval preparation failed."
+            ],
+        }
+
     result = retrieval_indexing_service.index_documents(
         session_id=str(state.get("session_id") or ""),
         dataset_id=str(state.get("dataset_id") or state.get("session_id") or ""),
@@ -153,6 +171,8 @@ def _workflow_status(state: BusinessIntelligenceState) -> str:
     )
     optional_failure = bool(
         ({"anomaly_detection", "forecasting"} & selected & failed)
+        or "kpi_trend" in failed
+        or "insight_synthesis" in failed
         or "retrieval_preparation" in failed
         or "retrieval_indexing" in failed
         or ("forecasting" in selected and not (state.get("forecasting_output") or {}).get("forecast"))
@@ -220,44 +240,205 @@ async def persistence_node(
     }
 
 
+def _recoverable_node(
+    name: str,
+    node: StateNode,
+    *,
+    empty_update: Mapping[str, Any],
+    required: bool = False,
+) -> StateNode:
+    """Keep optional branch failures in state so graph fan-in can still finish."""
+
+    async def run(state: BusinessIntelligenceState) -> dict[str, Any]:
+        try:
+            return await node(state)
+        except Exception as exc:
+            logger.exception("Multi-agent node failed node=%s", name)
+            message = f"{name.replace('_', ' ').title()} failed: {exc}"
+            update = dict(empty_update)
+            update["failed_agents"] = [name]
+            update["errors" if required else "warnings"] = [message]
+            return update
+
+    return run
+
+
 def build_business_intelligence_graph(
     *,
     generic_cleaning_node_fn: StateNode | None = None,
     data_preparation_node_fn: StateNode | None = None,
     orchestrator_node_fn: StateNode | None = None,
+    node_overrides: Mapping[str, StateNode] | None = None,
 ):
     """Build the workflow through specialist analysis and output fan-in."""
+    overrides = dict(node_overrides or {})
+    if generic_cleaning_node_fn is not None:
+        overrides["generic_cleaning"] = generic_cleaning_node_fn
+    if data_preparation_node_fn is not None:
+        overrides["data_preparation"] = data_preparation_node_fn
+    if orchestrator_node_fn is not None:
+        overrides["orchestrator"] = orchestrator_node_fn
+
+    def selected(name: str, default: StateNode) -> StateNode:
+        return overrides.get(name, default)
+
     graph = StateGraph(BusinessIntelligenceState)
-    graph.add_node("generic_cleaning", generic_cleaning_node_fn or generic_cleaning_node)
+    graph.add_node(
+        "generic_cleaning",
+        selected("generic_cleaning", generic_cleaning_node),
+    )
     graph.add_node(
         "data_preparation",
-        data_preparation_node_fn or data_preparation_graph_node,
+        selected("data_preparation", data_preparation_graph_node),
     )
-    graph.add_node("orchestrator", orchestrator_node_fn or orchestrator_node)
-    graph.add_node("kpi_trend", kpi_trend_node)
-    graph.add_node("anomaly_detection", anomaly_detection_node)
-    graph.add_node("forecasting", forecasting_node)
-    graph.add_node("specialist_join", specialist_join_node)
-    graph.add_node("insight_synthesis", insight_synthesis_node)
-    graph.add_node("dashboard_generation", dashboard_generation_node)
-    graph.add_node("retrieval_preparation", retrieval_preparation_node)
-    graph.add_node("retrieval_indexing", retrieval_indexing_node)
-    graph.add_node("output_join", output_join_node)
-    graph.add_node("persistence", persistence_node)
+    graph.add_node(
+        "orchestrator",
+        selected("orchestrator", orchestrator_node),
+    )
+    graph.add_node(
+        "kpi_trend",
+        _recoverable_node(
+            "kpi_trend",
+            selected("kpi_trend", kpi_trend_node),
+            empty_update={
+                "kpi_trend_output": {
+                    "status": "partial",
+                    "kpis": [],
+                    "trends": [],
+                    "warnings": [],
+                    "limitations": ["KPI and trend analysis failed."],
+                }
+            },
+        ),
+    )
+    graph.add_node(
+        "anomaly_detection",
+        _recoverable_node(
+            "anomaly_detection",
+            selected("anomaly_detection", anomaly_detection_node),
+            empty_update={
+                "anomaly_output": {
+                    "status": "partial",
+                    "anomalies": [],
+                    "warnings": [],
+                    "limitations": ["Anomaly detection failed."],
+                }
+            },
+        ),
+    )
+    graph.add_node(
+        "forecasting",
+        _recoverable_node(
+            "forecasting",
+            selected("forecasting", forecasting_node),
+            empty_update={
+                "forecasting_output": {
+                    "status": "partial",
+                    "historical": [],
+                    "forecast": [],
+                    "warnings": [],
+                    "limitations": ["Forecasting failed."],
+                }
+            },
+        ),
+    )
+    graph.add_node(
+        "specialist_join",
+        selected("specialist_join", specialist_join_node),
+    )
+    graph.add_node(
+        "insight_synthesis",
+        _recoverable_node(
+            "insight_synthesis",
+            selected("insight_synthesis", insight_synthesis_node),
+            empty_update={
+                "synthesis_output": {
+                    "status": "partial",
+                    "executive_summary": (
+                        "Specialist outputs are available, but insight synthesis failed."
+                    ),
+                    "key_insights": [],
+                    "recommendations": [],
+                    "warnings": [],
+                    "limitations": ["Insight synthesis failed."],
+                }
+            },
+        ),
+    )
+    graph.add_node(
+        "dashboard_generation",
+        _recoverable_node(
+            "dashboard_generation",
+            selected("dashboard_generation", dashboard_generation_node),
+            empty_update={},
+            required=True,
+        ),
+    )
+    graph.add_node(
+        "retrieval_preparation",
+        _recoverable_node(
+            "retrieval_preparation",
+            selected("retrieval_preparation", retrieval_preparation_node),
+            empty_update={
+                "retrieval_documents": [],
+                "retrieval_output": {
+                    "status": "partial",
+                    "documents": [],
+                    "warnings": [],
+                    "limitations": ["Retrieval preparation failed."],
+                },
+            },
+        ),
+    )
+    graph.add_node(
+        "retrieval_indexing",
+        _recoverable_node(
+            "retrieval_indexing",
+            selected("retrieval_indexing", retrieval_indexing_node),
+            empty_update={
+                "retrieval_indexing_result": {
+                    "status": "failed",
+                    "document_count": 0,
+                    "indexed_count": 0,
+                    "failed_count": 0,
+                    "message": "Retrieval indexing failed.",
+                }
+            },
+        ),
+    )
+    graph.add_node(
+        "output_join",
+        selected("output_join", output_join_node),
+    )
+    graph.add_node(
+        "persistence",
+        selected("persistence", persistence_node),
+    )
 
     graph.add_edge(START, "generic_cleaning")
     graph.add_edge("generic_cleaning", "data_preparation")
     graph.add_edge("data_preparation", "orchestrator")
-    graph.add_conditional_edges("orchestrator", route_specialists)
+    graph.add_conditional_edges(
+        "orchestrator",
+        route_specialists,
+        {
+            "kpi_trend": "kpi_trend",
+            "anomaly_detection": "anomaly_detection",
+            "forecasting": "forecasting",
+            "specialist_join": "specialist_join",
+        },
+    )
     graph.add_edge("kpi_trend", "specialist_join")
     graph.add_edge("anomaly_detection", "specialist_join")
     graph.add_edge("forecasting", "specialist_join")
     graph.add_edge("specialist_join", "insight_synthesis")
     graph.add_edge("insight_synthesis", "dashboard_generation")
     graph.add_edge("insight_synthesis", "retrieval_preparation")
-    graph.add_edge("dashboard_generation", "output_join")
     graph.add_edge("retrieval_preparation", "retrieval_indexing")
-    graph.add_edge("retrieval_indexing", "output_join")
+    graph.add_edge(
+        ["dashboard_generation", "retrieval_indexing"],
+        "output_join",
+    )
     graph.add_edge("output_join", "persistence")
     graph.add_edge("persistence", END)
     return graph.compile()

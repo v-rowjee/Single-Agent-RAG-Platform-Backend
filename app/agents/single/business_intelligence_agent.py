@@ -510,6 +510,42 @@ Do not include raw JSON, long lists, tables, code blocks, or unsupported recomme
         source_ids = [item["id"] for item in [*kpis, *charts]][:3]
 
         limitations = list(narrative.limitations)
+        actions = [
+            {
+                "id": f"action_{index}",
+                "title": action.title,
+                "description": action.description,
+                "priority": action.priority,
+                "sourceIds": source_ids,
+            }
+            for index, action in enumerate(narrative.actions, 1)
+        ]
+        for action in (
+            {
+                "id": "action_review_kpi_drivers",
+                "title": "Review KPI drivers",
+                "description": "Review the strongest available business dimensions behind the latest KPI movement.",
+                "priority": "medium",
+                "sourceIds": source_ids,
+            },
+            {
+                "id": "action_monitor_trends",
+                "title": "Monitor the next reporting period",
+                "description": "Compare the next actual result with the displayed trend and forecast before adjusting plans.",
+                "priority": "medium",
+                "sourceIds": source_ids,
+            },
+            {
+                "id": "action_data_quality",
+                "title": "Protect data quality",
+                "description": "Address missing values and duplicate-record causes before the next dashboard refresh.",
+                "priority": "low",
+                "sourceIds": source_ids,
+            },
+        ):
+            if len(actions) >= 3:
+                break
+            actions.append(action)
         warnings = []
         if not success:
             message = (
@@ -553,16 +589,7 @@ Do not include raw JSON, long lists, tables, code blocks, or unsupported recomme
                         source_ids,
                     ),
                 },
-                "recommendedActions": [
-                    {
-                        "id": f"action_{index}",
-                        "title": action.title,
-                        "description": action.description,
-                        "priority": action.priority,
-                        "sourceIds": source_ids,
-                    }
-                    for index, action in enumerate(narrative.actions, 1)
-                ],
+                "recommendedActions": actions[:5],
                 "datasetSummary": profile["summary"],
                 "sections": [
                     {

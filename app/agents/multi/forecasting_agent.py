@@ -1,21 +1,26 @@
 """Independent TimesFM forecasting specialist."""
 from __future__ import annotations
 
-import json
-import os
-import re
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy as np
 import pandas as pd
-from groq import AsyncGroq
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 
+from app.agents.multi.analysis_series import (
+    is_numeric_measure,
+    period_frequency,
+    select_primary_series,
+    selected_date_column,
+    selected_granularity,
+)
 from app.services.timesfm_service import MAX_CONTEXT, timesfm_service
 
-MODEL_NAME = "llama-3.3-70b-versatile"
-MIN_FORECAST_PERIODS = 12
-DEFAULT_HORIZON = 6
+# This matches data preparation's capability gate.  Short histories are still
+# labelled by the fallback model, while longer series can use TimesFM.
+MIN_FORECAST_PERIODS = 4
+DEFAULT_HORIZON = 3
 MAX_FORECAST_HORIZON = 24
 SUPPORTED_AGGREGATIONS = {"sum", "mean", "count"}
 SUPPORTED_GRANULARITIES = {"day", "week", "month", "quarter", "year"}
@@ -66,6 +71,8 @@ class ForecastingOutput(StrictModel):
     aggregation: str | None = None
     granularity: str | None = None
     horizon: int | None = None
+    model: str | None = None
+    confidence_level: float | None = None
     historical: list[HistoricalPoint] = Field(default_factory=list)
     forecast: list[ForecastPoint] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
@@ -79,40 +86,22 @@ def _path(prepared: dict[str, Any]) -> Path:
 
 
 def _frequency(granularity: str) -> str:
-    return {"day": "D", "week": "W-MON", "month": "M", "quarter": "Q", "year": "Y"}[granularity]
+    return period_frequency(granularity)
 
 
 def _granularity(prepared: dict[str, Any]) -> str:
-    profile = prepared.get("temporal_profile") or {}
-    value = profile.get("inferred_frequency") or prepared.get("time_granularity") or "month"
-    return value if value in SUPPORTED_GRANULARITIES else "month"
-
-
-def _metadata(prepared: dict[str, Any]) -> dict[str, Any]:
-    profile = prepared.get("dataset_profile") or {}
-    return {"columns": [{"name": item.get("name"), "type": item.get("inferred_type"), "unique_count": item.get("unique_count")} for item in profile.get("column_profiles", []) if isinstance(item, dict)][:80], "row_count": profile.get("row_count"), "primary_measures": prepared.get("primary_measures") or [], "dimension_candidates": prepared.get("dimension_candidates") or [], "date_column": prepared.get("date_column"), "temporal_profile": prepared.get("temporal_profile") or {"inferred_frequency": prepared.get("time_granularity")}, "time_series_candidates": prepared.get("time_series_candidates") or [], "capability_flags": prepared.get("capability_flags") or {}, "limitations": prepared.get("limitations") or []}
-
-
-async def _request_groq_plan(prepared: dict[str, Any]) -> ForecastPlan:
-    key = os.getenv("GROQ_API_KEY", "").strip()
-    if not key: raise ForecastingError("GROQ_API_KEY is missing.")
-    response = await AsyncGroq(api_key=key).chat.completions.create(
-        model=MODEL_NAME, temperature=0.1, max_completion_tokens=800, response_format={"type": "json_object"},
-        messages=[{"role": "system", "content": "Return JSON only: {forecast:{id,title,measure,aggregation,date_column,granularity,horizon,group_by?,group_value?},limitations:[]}. Select one supplied forecastable series using aggregation sum, mean, or count and granularity day, week, month, quarter, or year. Do not calculate forecast values."}, {"role": "user", "content": json.dumps(_metadata(prepared), default=str, separators=(",", ":"))}],
-    )
-    try: return ForecastPlan.model_validate_json(response.choices[0].message.content or "{}")
-    except ValidationError as exc: raise ForecastingError(f"Invalid Groq forecast plan: {exc}") from exc
+    return selected_granularity(prepared)
 
 
 def _numeric(df: pd.DataFrame, column: str) -> bool:
-    return column in df and pd.api.types.is_numeric_dtype(df[column])
+    return is_numeric_measure(df, column)
 
 
 def _supports(prepared: dict[str, Any], df: pd.DataFrame) -> str | None:
     flags = prepared.get("capability_flags") or {}
     if flags.get("supports_forecasting") is not True: return "Forecasting is not supported by the prepared dataset capability flags."
     if flags.get("has_temporal_data") is False: return "Forecasting requires temporal data."
-    date = prepared.get("date_column") or (prepared.get("temporal_profile") or {}).get("date_column")
+    date = selected_date_column(prepared, df)
     if not isinstance(date, str) or date not in df: return "Forecasting requires a prepared date column."
     if not any(_numeric(df, str(x)) for x in prepared.get("primary_measures") or []) and not any(_numeric(df, str(x)) for x in prepared.get("time_series_candidates") or []): return "Forecasting requires a numeric measure."
     periods = pd.to_datetime(df[date], errors="coerce").dropna().dt.to_period(_frequency(_granularity(prepared))).nunique()
@@ -120,12 +109,23 @@ def _supports(prepared: dict[str, Any], df: pd.DataFrame) -> str | None:
 
 
 def _fallback(prepared: dict[str, Any], df: pd.DataFrame) -> ForecastPlan:
-    candidates = [str(x) for x in prepared.get("time_series_candidates") or [] if _numeric(df, str(x))]
-    candidates += [str(x) for x in prepared.get("primary_measures") or [] if _numeric(df, str(x)) and str(x) not in candidates]
-    if not candidates: raise ForecastingError("No forecastable numeric measure is available.")
-    date = str(prepared.get("date_column") or (prepared.get("temporal_profile") or {}).get("date_column"))
-    measure = candidates[0]
-    return ForecastPlan(forecast=ForecastDefinition(id=f"forecast_{re.sub(r'[^a-z0-9]+', '_', measure.lower()).strip('_')}", title=f"Forecast {measure.replace('_', ' ').title()}", measure=measure, aggregation="sum", date_column=date, granularity=_granularity(prepared), horizon=DEFAULT_HORIZON), limitations=["Deterministic planning was used because Groq planning was unavailable or invalid."])
+    primary = select_primary_series(prepared, df)
+    if not primary:
+        raise ForecastingError("No forecastable primary series is available.")
+    slug = "_".join(
+        part for part in primary.measure.lower().replace("-", "_").split("_") if part
+    )
+    return ForecastPlan(
+        forecast=ForecastDefinition(
+            id=f"forecast_{slug or 'measure'}",
+            title=f"Forecast {primary.measure.replace('_', ' ').title()}",
+            measure=primary.measure,
+            aggregation=primary.aggregation,
+            date_column=primary.date_column,
+            granularity=primary.granularity,
+            horizon=DEFAULT_HORIZON,
+        )
+    )
 
 
 def _validate(plan: ForecastPlan, df: pd.DataFrame) -> ForecastDefinition:
@@ -152,6 +152,46 @@ def _prepare(df: pd.DataFrame, item: ForecastDefinition) -> pd.Series:
     return regular.iloc[-MAX_CONTEXT:]
 
 
+def _fallback_forecast(
+    series: pd.Series,
+    horizon: int,
+    granularity: str,
+) -> tuple[str, list[float], list[float] | None, list[float] | None]:
+    values = np.asarray(series.values, dtype=float)
+    seasonal_period = {
+        "day": 7,
+        "week": 52,
+        "month": 12,
+        "quarter": 4,
+        "year": 0,
+    }[granularity]
+    non_negative = bool((values >= 0).all())
+    if seasonal_period and len(values) >= seasonal_period * 2:
+        predictions = [
+            float(values[-seasonal_period + (index % seasonal_period)])
+            for index in range(horizon)
+        ]
+        residuals = values[seasonal_period:] - values[:-seasonal_period]
+        model = "seasonal_naive"
+    else:
+        recent = values[-min(12, len(values)) :]
+        x = np.arange(len(recent), dtype=float)
+        slope, intercept = np.polyfit(x, recent, 1)
+        predictions = [
+            float(slope * (len(recent) - 1 + step) + intercept)
+            for step in range(1, horizon + 1)
+        ]
+        residuals = recent - (slope * x + intercept)
+        model = "linear_trend"
+
+    if non_negative:
+        predictions = [max(0.0, value) for value in predictions]
+    spread = float(np.std(residuals)) * 1.96 if len(residuals) >= 2 else 0.0
+    lower = [max(0.0, value - spread) if non_negative else value - spread for value in predictions]
+    upper = [value + spread for value in predictions]
+    return model, predictions, lower, upper
+
+
 class ForecastingAgent:
     async def run(self, prepared_dataset: dict[str, Any]) -> ForecastingOutput:
         if not isinstance(prepared_dataset, dict): raise ForecastingError("prepared_dataset must be a dictionary.")
@@ -159,10 +199,9 @@ class ForecastingAgent:
         limitation = _supports(prepared_dataset, df)
         if limitation: return ForecastingOutput(limitations=[limitation])
         warnings: list[str] = []
-        try:
-            proposed = await _request_groq_plan(prepared_dataset); definition = _validate(proposed, df); limitations = proposed.limitations
-        except Exception as exc:
-            warnings.append(str(exc)); proposed = _fallback(prepared_dataset, df); definition = _validate(proposed, df); limitations = proposed.limitations
+        proposed = _fallback(prepared_dataset, df)
+        definition = _validate(proposed, df)
+        limitations = proposed.limitations
         try: series = _prepare(df, definition)
         except Exception as exc:
             return ForecastingOutput(series_id=definition.id, title=definition.title, measure=definition.measure, aggregation=definition.aggregation, granularity=definition.granularity, horizon=definition.horizon, limitations=[*limitations, str(exc)], warnings=warnings)
@@ -170,10 +209,25 @@ class ForecastingAgent:
         try:
             response = await timesfm_service.forecast([float(value) for value in series.values], definition.horizon)
         except Exception as exc:
-            return ForecastingOutput(series_id=definition.id, title=definition.title, measure=definition.measure, aggregation=definition.aggregation, granularity=definition.granularity, horizon=definition.horizon, historical=historical, limitations=[*limitations, f"TimesFM forecast was unavailable: {exc}"], warnings=warnings)
+            model, values, lower_bounds, upper_bounds = _fallback_forecast(
+                series,
+                definition.horizon,
+                definition.granularity,
+            )
+            limitations = [
+                *limitations,
+                f"TimesFM was unavailable; {model} fallback was used: {exc}",
+            ]
+            confidence_level = 0.95
+        else:
+            model = "TimesFM 2.5"
+            values = response.values
+            lower_bounds = response.lower_bounds
+            upper_bounds = response.upper_bounds
+            confidence_level = None
         future = pd.period_range(series.index[-1] + 1, periods=definition.horizon, freq=_frequency(definition.granularity))
-        forecast = [ForecastPoint(period=str(period), value=round(float(value), 6), lower_bound=round(float(response.lower_bounds[index]), 6) if response.lower_bounds and index < len(response.lower_bounds) else None, upper_bound=round(float(response.upper_bounds[index]), 6) if response.upper_bounds and index < len(response.upper_bounds) else None) for index, (period, value) in enumerate(zip(future, response.values))]
-        return ForecastingOutput(status="complete", series_id=definition.id, title=definition.title, measure=definition.measure, aggregation=definition.aggregation, granularity=definition.granularity, horizon=definition.horizon, historical=historical, forecast=forecast, limitations=limitations, warnings=warnings)
+        forecast = [ForecastPoint(period=str(period), value=round(float(value), 6), lower_bound=round(float(lower_bounds[index]), 6) if lower_bounds and index < len(lower_bounds) else None, upper_bound=round(float(upper_bounds[index]), 6) if upper_bounds and index < len(upper_bounds) else None) for index, (period, value) in enumerate(zip(future, values))]
+        return ForecastingOutput(status="complete", series_id=definition.id, title=definition.title, measure=definition.measure, aggregation=definition.aggregation, granularity=definition.granularity, horizon=definition.horizon, model=model, confidence_level=confidence_level, historical=historical, forecast=forecast, limitations=limitations, warnings=warnings)
 
 
 forecasting_agent = ForecastingAgent()

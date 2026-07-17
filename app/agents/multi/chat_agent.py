@@ -5,15 +5,15 @@ import json
 import logging
 import os
 
-from groq import AsyncGroq
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from app.core.agent_models import agent_model_policy
+from app.core.groq_structured import request_structured
 from app.rag.models import RetrievedDocument
 
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "llama-3.3-70b-versatile"
 MAX_RETRIEVED_DOCUMENTS = 6
 MAX_CONTEXT_CHARACTERS = 12_000
 MAX_DOCUMENT_CHARACTERS = 2_500
@@ -91,11 +91,12 @@ async def _request_groq_draft(query: str, context: str) -> GroundedChatDraft:
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GROQ_API_KEY is missing.")
-    response = await AsyncGroq(api_key=api_key).chat.completions.create(
-        model=MODEL_NAME,
+    return await request_structured(
+        api_key=api_key,
+        policy=agent_model_policy("chat"),
+        response_model=GroundedChatDraft,
+        schema_name="grounded_chat_draft",
         temperature=0.1,
-        max_completion_tokens=700,
-        response_format={"type": "json_object"},
         messages=[
             {
                 "role": "system",
@@ -120,9 +121,6 @@ async def _request_groq_draft(query: str, context: str) -> GroundedChatDraft:
                 ),
             },
         ],
-    )
-    return GroundedChatDraft.model_validate_json(
-        response.choices[0].message.content or "{}"
     )
 
 

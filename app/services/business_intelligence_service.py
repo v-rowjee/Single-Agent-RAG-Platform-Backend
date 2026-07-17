@@ -17,7 +17,9 @@ from fastapi import UploadFile
 
 from app.agents.multi.chat_agent import GroundedChatDraft, chat_agent
 from app.core.config import Settings, get_settings
+from app.guardrails.chat_input import chat_input_guardrail
 from app.guardrails.chat_grounding import chat_grounding_guardrail
+from app.orchestration.chat_graph import build_multi_agent_chat_graph
 from app.schemas.business_intelligence import (
     ApiMessage,
     BusinessIntelligenceAgentInput,
@@ -62,9 +64,26 @@ class BusinessIntelligenceService:
         self,
         storage: SupabaseService | None = None,
         settings: Settings | None = None,
+        *,
+        rag: Any | None = None,
+        multi_chat_agent: Any | None = None,
+        input_guardrail: Any | None = None,
+        output_guardrail: Any | None = None,
+        multi_chat_graph: Any | None = None,
     ) -> None:
         self.storage = storage or supabase_service
         self.settings = settings or get_settings()
+        self._rag_service = rag or rag_service
+        self._multi_chat_agent = multi_chat_agent or chat_agent
+        self._input_guardrail = input_guardrail or chat_input_guardrail
+        self._output_guardrail = output_guardrail or chat_grounding_guardrail
+        self._multi_chat_graph = multi_chat_graph or build_multi_agent_chat_graph(
+            validate_session=self._load_dataset,
+            validate_input=self._input_guardrail.validate,
+            retrieve_documents=self._retrieve_multi_chat_documents,
+            generate_draft=self._generate_multi_chat_draft,
+            ground_draft=self._ground_multi_chat_draft,
+        )
 
     async def create_analysis(
         self,
@@ -107,9 +126,9 @@ class BusinessIntelligenceService:
             dataset_inserted = True
 
             dashboard_response = await self._run_selected_pipeline(dataset, content)
-            self._save_dashboard(dataset.id, dashboard_response)
 
             if self.settings.bi_pipeline_mode == "single":
+                self._save_dashboard(dataset.id, dashboard_response)
                 self._try_index_rag(
                     dataset=dataset,
                     content=content,
@@ -223,6 +242,16 @@ class BusinessIntelligenceService:
 
             try:
                 result = await business_intelligence_graph.ainvoke(initial_state)
+                persistence_result = result.get("persistence_result")
+                if (
+                    result.get("workflow_status") == "failed"
+                    or not isinstance(persistence_result, dict)
+                    or persistence_result.get("status") != "success"
+                ):
+                    raise RuntimeError(
+                        "The multi-agent workflow did not persist successfully."
+                    )
+
                 dashboard_output = result.get("dashboard_output")
                 if not isinstance(dashboard_output, dict):
                     raise ValueError("The workflow did not return a dashboard output.")
@@ -268,17 +297,18 @@ class BusinessIntelligenceService:
         return response
 
     def chat(self, session_id: str, query: str) -> ChatResponse:
+        if self.settings.bi_pipeline_mode == "multi":
+            return self._chat_with_multi_agent_pipeline(
+                session_id=session_id,
+                query=query,
+            )
+
         dataset = self._load_dataset(session_id)
         cleaned_query = query.strip()
-
         if not cleaned_query:
             raise ValueError("The chat query cannot be empty.")
 
-        history = (
-            self._chat_history(dataset.id)
-            if self.settings.bi_pipeline_mode == "single"
-            else []
-        )
+        history = self._chat_history(dataset.id)
 
         self.storage.save_message(
             dataset_id=dataset.id,
@@ -287,66 +317,88 @@ class BusinessIntelligenceService:
             sources=[],
         )
 
-        if self.settings.bi_pipeline_mode == "single":
-            return self._chat_with_single_agent(
-                dataset=dataset,
-                query=cleaned_query,
-                history=history,
-            )
+        return self._chat_with_single_agent(
+            dataset=dataset,
+            query=cleaned_query,
+            history=history,
+        )
 
-        logger.info("Chat retrieval started session_id=%s", dataset.id)
-        try:
-            documents = rag_service.retrieve_for_session(
-                session_id=dataset.id,
-                query=cleaned_query,
-                limit=DEFAULT_RETRIEVAL_LIMIT,
-            )
-            logger.info(
-                "Chat documents retrieved session_id=%s count=%s",
-                dataset.id,
-                len(documents),
-            )
-        except Exception:
-            logger.exception(
-                "Chat retrieval or generation failed session_id=%s operation=retrieval",
-                dataset.id,
-            )
-            return self._save_chat_response(
-                dataset.id,
-                "The analysis assistant could not answer this question at the moment.",
-                [],
-            )
+    def _chat_with_multi_agent_pipeline(
+        self,
+        session_id: str,
+        query: str,
+    ) -> ChatResponse:
+        result = self._multi_chat_graph.invoke(
+            {
+                "session_id": session_id,
+                "query": query,
+            }
+        )
+        dataset = result.get("dataset")
+        guarded_draft = result.get("guarded_draft")
+        cleaned_query = str(result.get("query") or "").strip()
+        if not isinstance(dataset, DatasetRecord):
+            raise RuntimeError("Chat session validation did not return a dataset.")
+        if not isinstance(guarded_draft, GroundedChatDraft):
+            raise RuntimeError("The multi-agent chat pipeline returned no response.")
 
-        try:
-            draft = asyncio.run(
-                chat_agent.run(
-                    session_id=dataset.id,
-                    query=cleaned_query,
-                    retrieved_documents=documents,
-                )
-            )
-            guarded_draft = chat_grounding_guardrail.validate(
-                query=cleaned_query,
-                retrieved_documents=documents,
-                draft=draft,
-            )
-            logger.info("Chat response guarded session_id=%s", dataset.id)
-        except Exception:
-            logger.exception(
-                "Chat agent or grounding failed session_id=%s",
-                dataset.id,
-            )
-            guarded_draft = GroundedChatDraft(
-                answer="The analysis assistant could not answer this question at the moment.",
-                source_ids=[],
-                insufficient_context=True,
-            )
-
+        self.storage.save_message(
+            dataset_id=dataset.id,
+            role="user",
+            content=cleaned_query,
+            sources=[],
+        )
         return self._save_chat_response(
             dataset.id,
             guarded_draft.answer,
             guarded_draft.source_ids,
         )
+
+    def _retrieve_multi_chat_documents(
+        self,
+        session_id: str,
+        query: str,
+    ) -> list[RetrievedDocument]:
+        logger.info("Chat retrieval started session_id=%s", session_id)
+        documents = self._rag_service.retrieve_for_session(
+            session_id=session_id,
+            query=query,
+            limit=DEFAULT_RETRIEVAL_LIMIT,
+        )
+        logger.info(
+            "Chat documents retrieved session_id=%s count=%s",
+            session_id,
+            len(documents),
+        )
+        return documents
+
+    def _generate_multi_chat_draft(
+        self,
+        session_id: str,
+        query: str,
+        documents: list[RetrievedDocument],
+    ) -> GroundedChatDraft:
+        return asyncio.run(
+            self._multi_chat_agent.run(
+                session_id=session_id,
+                query=query,
+                retrieved_documents=documents,
+            )
+        )
+
+    def _ground_multi_chat_draft(
+        self,
+        query: str,
+        documents: list[RetrievedDocument],
+        draft: GroundedChatDraft,
+    ) -> GroundedChatDraft:
+        guarded = self._output_guardrail.validate(
+            query=query,
+            retrieved_documents=documents,
+            draft=draft,
+        )
+        logger.info("Chat response guarded")
+        return guarded
 
     def _chat_with_single_agent(
         self,
@@ -731,6 +783,26 @@ class BusinessIntelligenceService:
                         ),
                         "priority": "medium",
                         "sourceIds": [],
+                    },
+                    {
+                        "id": "review_dataset_quality",
+                        "title": "Review dataset quality",
+                        "description": (
+                            "Resolve the detected missing values and duplicate records "
+                            "before rerunning advanced analysis."
+                        ),
+                        "priority": "medium",
+                        "sourceIds": ["dataset_summary"],
+                    },
+                    {
+                        "id": "confirm_business_context",
+                        "title": "Confirm business context",
+                        "description": (
+                            "Confirm the intended KPI definitions, reporting period, "
+                            "and business priorities before the next analysis run."
+                        ),
+                        "priority": "low",
+                        "sourceIds": ["dataset_summary"],
                     }
                 ],
                 "datasetSummary": {
