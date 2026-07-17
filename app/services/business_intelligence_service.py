@@ -226,12 +226,16 @@ class BusinessIntelligenceService:
             else self.storage.download_file(session.storage_path)
         )
 
-        with self._temporary_agent_input(session, content) as agent_input:
+        with self._temporary_agent_workspace(
+            session,
+            content,
+        ) as (agent_input, workspace):
             initial_state = {
                 "session_id": session_id,
                 "dataset_id": session.id,
                 "business_description": session.description,
                 "uploaded_file_path": agent_input.filePath,
+                "working_directory": str(workspace),
                 "warnings": [],
                 "errors": [],
                 "completed_agents": [],
@@ -613,17 +617,36 @@ class BusinessIntelligenceService:
         dataset: DatasetRecord,
         content: bytes,
     ) -> Iterator[BusinessIntelligenceAgentInput]:
+        """Provide a temporary source file to legacy single-agent callers."""
+        with self._temporary_agent_workspace(dataset, content) as (
+            agent_input,
+            _,
+        ):
+            yield agent_input
+
+    @contextmanager
+    def _temporary_agent_workspace(
+        self,
+        dataset: DatasetRecord,
+        content: bytes,
+    ) -> Iterator[tuple[BusinessIntelligenceAgentInput, Path]]:
         suffix = Path(dataset.file_name).suffix.lower()
         with tempfile.TemporaryDirectory(prefix="bi_dataset_") as directory:
-            path = Path(directory) / dataset.file_name
+            workspace_root = Path(directory)
+            path = workspace_root / dataset.file_name
             if path.suffix.lower() != suffix:
-                path = Path(directory) / f"dataset{suffix}"
+                path = workspace_root / f"dataset{suffix}"
             path.write_bytes(content)
-            yield BusinessIntelligenceAgentInput(
-                sessionId=dataset.id,
-                filePath=str(path),
-                fileName=dataset.file_name,
-                description=dataset.description,
+            workspace = workspace_root / "processing"
+            workspace.mkdir()
+            yield (
+                BusinessIntelligenceAgentInput(
+                    sessionId=dataset.id,
+                    filePath=str(path),
+                    fileName=dataset.file_name,
+                    description=dataset.description,
+                ),
+                workspace,
             )
 
     def _inspect_file(

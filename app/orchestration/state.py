@@ -10,6 +10,7 @@ class BusinessIntelligenceState(TypedDict, total=False):
     business_description: str | None
 
     uploaded_file_path: str
+    working_directory: str
     generic_cleaned_file_path: str
     prepared_file_path: str
     prepared_temporal_file_path: str | None

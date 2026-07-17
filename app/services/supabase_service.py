@@ -57,6 +57,16 @@ class MessageRecord:
     created_at: str
 
 
+@dataclass(frozen=True)
+class SessionProcessingRecord:
+    dataset_id: str
+    workflow_status: str
+    generic_cleaning_report: JsonDict
+    prepared_dataset: JsonDict
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
 class SupabaseService:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
@@ -238,6 +248,48 @@ class SupabaseService:
         rows = list(response.data or [])
         return [self._message(row) for row in reversed(rows)]
 
+    def save_session_processing(
+        self,
+        dataset_id: str,
+        workflow_status: str,
+        generic_cleaning_report: JsonDict,
+        prepared_dataset: JsonDict,
+    ) -> SessionProcessingRecord:
+        payload: JsonDict = {
+            "dataset_id": dataset_id,
+            "workflow_status": workflow_status,
+            "generic_cleaning_report": generic_cleaning_report,
+            "prepared_dataset": prepared_dataset,
+        }
+        result = (
+            self.client.table("session_processing")
+            .upsert(payload, on_conflict="dataset_id")
+            .execute()
+        )
+        rows = list(result.data or [])
+        if not rows:
+            fetched = self.get_session_processing(dataset_id)
+            if fetched is None:
+                raise SupabaseUnavailableError(
+                    "Session-processing upsert returned no row."
+                )
+            return fetched
+        return self._session_processing(rows[0])
+
+    def get_session_processing(
+        self,
+        dataset_id: str,
+    ) -> SessionProcessingRecord | None:
+        response = (
+            self.client.table("session_processing")
+            .select("*")
+            .eq("dataset_id", dataset_id)
+            .limit(1)
+            .execute()
+        )
+        rows = list(response.data or [])
+        return self._session_processing(rows[0]) if rows else None
+
     def delete_document_chunks(self, dataset_id: str) -> None:
         self.client.table("document_chunks").delete().eq(
             "dataset_id",
@@ -333,6 +385,35 @@ class SupabaseService:
             if isinstance(sources, list)
             else [],
             created_at=str(row.get("created_at") or SupabaseService._now()),
+        )
+
+    @staticmethod
+    def _session_processing(row: JsonDict) -> SessionProcessingRecord:
+        generic_cleaning_report = row.get("generic_cleaning_report")
+        prepared_dataset = row.get("prepared_dataset")
+        return SessionProcessingRecord(
+            dataset_id=str(row["dataset_id"]),
+            workflow_status=str(row["workflow_status"]),
+            generic_cleaning_report=(
+                dict(generic_cleaning_report)
+                if isinstance(generic_cleaning_report, dict)
+                else {}
+            ),
+            prepared_dataset=(
+                dict(prepared_dataset)
+                if isinstance(prepared_dataset, dict)
+                else {}
+            ),
+            created_at=(
+                str(row["created_at"])
+                if row.get("created_at") is not None
+                else None
+            ),
+            updated_at=(
+                str(row["updated_at"])
+                if row.get("updated_at") is not None
+                else None
+            ),
         )
 
     @staticmethod

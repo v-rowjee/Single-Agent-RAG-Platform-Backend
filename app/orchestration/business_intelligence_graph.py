@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
 from langgraph.graph import END, START, StateGraph
 
 from app.agents.multi.data_preparation_agent import (
     _generic_clean_csv,
-    _session_dir,
     data_preparation_node,
 )
 from app.agents.multi.orchestrator_agent import orchestrator_node
@@ -47,9 +47,15 @@ async def generic_cleaning_node(
     state: BusinessIntelligenceState,
 ) -> dict[str, Any]:
     """Adapt the existing generic cleaner for use as a LangGraph node."""
-    session_id = str(state.get("session_id", "")).strip()
     uploaded_file_path = str(state.get("uploaded_file_path", "")).strip()
-    _, report = _generic_clean_csv(uploaded_file_path, _session_dir(session_id))
+    working_directory = str(state.get("working_directory") or "").strip()
+    if not working_directory:
+        raise RuntimeError("state.working_directory is required.")
+
+    _, report = _generic_clean_csv(
+        uploaded_file_path,
+        Path(working_directory),
+    )
 
     return {
         "generic_cleaned_file_path": report.cleaned_file_path,
@@ -217,6 +223,7 @@ async def persistence_node(
         key: state.get(key)
         for key in (
             "session_id", "dataset_id", "prepared_dataset", "orchestration_plan",
+            "generic_cleaning_report",
             "kpi_trend_output", "anomaly_output", "forecasting_output",
             "synthesis_output", "retrieval_documents", "retrieval_indexing_result",
             "warnings", "errors", "completed_agents", "failed_agents", "skipped_agents",

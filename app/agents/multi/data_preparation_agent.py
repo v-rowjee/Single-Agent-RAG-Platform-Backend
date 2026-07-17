@@ -26,9 +26,6 @@ from app.core.groq_structured import request_structured
 
 load_dotenv(Path(__file__).resolve().parents[4] / ".env")
 
-STORAGE_ROOT = Path("app/storage")
-SESSIONS_DIR = STORAGE_ROOT / "sessions"
-
 SUPPORTED_OPERATIONS = {
     "fill_constant",
     "preserve_missing",
@@ -210,17 +207,6 @@ class PreparedDatasetPackage(StrictModel):
 
 
 # 4. Generic cleaning functions
-
-
-def _safe_identifier(value: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
-    return safe or "default"
-
-
-def _session_dir(session_id: str) -> Path:
-    path = SESSIONS_DIR / _safe_identifier(session_id)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
 
 
 def _normalise_column_name(value: Any) -> str:
@@ -1074,13 +1060,18 @@ class DataPreparationAgent:
         business_description: str | None = None,
         generic_cleaning_report: GenericCleaningResult | None = None,
         file_name: str | None = None,
+        output_dir: Path | None = None,
     ) -> PreparedDatasetPackage:
         logger.info(
             "Data preparation started session_id=%s source_path=%s",
             session_id,
             uploaded_file_path,
         )
-        output_dir = _session_dir(session_id)
+        if output_dir is None:
+            raise DataPreparationError(
+                "A temporary processing workspace is required."
+            )
+        output_dir.mkdir(parents=True, exist_ok=True)
         if generic_cleaning_report is None:
             df, cleaning_report = _generic_clean_csv(uploaded_file_path, output_dir)
         else:
@@ -1200,11 +1191,14 @@ async def data_preparation_node(state: dict[str, Any]) -> dict[str, Any]:
     ).strip()
     business_description = state.get("business_description") or state.get("businessDescription")
     file_name = state.get("file_name") or state.get("fileName")
+    working_directory = str(state.get("working_directory") or "").strip()
 
     if not session_id:
         raise DataPreparationError("state.session_id is required.")
     if not uploaded_file_path:
         raise DataPreparationError("state.uploaded_file_path is required.")
+    if not working_directory:
+        raise DataPreparationError("state.working_directory is required.")
 
     result = await data_preparation_agent.run(
         uploaded_file_path=uploaded_file_path,
@@ -1217,6 +1211,7 @@ async def data_preparation_node(state: dict[str, Any]) -> dict[str, Any]:
             else None
         ),
         file_name=str(file_name) if file_name else None,
+        output_dir=Path(working_directory),
     )
 
     return {
