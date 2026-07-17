@@ -88,8 +88,11 @@ class BusinessIntelligenceService:
     async def create_analysis(
         self,
         file: UploadFile,
+        user_id: str,
         description: str | None = None,
     ) -> dict[str, Any]:
+        if not user_id:
+            raise ValueError("An authenticated user is required.")
         original_name = Path(file.filename or "").name
         file_name = self._sanitize_file_name(original_name)
         mime_type = (file.content_type or "").strip()
@@ -103,7 +106,7 @@ class BusinessIntelligenceService:
             raise InvalidUploadError("The uploaded file is too large.")
 
         session_id = str(uuid4())
-        storage_path = f"{session_id}/{file_name}"
+        storage_path = f"{user_id}/{session_id}/{file_name}"
         file_hash = hashlib.sha256(content).hexdigest()
 
         self.storage.upload_file(
@@ -116,6 +119,7 @@ class BusinessIntelligenceService:
         try:
             dataset = self.storage.create_dataset(
                 dataset_id=session_id,
+                user_id=user_id,
                 file_name=file_name,
                 storage_path=storage_path,
                 mime_type=mime_type,
@@ -170,8 +174,8 @@ class BusinessIntelligenceService:
             "message": "File uploaded and analysis session created successfully.",
         }
 
-    async def get_dashboard(self, session_id: str) -> DashboardResponse:
-        dataset = self._load_dataset(session_id)
+    async def get_dashboard(self, session_id: str, user_id: str) -> DashboardResponse:
+        dataset = self._load_dataset(session_id, user_id)
         dashboard = self.storage.get_dashboard(dataset.id)
 
         if dashboard is not None:
@@ -300,14 +304,15 @@ class BusinessIntelligenceService:
         )
         return response
 
-    def chat(self, session_id: str, query: str) -> ChatResponse:
+    def chat(self, session_id: str, query: str, user_id: str) -> ChatResponse:
         if self.settings.bi_pipeline_mode == "multi":
             return self._chat_with_multi_agent_pipeline(
                 session_id=session_id,
                 query=query,
+                user_id=user_id,
             )
 
-        dataset = self._load_dataset(session_id)
+        dataset = self._load_dataset(session_id, user_id)
         cleaned_query = query.strip()
         if not cleaned_query:
             raise ValueError("The chat query cannot be empty.")
@@ -331,11 +336,13 @@ class BusinessIntelligenceService:
         self,
         session_id: str,
         query: str,
+        user_id: str,
     ) -> ChatResponse:
         result = self._multi_chat_graph.invoke(
             {
                 "session_id": session_id,
                 "query": query,
+                "user_id": user_id,
             }
         )
         dataset = result.get("dataset")
@@ -486,8 +493,8 @@ class BusinessIntelligenceService:
             grounding or "No supporting dataset evidence was available.",
         )
 
-    def get_chat_history(self, session_id: str) -> dict[str, Any]:
-        dataset = self._load_dataset(session_id)
+    def get_chat_history(self, session_id: str, user_id: str) -> dict[str, Any]:
+        dataset = self._load_dataset(session_id, user_id)
         return {
             "sessionId": dataset.id,
             "messages": [
@@ -496,9 +503,13 @@ class BusinessIntelligenceService:
             ],
         }
 
-    def _load_dataset(self, session_id: str) -> DatasetRecord:
+    def _load_dataset(self, session_id: str, user_id: str) -> DatasetRecord:
         dataset_id = self._validate_session_id(session_id)
-        dataset = self.storage.get_dataset(dataset_id)
+        if not user_id:
+            raise SessionNotFoundError(
+                f"Analysis session '{session_id}' was not found."
+            )
+        dataset = self.storage.get_dataset(dataset_id, user_id)
         if dataset is None:
             raise SessionNotFoundError(
                 f"Analysis session '{session_id}' was not found."

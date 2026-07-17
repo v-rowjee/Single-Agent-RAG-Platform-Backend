@@ -15,6 +15,9 @@ from app.services.business_intelligence_service import BusinessIntelligenceServi
 from app.services.supabase_service import DatasetRecord
 
 
+USER_ID = "59b3d0fc-2d4a-40a0-8bb1-99e19da406ee"
+
+
 class UploadStorage:
     def __init__(self) -> None:
         self.saved_dashboards = 0
@@ -26,6 +29,7 @@ class UploadStorage:
     def create_dataset(self, **values: Any) -> DatasetRecord:
         return DatasetRecord(
             id=str(values["dataset_id"]),
+            user_id=str(values["user_id"]),
             file_name=str(values["file_name"]),
             storage_path=str(values["storage_path"]),
             mime_type=str(values["mime_type"]),
@@ -87,7 +91,7 @@ def test_multi_upload_uses_graph_owned_persistence_and_never_single_agent(
         file=io.BytesIO(b"date,revenue\n2025-01-01,100\n"),
         headers=Headers({"content-type": "text/csv"}),
     )
-    response = asyncio.run(service.create_analysis(upload))
+    response = asyncio.run(service.create_analysis(upload, user_id=USER_ID))
 
     assert response["status"] == "success"
     assert len(multi_calls) == 1
@@ -100,6 +104,7 @@ def test_failed_graph_persistence_returns_failed_dashboard_response(
 ) -> None:
     dataset = DatasetRecord(
         id="9d719abc-9e09-4c14-b2d6-ed8308a1b85d",
+        user_id=USER_ID,
         file_name="sales.csv",
         storage_path="session/sales.csv",
         mime_type="text/csv",

@@ -22,6 +22,7 @@ CHAT_FAILURE_ANSWER = (
 
 class MultiAgentChatState(TypedDict, total=False):
     session_id: str
+    user_id: str
     query: str
     dataset: Any
     input_guardrail: ChatInputGuardrailResult
@@ -30,7 +31,7 @@ class MultiAgentChatState(TypedDict, total=False):
     guarded_draft: GroundedChatDraft
 
 
-ValidateSession = Callable[[str], Any]
+ValidateSession = Callable[[str, str], Any]
 ValidateInput = Callable[[str], ChatInputGuardrailResult]
 RetrieveDocuments = Callable[[str, str], list[RetrievedDocument]]
 GenerateDraft = Callable[
@@ -55,7 +56,8 @@ def build_multi_agent_chat_graph(
 
     def session_validation_node(state: MultiAgentChatState) -> dict[str, Any]:
         session_id = str(state.get("session_id") or "")
-        return {"dataset": validate_session(session_id)}
+        user_id = str(state.get("user_id") or "")
+        return {"dataset": validate_session(session_id, user_id)}
 
     def input_guardrail_node(state: MultiAgentChatState) -> dict[str, Any]:
         result = validate_input(str(state.get("query") or ""))

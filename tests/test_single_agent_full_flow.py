@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 
 from app.agents.single import business_intelligence_agent as single_agent_module
 from app.api import business_intelligence as business_intelligence_api
+from app.core.auth import CurrentUser, get_current_user
 from app.core.config import Settings
 from app.main import app
 from app.rag import rag_service as rag_service_module
@@ -30,6 +31,7 @@ from app.services.supabase_service import (
 
 
 CSV_CONTENT = b"Region,Revenue\nNorth,10\nSouth,20\n"
+USER_ID = "59b3d0fc-2d4a-40a0-8bb1-99e19da406ee"
 
 
 class InMemoryStorage:
@@ -54,6 +56,7 @@ class InMemoryStorage:
     def create_dataset(
         self,
         dataset_id: str,
+        user_id: str,
         file_name: str,
         storage_path: str,
         mime_type: str,
@@ -63,6 +66,7 @@ class InMemoryStorage:
     ) -> DatasetRecord:
         dataset = DatasetRecord(
             id=dataset_id,
+            user_id=user_id,
             file_name=file_name,
             storage_path=storage_path,
             mime_type=mime_type,
@@ -76,8 +80,9 @@ class InMemoryStorage:
         self.datasets[dataset_id] = dataset
         return dataset
 
-    def get_dataset(self, dataset_id: str) -> DatasetRecord | None:
-        return self.datasets.get(dataset_id)
+    def get_dataset(self, dataset_id: str, user_id: str) -> DatasetRecord | None:
+        dataset = self.datasets.get(dataset_id)
+        return dataset if dataset is not None and dataset.user_id == user_id else None
 
     def update_dataset_status(self, dataset_id: str, **updates: object) -> None:
         self.status_updates.append((dataset_id, updates))
@@ -216,6 +221,7 @@ def _dashboard_response(session_id: str, file_name: str) -> DashboardResponse:
     payload = template_service._build_placeholder_dashboard(
         dataset=DatasetRecord(
             id=session_id,
+            user_id=USER_ID,
             file_name=file_name,
             storage_path=f"{session_id}/{file_name}",
             mime_type="text/csv",
@@ -266,9 +272,13 @@ def full_flow(monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.setattr(single_agent_module, "business_intelligence_agent", agent)
     monkeypatch.setattr(rag_service_module, "rag_service", rag)
+    app.dependency_overrides[get_current_user] = lambda: CurrentUser(id=USER_ID)
 
-    with TestClient(app) as client:
-        yield client, storage, agent, rag
+    try:
+        with TestClient(app) as client:
+            yield client, storage, agent, rag
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
 
 
 def test_single_agent_api_full_flow_uses_only_deterministic_fakes(full_flow) -> None:
@@ -285,7 +295,7 @@ def test_single_agent_api_full_flow_uses_only_deterministic_fakes(full_flow) -> 
     assert upload_body["status"] == "success"
     assert upload_body["fileName"] == "sales.csv"
     session_id = upload_body["sessionId"]
-    assert storage.files[f"{session_id}/sales.csv"] == CSV_CONTENT
+    assert storage.files[f"{USER_ID}/{session_id}/sales.csv"] == CSV_CONTENT
     assert storage.datasets[session_id].description == "Quarterly sales"
     assert storage.datasets[session_id].status == "ready"
     assert storage.datasets[session_id].rag_status == "ready"
@@ -372,3 +382,40 @@ def test_single_agent_api_full_flow_uses_only_deterministic_fakes(full_flow) -> 
         False,
         True,
     ]
+
+
+def test_analysis_routes_reject_requests_without_a_bearer_token() -> None:
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/upload",
+            files={"file": ("sales.csv", CSV_CONTENT, "text/csv")},
+        ).status_code == 401
+        assert client.get("/api/dashboard/9d719abc-9e09-4c14-b2d6-ed8308a1b85d").status_code == 401
+        assert client.post(
+            "/api/chat",
+            json={
+                "sessionId": "9d719abc-9e09-4c14-b2d6-ed8308a1b85d",
+                "query": "What is revenue?",
+            },
+        ).status_code == 401
+        assert client.get(
+            "/api/chat/9d719abc-9e09-4c14-b2d6-ed8308a1b85d/history"
+        ).status_code == 401
+
+
+def test_other_users_cannot_access_an_existing_session(full_flow) -> None:
+    client, _, _, _ = full_flow
+    upload = client.post(
+        "/api/upload",
+        files={"file": ("sales.csv", CSV_CONTENT, "text/csv")},
+    )
+    session_id = upload.json()["sessionId"]
+    other_user = "6bd2f47e-f81a-4fa6-a8e2-8af53fd2a6f0"
+    app.dependency_overrides[get_current_user] = lambda: CurrentUser(id=other_user)
+
+    assert client.get(f"/api/dashboard/{session_id}").status_code == 404
+    assert client.post(
+        "/api/chat",
+        json={"sessionId": session_id, "query": "What is revenue?"},
+    ).status_code == 404
+    assert client.get(f"/api/chat/{session_id}/history").status_code == 404

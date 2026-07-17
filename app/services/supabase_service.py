@@ -24,6 +24,7 @@ class SupabaseUnavailableError(Exception):
 @dataclass(frozen=True)
 class DatasetRecord:
     id: str
+    user_id: str
     file_name: str
     storage_path: str
     mime_type: str
@@ -123,6 +124,7 @@ class SupabaseService:
     def create_dataset(
         self,
         dataset_id: str,
+        user_id: str,
         file_name: str,
         storage_path: str,
         mime_type: str,
@@ -132,6 +134,7 @@ class SupabaseService:
     ) -> DatasetRecord:
         payload: JsonDict = {
             "id": dataset_id,
+            "user_id": user_id,
             "file_name": file_name,
             "storage_path": storage_path,
             "mime_type": mime_type,
@@ -148,11 +151,12 @@ class SupabaseService:
             raise SupabaseUnavailableError("Dataset insert returned no row.")
         return self._dataset(rows[0])
 
-    def get_dataset(self, dataset_id: str) -> DatasetRecord | None:
+    def get_dataset(self, dataset_id: str, user_id: str) -> DatasetRecord | None:
         response = (
             self.client.table("datasets")
             .select("*")
             .eq("id", dataset_id)
+            .eq("user_id", user_id)
             .limit(1)
             .execute()
         )
@@ -328,6 +332,7 @@ class SupabaseService:
     def _dataset(row: JsonDict) -> DatasetRecord:
         return DatasetRecord(
             id=str(row["id"]),
+            user_id=str(row["user_id"]),
             file_name=str(row["file_name"]),
             storage_path=str(row["storage_path"]),
             mime_type=str(row["mime_type"]),

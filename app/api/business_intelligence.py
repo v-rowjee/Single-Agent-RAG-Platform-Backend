@@ -1,8 +1,9 @@
 from typing import Any, Literal
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
+from app.core.auth import CurrentUser, get_current_user
 from app.schemas.business_intelligence import ChatRequest, ChatResponse
 
 from app.services.business_intelligence_service import (
@@ -32,11 +33,13 @@ class ChatHistoryResponse(BaseModel):
 async def upload_file(
     file: UploadFile = File(...),
     description: str | None = Form(default=None),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     try:
         return await business_intelligence_service.create_analysis(
             file=file,
             description=description,
+            user_id=current_user.id,
         )
 
     except InvalidUploadError as error:
@@ -54,10 +57,16 @@ async def upload_file(
 
 
 @router.get("/dashboard/{session_id}")
-async def get_dashboard(session_id: str) -> dict[str, Any]:
+async def get_dashboard(
+    session_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> dict[str, Any]:
     try:
         return (
-            await business_intelligence_service.get_dashboard(session_id)
+            await business_intelligence_service.get_dashboard(
+                session_id,
+                current_user.id,
+            )
         ).model_dump(mode="json")
 
     except SessionNotFoundError as error:
@@ -74,11 +83,15 @@ async def get_dashboard(session_id: str) -> dict[str, Any]:
 
 
 @router.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> ChatResponse:
+def chat(
+    request: ChatRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> ChatResponse:
     try:
         return business_intelligence_service.chat(
             session_id=request.sessionId,
             query=request.query,
+            user_id=current_user.id,
         )
 
     except SessionNotFoundError as error:
@@ -101,9 +114,15 @@ def chat(request: ChatRequest) -> ChatResponse:
 
 
 @router.get("/chat/{session_id}/history", response_model=ChatHistoryResponse)
-def get_chat_history(session_id: str) -> ChatHistoryResponse:
+def get_chat_history(
+    session_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> ChatHistoryResponse:
     try:
-        result = business_intelligence_service.get_chat_history(session_id)
+        result = business_intelligence_service.get_chat_history(
+            session_id,
+            current_user.id,
+        )
 
         return ChatHistoryResponse(**result)
 

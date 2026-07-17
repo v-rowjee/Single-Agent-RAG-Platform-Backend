@@ -14,6 +14,7 @@ from app.services.supabase_service import DatasetRecord
 
 
 SESSION_ID = "9d719abc-9e09-4c14-b2d6-ed8308a1b85d"
+USER_ID = "59b3d0fc-2d4a-40a0-8bb1-99e19da406ee"
 
 
 class PersistenceStorage:
@@ -116,6 +117,7 @@ def test_multi_agent_workspace_is_temporary_and_not_session_storage(
     )
     dataset = DatasetRecord(
         id=SESSION_ID,
+        user_id=USER_ID,
         file_name="sales.csv",
         storage_path=f"{SESSION_ID}/sales.csv",
         mime_type="text/csv",
