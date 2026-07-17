@@ -4,10 +4,11 @@ import asyncio
 import hashlib
 import io
 import logging
+import math
 import re
 import tempfile
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Literal
 from uuid import UUID, uuid4
@@ -59,6 +60,10 @@ class InvalidUploadError(Exception):
     """Raised when an uploaded file cannot be processed."""
 
 
+class DatasetAlreadyExistsError(Exception):
+    """Raised when a user attempts to upload a second active dataset."""
+
+
 class BusinessIntelligenceService:
     def __init__(
         self,
@@ -105,17 +110,18 @@ class BusinessIntelligenceService:
         if len(content) > MAX_UPLOAD_BYTES:
             raise InvalidUploadError("The uploaded file is too large.")
 
+        dataset_info = self._inspect_file(file_name, content)
+        if self.storage.get_active_dataset(user_id) is not None:
+            raise DatasetAlreadyExistsError(
+                "You already have an active dataset. Use Start Over before uploading another file."
+            )
+
         session_id = str(uuid4())
         storage_path = f"{user_id}/{session_id}/{file_name}"
         file_hash = hashlib.sha256(content).hexdigest()
 
-        self.storage.upload_file(
-            storage_path=storage_path,
-            content=content,
-            mime_type=mime_type,
-        )
-
         dataset_inserted = False
+        file_uploaded = False
         try:
             dataset = self.storage.create_dataset(
                 dataset_id=session_id,
@@ -126,8 +132,17 @@ class BusinessIntelligenceService:
                 file_size=len(content),
                 file_hash=file_hash,
                 description=description,
+                row_count=int(dataset_info["rowCount"]),
+                column_count=int(dataset_info["columnCount"]),
             )
             dataset_inserted = True
+
+            self.storage.upload_file(
+                storage_path=storage_path,
+                content=content,
+                mime_type=mime_type,
+            )
+            file_uploaded = True
 
             dashboard_response = await self._run_selected_pipeline(dataset, content)
 
@@ -151,6 +166,11 @@ class BusinessIntelligenceService:
             )
 
         except Exception as error:
+            if not dataset_inserted and self._is_duplicate_dataset_error(error):
+                raise DatasetAlreadyExistsError(
+                    "You already have an active dataset. Use Start Over before uploading another file."
+                ) from error
+
             safe_error = self._safe_error(error)
             logger.exception(
                 "Dataset processing failed session_id=%s operation=upload storage_path=%s",
@@ -158,13 +178,14 @@ class BusinessIntelligenceService:
                 storage_path,
             )
             if dataset_inserted:
-                self.storage.update_dataset_status(
-                    session_id,
-                    status="failed",
-                    error_message=safe_error,
-                )
-            else:
-                self.storage.delete_file(storage_path)
+                if file_uploaded:
+                    self.storage.update_dataset_status(
+                        session_id,
+                        status="failed",
+                        error_message=safe_error,
+                    )
+                else:
+                    self.storage.delete_dataset(session_id, user_id)
             raise
 
         return {
@@ -173,6 +194,71 @@ class BusinessIntelligenceService:
             "fileName": file_name,
             "message": "File uploaded and analysis session created successfully.",
         }
+
+    def get_active_dataset(self, user_id: str) -> DatasetRecord:
+        if not user_id:
+            raise SessionNotFoundError("No active dataset was found.")
+        dataset = self.storage.get_active_dataset(user_id)
+        if dataset is None:
+            raise SessionNotFoundError("No active dataset was found.")
+        return dataset
+
+    def get_active_dataset_details(self, user_id: str) -> dict[str, Any]:
+        dataset = self.get_active_dataset(user_id)
+        row_count = dataset.row_count
+        column_count = dataset.column_count
+        if row_count is None or column_count is None:
+            dataset_info = self._inspect_file(
+                dataset.file_name,
+                self.storage.download_file(dataset.storage_path),
+            )
+            row_count = int(dataset_info["rowCount"])
+            column_count = int(dataset_info["columnCount"])
+
+        return {
+            "sessionId": dataset.id,
+            "fileName": dataset.file_name,
+            "fileSize": dataset.file_size,
+            "uploadedAt": dataset.created_at or "",
+            "rowCount": row_count,
+            "columnCount": column_count,
+            "analysisStatus": dataset.status,
+            "originalPrompt": dataset.description,
+        }
+
+    def get_dataset_preview(
+        self,
+        user_id: str,
+        page: int,
+        page_size: int,
+    ) -> dict[str, Any]:
+        dataset = self.get_active_dataset(user_id)
+        content = self.storage.download_file(dataset.storage_path)
+        total_rows = (
+            dataset.row_count
+            if dataset.row_count is not None
+            else int(self._inspect_file(dataset.file_name, content)["rowCount"])
+        )
+        columns, rows = self._read_preview_page(
+            dataset.file_name,
+            content,
+            page,
+            page_size,
+        )
+        total_pages = math.ceil(total_rows / page_size) if total_rows else 0
+        return {
+            "columns": columns,
+            "rows": rows,
+            "page": page,
+            "page_size": page_size,
+            "total_rows": total_rows,
+            "total_pages": total_pages,
+        }
+
+    def reset_active_dataset(self, user_id: str) -> None:
+        dataset = self.get_active_dataset(user_id)
+        self.storage.delete_file(dataset.storage_path)
+        self.storage.delete_dataset(dataset.id, user_id)
 
     async def get_dashboard(self, session_id: str, user_id: str) -> DashboardResponse:
         dataset = self._load_dataset(session_id, user_id)
@@ -712,6 +798,96 @@ class BusinessIntelligenceService:
             "completenessPercent": completeness_percent,
         }
 
+    def _read_preview_page(
+        self,
+        file_name: str,
+        content: bytes,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        start_row = (page - 1) * page_size
+        suffix = Path(file_name).suffix.lower()
+
+        try:
+            if suffix == ".csv":
+                skiprows = (
+                    (lambda row_index: row_index != 0 and row_index <= start_row)
+                    if start_row
+                    else None
+                )
+                dataframe = pd.read_csv(
+                    io.BytesIO(content),
+                    low_memory=False,
+                    skiprows=skiprows,
+                    nrows=page_size,
+                )
+            elif suffix == ".xlsx":
+                dataframe = pd.read_excel(
+                    io.BytesIO(content),
+                    skiprows=range(1, start_row + 1) if start_row else None,
+                    nrows=page_size,
+                )
+            else:
+                raise InvalidUploadError("Only CSV and XLSX files are supported.")
+        except UnicodeDecodeError as error:
+            raise InvalidUploadError(
+                "The CSV file must use UTF-8 encoding."
+            ) from error
+        except InvalidUploadError:
+            raise
+        except Exception as error:
+            raise InvalidUploadError(
+                "The uploaded dataset preview could not be read."
+            ) from error
+
+        columns = self._unique_column_names(
+            [str(column) for column in dataframe.columns]
+        )
+        dataframe.columns = columns
+        rows = [
+            {
+                column: self._json_preview_value(value)
+                for column, value in row.items()
+            }
+            for row in dataframe.to_dict(orient="records")
+        ]
+        return columns, rows
+
+    @staticmethod
+    def _unique_column_names(columns: list[str]) -> list[str]:
+        used: dict[str, int] = {}
+        result: list[str] = []
+        for index, raw_name in enumerate(columns, start=1):
+            base_name = raw_name.strip() or f"Column {index}"
+            occurrence = used.get(base_name, 0)
+            used[base_name] = occurrence + 1
+            result.append(
+                base_name if occurrence == 0 else f"{base_name} ({occurrence + 1})"
+            )
+        return result
+
+    @staticmethod
+    def _json_preview_value(value: Any) -> str | int | float | bool | None:
+        if value is None:
+            return None
+        if hasattr(value, "item"):
+            try:
+                value = value.item()
+            except (AttributeError, ValueError):
+                pass
+        if isinstance(value, (datetime, date, pd.Timestamp)):
+            return value.isoformat()
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            pass
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if isinstance(value, (str, int, bool)):
+            return value
+        return str(value)
+
     def _build_placeholder_dashboard(
         self,
         dataset: DatasetRecord,
@@ -955,6 +1131,14 @@ class BusinessIntelligenceService:
         if not text:
             return "Processing failed."
         return text[:300]
+
+    @staticmethod
+    def _is_duplicate_dataset_error(error: Exception) -> bool:
+        code = str(getattr(error, "code", ""))
+        message = str(error).lower()
+        return code == "23505" or (
+            "duplicate" in message and "user" in message and "dataset" in message
+        )
 
     @staticmethod
     def _current_timestamp() -> str:

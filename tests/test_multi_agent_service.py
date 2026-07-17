@@ -26,6 +26,9 @@ class UploadStorage:
     def upload_file(self, storage_path: str, content: bytes, mime_type: str) -> None:
         return None
 
+    def get_active_dataset(self, user_id: str) -> DatasetRecord | None:
+        return None
+
     def create_dataset(self, **values: Any) -> DatasetRecord:
         return DatasetRecord(
             id=str(values["dataset_id"]),
@@ -39,6 +42,8 @@ class UploadStorage:
             status="processing",
             rag_status="pending",
             error_message=None,
+            row_count=int(values["row_count"]),
+            column_count=int(values["column_count"]),
         )
 
     def save_dashboard(self, **values: Any) -> None:
@@ -48,6 +53,9 @@ class UploadStorage:
         self.status_updates.append({"dataset_id": dataset_id, **values})
 
     def delete_file(self, storage_path: str) -> None:
+        return None
+
+    def delete_dataset(self, dataset_id: str, user_id: str) -> None:
         return None
 
 

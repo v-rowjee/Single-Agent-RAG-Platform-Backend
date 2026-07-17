@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import sys
+from io import BytesIO
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import pandas as pd
 from fastapi.testclient import TestClient
 
 
@@ -63,6 +65,8 @@ class InMemoryStorage:
         file_size: int,
         file_hash: str,
         description: str | None,
+        row_count: int,
+        column_count: int,
     ) -> DatasetRecord:
         dataset = DatasetRecord(
             id=dataset_id,
@@ -76,6 +80,8 @@ class InMemoryStorage:
             status="processing",
             rag_status="pending",
             error_message=None,
+            row_count=row_count,
+            column_count=column_count,
         )
         self.datasets[dataset_id] = dataset
         return dataset
@@ -83,6 +89,28 @@ class InMemoryStorage:
     def get_dataset(self, dataset_id: str, user_id: str) -> DatasetRecord | None:
         dataset = self.datasets.get(dataset_id)
         return dataset if dataset is not None and dataset.user_id == user_id else None
+
+    def get_active_dataset(self, user_id: str) -> DatasetRecord | None:
+        return next(
+            (
+                dataset
+                for dataset in self.datasets.values()
+                if dataset.user_id == user_id
+            ),
+            None,
+        )
+
+    def delete_dataset(self, dataset_id: str, user_id: str) -> None:
+        dataset = self.get_dataset(dataset_id, user_id)
+        if dataset is None:
+            return
+        self.datasets.pop(dataset_id, None)
+        self.dashboards.pop(dataset_id, None)
+        self.messages = [
+            message
+            for message in self.messages
+            if message.dataset_id != dataset_id
+        ]
 
     def update_dataset_status(self, dataset_id: str, **updates: object) -> None:
         self.status_updates.append((dataset_id, updates))
@@ -401,6 +429,9 @@ def test_analysis_routes_reject_requests_without_a_bearer_token() -> None:
         assert client.get(
             "/api/chat/9d719abc-9e09-4c14-b2d6-ed8308a1b85d/history"
         ).status_code == 401
+        assert client.get("/api/dataset").status_code == 401
+        assert client.get("/api/dataset/preview").status_code == 401
+        assert client.post("/api/dataset/reset").status_code == 401
 
 
 def test_other_users_cannot_access_an_existing_session(full_flow) -> None:
@@ -419,3 +450,117 @@ def test_other_users_cannot_access_an_existing_session(full_flow) -> None:
         json={"sessionId": session_id, "query": "What is revenue?"},
     ).status_code == 404
     assert client.get(f"/api/chat/{session_id}/history").status_code == 404
+    assert client.get("/api/dataset").status_code == 404
+    assert client.get("/api/dataset/preview").status_code == 404
+    assert client.post("/api/dataset/reset").status_code == 404
+
+
+def test_active_dataset_details_preview_second_upload_and_reset(full_flow) -> None:
+    client, storage, agent, _ = full_flow
+
+    assert client.get("/api/dataset").status_code == 404
+
+    upload = client.post(
+        "/api/upload",
+        files={"file": ("sales.csv", CSV_CONTENT, "text/csv")},
+        data={"description": "Quarterly sales analysis"},
+    )
+    assert upload.status_code == 200
+    session_id = upload.json()["sessionId"]
+
+    details = client.get("/api/dataset")
+    assert details.status_code == 200
+    assert details.json() == {
+        "sessionId": session_id,
+        "fileName": "sales.csv",
+        "fileSize": len(CSV_CONTENT),
+        "uploadedAt": "",
+        "rowCount": 2,
+        "columnCount": 2,
+        "analysisStatus": "ready",
+        "originalPrompt": "Quarterly sales analysis",
+    }
+
+    preview = client.get("/api/dataset/preview?page=1&page_size=50")
+    assert preview.status_code == 200
+    assert preview.json() == {
+        "columns": ["Region", "Revenue"],
+        "rows": [
+            {"Region": "North", "Revenue": 10},
+            {"Region": "South", "Revenue": 20},
+        ],
+        "page": 1,
+        "page_size": 50,
+        "total_rows": 2,
+        "total_pages": 1,
+    }
+
+    duplicate = client.post(
+        "/api/upload",
+        files={"file": ("replacement.csv", CSV_CONTENT, "text/csv")},
+    )
+    assert duplicate.status_code == 409
+    assert len(agent.dashboard_calls) == 1
+
+    assert client.post("/api/chat", json={"sessionId": session_id, "query": "What is revenue?"}).status_code == 200
+    reset = client.post("/api/dataset/reset")
+    assert reset.status_code == 204
+    assert storage.datasets == {}
+    assert storage.files == {}
+    assert storage.dashboards == {}
+    assert storage.messages == []
+    assert client.get("/api/dataset").status_code == 404
+
+
+def test_xlsx_preview_returns_only_the_requested_page(full_flow) -> None:
+    client, _, _, _ = full_flow
+    workbook = BytesIO()
+    pd.DataFrame(
+        [
+            {"Region": "North", "Revenue": 10},
+            {"Region": "South", "Revenue": 20},
+        ]
+    ).to_excel(workbook, index=False)
+
+    upload = client.post(
+        "/api/upload",
+        files={
+            "file": (
+                "sales.xlsx",
+                workbook.getvalue(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    assert upload.status_code == 200
+
+    preview = client.get("/api/dataset/preview?page=2&page_size=1")
+    assert preview.status_code == 200
+    assert preview.json() == {
+        "columns": ["Region", "Revenue"],
+        "rows": [{"Region": "South", "Revenue": 20}],
+        "page": 2,
+        "page_size": 1,
+        "total_rows": 2,
+        "total_pages": 2,
+    }
+
+
+def test_empty_dataset_preview_returns_an_empty_page(full_flow) -> None:
+    client, _, _, _ = full_flow
+    upload = client.post(
+        "/api/upload",
+        files={"file": ("empty.csv", b"Region,Revenue\n", "text/csv")},
+    )
+    assert upload.status_code == 200
+
+    preview = client.get("/api/dataset/preview")
+    assert preview.status_code == 200
+    assert preview.json() == {
+        "columns": ["Region", "Revenue"],
+        "rows": [],
+        "page": 1,
+        "page_size": 50,
+        "total_rows": 0,
+        "total_pages": 0,
+    }

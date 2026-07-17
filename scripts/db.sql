@@ -44,7 +44,7 @@ create table public.profiles (
 
 create table public.datasets (
     id uuid primary key default gen_random_uuid(),
-    user_id uuid not null references public.profiles(id) on delete cascade,
+    user_id uuid not null unique references public.profiles(id) on delete cascade,
 
     file_name text not null,
     storage_path text not null unique,
@@ -52,6 +52,8 @@ create table public.datasets (
     file_size bigint not null check (file_size >= 0),
     file_hash text not null,
     description text,
+    row_count integer not null check (row_count >= 0),
+    column_count integer not null check (column_count >= 0),
 
     status text not null default 'processing'
         check (status in ('processing', 'ready', 'failed')),

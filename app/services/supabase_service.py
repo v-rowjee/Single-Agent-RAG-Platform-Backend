@@ -34,6 +34,8 @@ class DatasetRecord:
     status: str
     rag_status: str
     error_message: str | None
+    row_count: int | None = None
+    column_count: int | None = None
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -131,6 +133,8 @@ class SupabaseService:
         file_size: int,
         file_hash: str,
         description: str | None,
+        row_count: int,
+        column_count: int,
     ) -> DatasetRecord:
         payload: JsonDict = {
             "id": dataset_id,
@@ -144,8 +148,29 @@ class SupabaseService:
             "status": "processing",
             "rag_status": "pending",
             "error_message": None,
+            "row_count": row_count,
+            "column_count": column_count,
         }
-        response = self.client.table("datasets").insert(payload).execute()
+        table = self.client.table("datasets")
+        try:
+            response = table.insert(payload).execute()
+        except Exception as error:
+            if not self._is_missing_dataset_metadata_column(error):
+                raise
+
+            # Existing deployments may not yet have run the single-active-
+            # dataset migration. The API can still serve them safely by
+            # calculating these values from the uploaded file when needed.
+            # Retain the fields in the primary insert so migrated databases
+            # avoid that additional read.
+            logger.warning(
+                "datasets table is missing row_count/column_count; falling back "
+                "to legacy storage. Apply scripts/migrate_single_active_dataset.sql."
+            )
+            legacy_payload = dict(payload)
+            legacy_payload.pop("row_count", None)
+            legacy_payload.pop("column_count", None)
+            response = table.insert(legacy_payload).execute()
         rows = list(response.data or [])
         if not rows:
             raise SupabaseUnavailableError("Dataset insert returned no row.")
@@ -162,6 +187,23 @@ class SupabaseService:
         )
         rows = list(response.data or [])
         return self._dataset(rows[0]) if rows else None
+
+    def get_active_dataset(self, user_id: str) -> DatasetRecord | None:
+        response = (
+            self.client.table("datasets")
+            .select("*")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        rows = list(response.data or [])
+        return self._dataset(rows[0]) if rows else None
+
+    def delete_dataset(self, dataset_id: str, user_id: str) -> None:
+        self.client.table("datasets").delete().eq("id", dataset_id).eq(
+            "user_id",
+            user_id,
+        ).execute()
 
     def update_dataset_status(
         self,
@@ -348,6 +390,16 @@ class SupabaseService:
                 if row.get("error_message") is not None
                 else None
             ),
+            row_count=(
+                int(row["row_count"])
+                if row.get("row_count") is not None
+                else None
+            ),
+            column_count=(
+                int(row["column_count"])
+                if row.get("column_count") is not None
+                else None
+            ),
             created_at=(
                 str(row["created_at"]) if row.get("created_at") is not None else None
             ),
@@ -419,6 +471,18 @@ class SupabaseService:
                 if row.get("updated_at") is not None
                 else None
             ),
+        )
+
+    @staticmethod
+    def _is_missing_dataset_metadata_column(error: Exception) -> bool:
+        message = str(error).lower()
+        mentions_metadata_column = (
+            "row_count" in message or "column_count" in message
+        )
+        return mentions_metadata_column and (
+            "does not exist" in message
+            or "could not find" in message
+            or "schema cache" in message
         )
 
     @staticmethod
