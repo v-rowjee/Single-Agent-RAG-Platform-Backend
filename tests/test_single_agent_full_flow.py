@@ -1,0 +1,374 @@
+from __future__ import annotations
+
+import sys
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from fastapi.testclient import TestClient
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+
+from app.agents.single import business_intelligence_agent as single_agent_module
+from app.api import business_intelligence as business_intelligence_api
+from app.core.config import Settings
+from app.main import app
+from app.rag import rag_service as rag_service_module
+from app.schemas.business_intelligence import DashboardResponse
+from app.services.business_intelligence_service import BusinessIntelligenceService
+from app.services.supabase_service import (
+    DashboardRecord,
+    DatasetRecord,
+    MessageRecord,
+)
+
+
+CSV_CONTENT = b"Region,Revenue\nNorth,10\nSouth,20\n"
+
+
+class InMemoryStorage:
+    """Network-free storage substitute for the complete API flow."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {}
+        self.datasets: dict[str, DatasetRecord] = {}
+        self.dashboards: dict[str, DashboardRecord] = {}
+        self.messages: list[MessageRecord] = []
+        self.status_updates: list[tuple[str, dict[str, object]]] = []
+
+    def upload_file(self, storage_path: str, content: bytes, mime_type: str) -> None:
+        self.files[storage_path] = content
+
+    def download_file(self, storage_path: str) -> bytes:
+        return self.files[storage_path]
+
+    def delete_file(self, storage_path: str) -> None:
+        self.files.pop(storage_path, None)
+
+    def create_dataset(
+        self,
+        dataset_id: str,
+        file_name: str,
+        storage_path: str,
+        mime_type: str,
+        file_size: int,
+        file_hash: str,
+        description: str | None,
+    ) -> DatasetRecord:
+        dataset = DatasetRecord(
+            id=dataset_id,
+            file_name=file_name,
+            storage_path=storage_path,
+            mime_type=mime_type,
+            file_size=file_size,
+            file_hash=file_hash,
+            description=description,
+            status="processing",
+            rag_status="pending",
+            error_message=None,
+        )
+        self.datasets[dataset_id] = dataset
+        return dataset
+
+    def get_dataset(self, dataset_id: str) -> DatasetRecord | None:
+        return self.datasets.get(dataset_id)
+
+    def update_dataset_status(self, dataset_id: str, **updates: object) -> None:
+        self.status_updates.append((dataset_id, updates))
+        dataset = self.datasets[dataset_id]
+        allowed = {
+            key: value
+            for key, value in updates.items()
+            if key in {"status", "rag_status", "error_message"}
+        }
+        self.datasets[dataset_id] = replace(dataset, **allowed)
+
+    def save_dashboard(
+        self,
+        dataset_id: str,
+        status: str,
+        response: dict[str, object],
+    ) -> DashboardRecord:
+        dashboard = DashboardRecord(
+            id=f"dashboard-{dataset_id}",
+            dataset_id=dataset_id,
+            status=status,
+            response=response,
+        )
+        self.dashboards[dataset_id] = dashboard
+        return dashboard
+
+    def get_dashboard(self, dataset_id: str) -> DashboardRecord | None:
+        return self.dashboards.get(dataset_id)
+
+    def save_message(
+        self,
+        dataset_id: str,
+        role: str,
+        content: str,
+        sources: list[str] | None = None,
+    ) -> MessageRecord:
+        message = MessageRecord(
+            id=f"message-{len(self.messages) + 1}",
+            dataset_id=dataset_id,
+            role=role,
+            content=content,
+            sources=sources or [],
+            created_at=f"2026-07-17T10:00:0{len(self.messages)}Z",
+        )
+        self.messages.append(message)
+        return message
+
+    def get_recent_messages(
+        self,
+        dataset_id: str,
+        limit: int = 6,
+    ) -> list[MessageRecord]:
+        messages = [
+            message for message in self.messages if message.dataset_id == dataset_id
+        ]
+        return messages[-limit:]
+
+
+class DummyRagService:
+    """Records single-agent indexing without embedding or network access."""
+
+    def __init__(self) -> None:
+        self.index_calls: list[dict[str, object]] = []
+
+    def index_dataset(self, **kwargs: object) -> SimpleNamespace:
+        agent_input = kwargs["agent_input"]
+        self.index_calls.append(
+            {
+                "session_id": agent_input.sessionId,
+                "file_name": agent_input.fileName,
+                "content": Path(agent_input.filePath).read_bytes(),
+                "force": kwargs["force"],
+            }
+        )
+        return SimpleNamespace(collection_name="document_chunks")
+
+
+class DummySingleAgent:
+    """Deterministic stand-in for all single-agent LLM work."""
+
+    def __init__(self) -> None:
+        self.dashboard_calls: list[dict[str, object]] = []
+        self.profile_calls: list[str] = []
+        self.chat_calls: list[dict[str, object]] = []
+        self._source_ids: dict[str, list[str]] = {}
+
+    def generate_dashboard(self, agent_input: Any) -> DashboardResponse:
+        self.dashboard_calls.append(
+            {
+                "session_id": agent_input.sessionId,
+                "file_name": agent_input.fileName,
+                "content": Path(agent_input.filePath).read_bytes(),
+            }
+        )
+        return _dashboard_response(agent_input.sessionId, agent_input.fileName)
+
+    def profile_for_session(self, agent_input: Any) -> dict[str, object]:
+        self.profile_calls.append(agent_input.sessionId)
+        return {"summary": {"measures": ["Revenue"], "dimensions": ["Region"]}}
+
+    def chat(
+        self,
+        agent_input: Any,
+        query: str,
+        history: list[dict[str, str]],
+    ) -> str:
+        self.chat_calls.append(
+            {
+                "session_id": agent_input.sessionId,
+                "query": query,
+                "history": history.copy(),
+            }
+        )
+        if len(self.chat_calls) == 1:
+            self._source_ids[agent_input.sessionId] = ["dataset_summary"]
+            return (
+                "**Answer:** Revenue totals 30 across North and South.\n\n"
+                "**Grounding:** The uploaded sales dataset."
+            )
+
+        self._source_ids[agent_input.sessionId] = ["dataset_summary", "revenue_by_region"]
+        return (
+            "**Answer:** North contributes 10 and South contributes 20.\n\n"
+            "**Grounding:** The prior revenue result and the regional rows."
+        )
+
+    def source_ids_for_session(self, session_id: str) -> list[str]:
+        return self._source_ids[session_id]
+
+
+def _dashboard_response(session_id: str, file_name: str) -> DashboardResponse:
+    template_service = BusinessIntelligenceService(
+        storage=SimpleNamespace(),  # type: ignore[arg-type]
+        settings=Settings("", "", bi_pipeline_mode="single"),
+    )
+    payload = template_service._build_placeholder_dashboard(
+        dataset=DatasetRecord(
+            id=session_id,
+            file_name=file_name,
+            storage_path=f"{session_id}/{file_name}",
+            mime_type="text/csv",
+            file_size=len(CSV_CONTENT),
+            file_hash="test-hash",
+            description="Quarterly sales",
+            status="processing",
+            rag_status="pending",
+            error_message=None,
+        ),
+        dataset_info={
+            "rowCount": 2,
+            "columnCount": 2,
+            "measures": ["Revenue"],
+            "dimensions": ["Region"],
+            "missingValueCount": 0,
+            "duplicateRowCount": 0,
+            "completenessPercent": 100.0,
+        },
+    )
+    payload["status"] = "success"
+    payload["warnings"] = []
+    return DashboardResponse.model_validate(payload)
+
+
+@pytest.fixture
+def full_flow(monkeypatch: pytest.MonkeyPatch):
+    storage = InMemoryStorage()
+    agent = DummySingleAgent()
+    rag = DummyRagService()
+    service = BusinessIntelligenceService(
+        storage=storage,  # type: ignore[arg-type]
+        settings=Settings("", "", bi_pipeline_mode="single"),
+    )
+
+    async def multi_agent_pipeline_must_not_run(*args: object, **kwargs: object):
+        raise AssertionError("The multi-agent pipeline must not run in single mode.")
+
+    monkeypatch.setattr(
+        service,
+        "_run_multi_agent_pipeline",
+        multi_agent_pipeline_must_not_run,
+    )
+    monkeypatch.setattr(
+        business_intelligence_api,
+        "business_intelligence_service",
+        service,
+    )
+    monkeypatch.setattr(single_agent_module, "business_intelligence_agent", agent)
+    monkeypatch.setattr(rag_service_module, "rag_service", rag)
+
+    with TestClient(app) as client:
+        yield client, storage, agent, rag
+
+
+def test_single_agent_api_full_flow_uses_only_deterministic_fakes(full_flow) -> None:
+    client, storage, agent, rag = full_flow
+
+    upload = client.post(
+        "/api/upload",
+        files={"file": ("sales.csv", CSV_CONTENT, "text/csv")},
+        data={"description": "Quarterly sales"},
+    )
+
+    assert upload.status_code == 200
+    upload_body = upload.json()
+    assert upload_body["status"] == "success"
+    assert upload_body["fileName"] == "sales.csv"
+    session_id = upload_body["sessionId"]
+    assert storage.files[f"{session_id}/sales.csv"] == CSV_CONTENT
+    assert storage.datasets[session_id].description == "Quarterly sales"
+    assert storage.datasets[session_id].status == "ready"
+    assert storage.datasets[session_id].rag_status == "ready"
+    assert len(agent.dashboard_calls) == 1
+    assert agent.dashboard_calls[0]["content"] == CSV_CONTENT
+    assert agent.profile_calls == [session_id]
+    assert rag.index_calls == [
+        {
+            "session_id": session_id,
+            "file_name": "sales.csv",
+            "content": CSV_CONTENT,
+            "force": True,
+        }
+    ]
+
+    dashboard = client.get(f"/api/dashboard/{session_id}")
+
+    assert dashboard.status_code == 200
+    assert dashboard.json()["status"] == "success"
+    assert dashboard.json()["sessionId"] == session_id
+    assert dashboard.json()["dashboard"]["datasetSummary"] == {
+        "fileName": "sales.csv",
+        "rowCount": 2,
+        "columnCount": 2,
+        "timeField": None,
+        "period": None,
+        "measures": ["Revenue"],
+        "dimensions": ["Region"],
+        "quality": {
+            "completenessPercent": 100.0,
+            "missingValueCount": 0,
+            "duplicateRowCount": 0,
+        },
+        "generatedAt": dashboard.json()["dashboard"]["datasetSummary"]["generatedAt"],
+    }
+    assert len(agent.dashboard_calls) == 1
+
+    first_chat = client.post(
+        "/api/chat",
+        json={"sessionId": session_id, "query": "What is total revenue?"},
+    )
+    second_chat = client.post(
+        "/api/chat",
+        json={"sessionId": session_id, "query": "How is it split by region?"},
+    )
+
+    assert first_chat.status_code == 200
+    assert first_chat.json() == {
+        "answer": "Revenue totals 30 across North and South.",
+        "grounding": "The uploaded sales dataset.",
+    }
+    assert second_chat.status_code == 200
+    assert second_chat.json() == {
+        "answer": "North contributes 10 and South contributes 20.",
+        "grounding": "The prior revenue result and the regional rows.",
+    }
+    assert agent.chat_calls[0]["history"] == []
+    assert agent.chat_calls[1]["history"] == [
+        {"role": "user", "content": "What is total revenue?"},
+        {
+            "role": "assistant",
+            "content": (
+                "**Answer:** Revenue totals 30 across North and South.\n\n"
+                "**Grounding:** The uploaded sales dataset."
+            ),
+        },
+    ]
+    assert storage.messages[1].sources == ["dataset_summary"]
+    assert storage.messages[3].sources == ["dataset_summary", "revenue_by_region"]
+
+    history = client.get(f"/api/chat/{session_id}/history")
+
+    assert history.status_code == 200
+    assert history.json()["sessionId"] == session_id
+    assert [message["role"] for message in history.json()["messages"]] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert [message["grounded"] for message in history.json()["messages"]] == [
+        False,
+        True,
+        False,
+        True,
+    ]
