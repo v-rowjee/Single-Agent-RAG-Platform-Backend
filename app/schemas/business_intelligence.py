@@ -315,4 +315,5 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    response: str
+    answer: str = Field(min_length=1)
+    grounding: str = Field(min_length=1)

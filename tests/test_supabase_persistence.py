@@ -10,6 +10,7 @@ from fastapi import UploadFile
 from starlette.datastructures import Headers
 
 from app.agents.multi.chat_agent import GroundedChatDraft
+from app.core.config import Settings
 from app.rag.models import RagDocument, RetrievedDocument
 from app.rag.rag_service import RagService
 from app.schemas.business_intelligence import DashboardResponse
@@ -211,7 +212,10 @@ def test_upload_persists_file_dataset_dashboard_and_response_schema(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage = FakeStorage()
-    service = BusinessIntelligenceService(storage=storage)  # type: ignore[arg-type]
+    service = BusinessIntelligenceService(
+        storage=storage,  # type: ignore[arg-type]
+        settings=Settings("", "", bi_pipeline_mode="multi"),
+    )
     monkeypatch.setattr(
         service,
         "_generate_dashboard_from_bytes",
@@ -260,7 +264,10 @@ def test_chat_messages_are_saved_and_recent_history_is_used(
 ) -> None:
     storage = FakeStorage()
     storage.datasets[DATASET_ID] = dataset_record()
-    service = BusinessIntelligenceService(storage=storage)  # type: ignore[arg-type]
+    service = BusinessIntelligenceService(
+        storage=storage,  # type: ignore[arg-type]
+        settings=Settings("", "", bi_pipeline_mode="multi"),
+    )
     monkeypatch.setattr(
         "app.services.business_intelligence_service.rag_service.retrieve_for_session",
         lambda **kwargs: [
@@ -290,7 +297,7 @@ def test_chat_messages_are_saved_and_recent_history_is_used(
 
     result = service.chat(DATASET_ID, "What is revenue?")
 
-    assert result.response == "answer"
+    assert result.answer == "answer"
     assert [message.role for message in storage.messages] == ["user", "assistant"]
     assert storage.messages[1].sources == ["dataset_overview"]
 

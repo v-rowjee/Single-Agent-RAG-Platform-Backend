@@ -274,12 +274,26 @@ class BusinessIntelligenceService:
         if not cleaned_query:
             raise ValueError("The chat query cannot be empty.")
 
+        history = (
+            self._chat_history(dataset.id)
+            if self.settings.bi_pipeline_mode == "single"
+            else []
+        )
+
         self.storage.save_message(
             dataset_id=dataset.id,
             role="user",
             content=cleaned_query,
             sources=[],
         )
+
+        if self.settings.bi_pipeline_mode == "single":
+            return self._chat_with_single_agent(
+                dataset=dataset,
+                query=cleaned_query,
+                history=history,
+            )
+
         logger.info("Chat retrieval started session_id=%s", dataset.id)
         try:
             documents = rag_service.retrieve_for_session(
@@ -334,19 +348,87 @@ class BusinessIntelligenceService:
             guarded_draft.source_ids,
         )
 
+    def _chat_with_single_agent(
+        self,
+        dataset: DatasetRecord,
+        query: str,
+        history: list[dict[str, str]],
+    ) -> ChatResponse:
+        """Answer through the single-agent RAG graph for single pipeline sessions."""
+        try:
+            content = self.storage.download_file(dataset.storage_path)
+            response, source_ids = self._chat_with_agent(
+                dataset=dataset,
+                content=content,
+                query=query,
+                history=history,
+            )
+        except Exception:
+            logger.exception(
+                "Single-agent chat preparation failed session_id=%s",
+                dataset.id,
+            )
+            response = (
+                "The analysis assistant could not answer this question at the moment."
+            )
+            source_ids = []
+
+        return self._save_chat_response(dataset.id, response, source_ids)
+
+    def _chat_history(self, dataset_id: str) -> list[dict[str, str]]:
+        return [
+            {"role": message.role, "content": message.content}
+            for message in self.storage.get_recent_messages(dataset_id, limit=10)
+        ]
+
     def _save_chat_response(
         self,
         dataset_id: str,
         response_text: str,
         source_ids: list[str],
     ) -> ChatResponse:
+        answer, grounding = self._split_chat_response(response_text, source_ids)
         self.storage.save_message(
             dataset_id=dataset_id,
             role="assistant",
-            content=response_text,
+            content=f"**Answer:** {answer}\n\n**Grounding:** {grounding}",
             sources=source_ids,
         )
-        return ChatResponse(response=response_text)
+        return ChatResponse(answer=answer, grounding=grounding)
+
+    @staticmethod
+    def _split_chat_response(
+        response_text: str,
+        source_ids: list[str],
+    ) -> tuple[str, str]:
+        """Split the agent's Markdown sections into the public chat contract."""
+        grounding_match = re.search(
+            r"(?:^|\n)\s*\*\*Grounding:\*\*\s*([\s\S]*)$",
+            response_text,
+            flags=re.IGNORECASE,
+        )
+        if grounding_match is not None:
+            answer = response_text[: grounding_match.start()].strip()
+            grounding = grounding_match.group(1).strip()
+        else:
+            answer = response_text.strip()
+            source_text = ", ".join(f"`{source_id}`" for source_id in source_ids)
+            grounding = (
+                f"Retrieved dataset sources: {source_text}."
+                if source_text
+                else "No supporting dataset evidence was available."
+            )
+
+        answer = re.sub(
+            r"^\s*\*\*Answer:\*\*\s*",
+            "",
+            answer,
+            flags=re.IGNORECASE,
+        )
+        return (
+            answer or "The analysis assistant could not answer this question.",
+            grounding or "No supporting dataset evidence was available.",
+        )
 
     def get_chat_history(self, session_id: str) -> dict[str, Any]:
         dataset = self._load_dataset(session_id)

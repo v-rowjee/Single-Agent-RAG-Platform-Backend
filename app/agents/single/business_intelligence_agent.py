@@ -415,7 +415,8 @@ Cite retrieved sources using their source IDs.
 Distinguish historical values from forecast values.
 Do not claim that correlation proves causation.
 
-Format exactly:
+Return exactly these two Markdown sections. The API returns each section as a
+separate field:
 **Answer:** Direct answer in one to four sentences.
 
 **Grounding:** Mention the calculation fields and/or retrieved source IDs that support the answer.""",
@@ -435,7 +436,8 @@ Format exactly:
                     """Answer only from the supplied compact dataset profile.
 Return short Markdown under 90 words.
 
-Format exactly:
+Return exactly these two Markdown sections. The API returns each section as a
+separate field:
 **Answer:** 1-2 direct sentences.
 
 **Grounding:** Mention the compact profile fields that support the answer.

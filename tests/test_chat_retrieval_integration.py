@@ -7,6 +7,7 @@ from fastapi import HTTPException
 
 from app.agents.multi.chat_agent import GroundedChatDraft
 from app.api import business_intelligence as chat_api
+from app.core.config import Settings
 from app.rag.models import RetrievedDocument
 from app.rag.rag_service import RagService
 from app.schemas.business_intelligence import ChatRequest, ChatResponse
@@ -119,7 +120,13 @@ def configure_service(
         lambda: FakeEmbeddingService(),
     )
     monkeypatch.setattr("app.services.business_intelligence_service.rag_service", rag)
-    return BusinessIntelligenceService(storage=storage), storage  # type: ignore[arg-type]
+    return (
+        BusinessIntelligenceService(
+            storage=storage,  # type: ignore[arg-type]
+            settings=Settings("", "", bi_pipeline_mode="multi"),
+        ),
+        storage,
+    )
 
 
 def test_chat_uses_session_scoped_vector_retrieval_and_canonical_response(
@@ -156,7 +163,8 @@ def test_chat_uses_session_scoped_vector_retrieval_and_canonical_response(
     response = service.chat(SESSION_A, "What is the revenue trend?")
 
     assert isinstance(response, ChatResponse)
-    assert response.response == "grounded answer"
+    assert response.answer == "grounded answer"
+    assert response.grounding == "Retrieved dataset sources: `kpi-source`."
     assert storage.vector_calls[0]["dataset_id"] == SESSION_A
     assert received["session_id"] == SESSION_A
     assert [document.metadata["title"] for document in received["documents"]] == ["Revenue KPI"]
@@ -220,7 +228,7 @@ def test_chat_returns_normal_response_when_no_documents_are_retrieved(
     response = service.chat(SESSION_A, "What is the revenue trend?")
 
     assert isinstance(response, ChatResponse)
-    assert "does not contain enough information" in response.response
+    assert "does not contain enough information" in response.answer
 
 
 def test_chat_handles_vector_retrieval_failure_without_unfiltered_fallback(
@@ -238,13 +246,16 @@ def test_chat_handles_vector_retrieval_failure_without_unfiltered_fallback(
         "app.services.business_intelligence_service.rag_service",
         SimpleNamespace(retrieve_for_session=fail_retrieval),
     )
-    service = BusinessIntelligenceService(storage=storage)  # type: ignore[arg-type]
+    service = BusinessIntelligenceService(
+        storage=storage,  # type: ignore[arg-type]
+        settings=Settings("", "", bi_pipeline_mode="multi"),
+    )
 
     response = service.chat(SESSION_A, "What is the revenue trend?")
 
     assert calls == 1
-    assert "could not answer" in response.response
-    assert "private vector failure" not in response.response
+    assert "could not answer" in response.answer
+    assert "private vector failure" not in response.answer
 
 
 def test_chat_handles_model_failure_with_safe_response(
@@ -262,8 +273,8 @@ def test_chat_handles_model_failure_with_safe_response(
     response = service.chat(SESSION_A, "What improved?")
 
     assert isinstance(response, ChatResponse)
-    assert "could not answer" in response.response
-    assert "private model failure" not in response.response
+    assert "could not answer" in response.answer
+    assert "private model failure" not in response.answer
 
 
 def test_chat_route_uses_canonical_request_and_response_schemas(
@@ -272,10 +283,18 @@ def test_chat_route_uses_canonical_request_and_response_schemas(
     monkeypatch.setattr(
         chat_api,
         "business_intelligence_service",
-        SimpleNamespace(chat=lambda session_id, query: ChatResponse(response="answer")),
+        SimpleNamespace(
+            chat=lambda session_id, query: ChatResponse(
+                answer="answer",
+                grounding="Dataset overview.",
+            )
+        ),
     )
 
     response = chat_api.chat(ChatRequest(sessionId=SESSION_A, query="Question"))
 
     assert isinstance(response, ChatResponse)
-    assert response.model_dump() == {"response": "answer"}
+    assert response.model_dump() == {
+        "answer": "answer",
+        "grounding": "Dataset overview.",
+    }

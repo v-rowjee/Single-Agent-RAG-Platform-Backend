@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from app.core.config import Settings, get_settings
-from app.schemas.business_intelligence import DashboardResponse
+from app.schemas.business_intelligence import ChatResponse, DashboardResponse
 from app.services.business_intelligence_service import BusinessIntelligenceService
 from app.services.supabase_service import DatasetRecord
 
@@ -91,6 +92,37 @@ def test_pipeline_modes_share_the_canonical_dashboard_contract() -> None:
     assert DashboardResponse.model_validate(single_result.model_dump())
     assert DashboardResponse.model_validate(multi_result.model_dump())
     assert type(single_result) is type(multi_result) is DashboardResponse
+
+
+def test_single_mode_routes_chat_to_the_single_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = BusinessIntelligenceService(
+        storage=SimpleNamespace(),  # type: ignore[arg-type]
+        settings=Settings("", "", bi_pipeline_mode="single"),
+    )
+    expected = ChatResponse(
+        answer="single-agent answer",
+        grounding="Dataset overview.",
+    )
+    single = lambda **kwargs: expected
+    multi = lambda **kwargs: pytest.fail("multi-agent chat must not run in single mode")
+
+    monkeypatch.setattr(service, "_load_dataset", lambda session_id: session())
+    monkeypatch.setattr(service, "_chat_history", lambda dataset_id: [])
+    monkeypatch.setattr(
+        service.storage,
+        "save_message",
+        lambda **kwargs: None,
+        raising=False,
+    )
+    monkeypatch.setattr(service, "_chat_with_single_agent", single)
+    monkeypatch.setattr(
+        "app.services.business_intelligence_service.rag_service.retrieve_for_session",
+        multi,
+    )
+
+    assert service.chat(SESSION_ID, "What is the total revenue?") == expected
 
 
 def test_invalid_pipeline_mode_is_rejected_when_settings_load(
