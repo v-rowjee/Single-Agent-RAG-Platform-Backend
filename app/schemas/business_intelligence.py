@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -244,7 +244,10 @@ class Dashboard(BaseModel):
     supportingCharts: list[SupportingChart] = Field(max_length=4)
     analysis: DashboardAnalysis
     insights: DashboardInsights
-    recommendedActions: list[RecommendedAction]
+    recommendedActions: list[RecommendedAction] = Field(
+        min_length=3,
+        max_length=5,
+    )
     datasetSummary: DatasetSummary
     sections: list[Section]
     layout: DashboardLayout
@@ -307,6 +310,26 @@ class UploadResponse(BaseModel):
     sessionId: str = Field(min_length=1)
     fileName: str
     message: str
+
+
+class ActiveDatasetResponse(BaseModel):
+    sessionId: str = Field(min_length=1)
+    fileName: str = Field(min_length=1)
+    fileSize: int = Field(ge=0)
+    uploadedAt: str
+    rowCount: int = Field(ge=0)
+    columnCount: int = Field(ge=0)
+    analysisStatus: Literal["processing", "ready", "failed"]
+    originalPrompt: str | None = None
+
+
+class DatasetPreviewResponse(BaseModel):
+    columns: list[str]
+    rows: list[dict[str, Any]]
+    page: int = Field(ge=1)
+    page_size: int = Field(ge=1, le=50)
+    total_rows: int = Field(ge=0)
+    total_pages: int = Field(ge=0)
 
 
 class ChatRequest(BaseModel):

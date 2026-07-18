@@ -2,22 +2,17 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 from typing import Any, Literal, TypeAlias
 
 from dotenv import load_dotenv
-from groq import AsyncGroq
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 load_dotenv()
 
-MODEL_NAME = "llama-3.3-70b-versatile"
-
 MIN_TREND_PERIODS = 2
-MIN_FORECAST_PERIODS = 12
+MIN_FORECAST_PERIODS = 4
 
 AgentName: TypeAlias = Literal[
     "kpi_trend",
@@ -210,92 +205,6 @@ def _compact_input(
     }
 
 
-def _system_prompt() -> str:
-    return """
-You are the supervisor of a multi-agent business intelligence workflow.
-
-The available specialist agents are:
-- kpi_trend
-- anomaly_detection
-- forecasting
-
-Select agents using only the validated capability flags supplied to you.
-
-Rules:
-- Select kpi_trend when KPI or trend analysis is supported.
-- Select anomaly_detection when anomaly analysis is supported.
-- Select forecasting only when forecasting is supported.
-- Explain the decision for all three agents.
-- Do not calculate KPIs, detect anomalies, forecast values, load data,
-  generate dashboard content, or create RAG documents.
-- Do not select an unsupported agent.
-
-Return only JSON in this structure:
-
-{
-  "selected_agents": ["kpi_trend"],
-  "decisions": [
-    {
-      "agent": "kpi_trend",
-      "selected": true,
-      "reason": "Short reason"
-    },
-    {
-      "agent": "anomaly_detection",
-      "selected": false,
-      "reason": "Short reason"
-    },
-    {
-      "agent": "forecasting",
-      "selected": false,
-      "reason": "Short reason"
-    }
-  ]
-}
-""".strip()
-
-
-async def _request_groq_plan(
-    prepared_dataset: dict[str, Any],
-    capabilities: dict[str, bool],
-) -> OrchestrationPlan:
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
-
-    if not api_key:
-        raise OrchestratorError(
-            "GROQ_API_KEY is missing from the environment."
-        )
-
-    client = AsyncGroq(api_key=api_key)
-
-    response = await client.chat.completions.create(
-        model=MODEL_NAME,
-        temperature=0.1,
-        max_completion_tokens=500,
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "system",
-                "content": _system_prompt(),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    _compact_input(
-                        prepared_dataset,
-                        capabilities,
-                    ),
-                    separators=(",", ":"),
-                    default=str,
-                ),
-            },
-        ],
-    )
-
-    content = response.choices[0].message.content or "{}"
-    return OrchestrationPlan.model_validate_json(content)
-
-
 def _fallback_plan(
     supported_agents: set[AgentName],
 ) -> OrchestrationPlan:
@@ -324,69 +233,6 @@ def _fallback_plan(
     )
 
 
-def _validate_plan(
-    plan: OrchestrationPlan,
-    supported_agents: set[AgentName],
-) -> OrchestrationPlan:
-    """
-    The LLM proposes a plan, but deterministic capability checks
-    have final authority.
-    """
-    proposed_agents = set(plan.selected_agents)
-
-    selected_agents = [
-        agent
-        for agent in AGENT_ORDER
-        if agent in proposed_agents and agent in supported_agents
-    ]
-
-    # KPI/trend analysis is the core dashboard branch when supported.
-    if (
-        "kpi_trend" in supported_agents
-        and "kpi_trend" not in selected_agents
-    ):
-        selected_agents.insert(0, "kpi_trend")
-
-    proposed_reasons = {
-        decision.agent: decision.reason
-        for decision in plan.decisions
-    }
-
-    decisions: list[AgentDecision] = []
-
-    for agent in AGENT_ORDER:
-        selected = agent in selected_agents
-
-        if agent not in supported_agents:
-            reason = (
-                "Not selected because the prepared dataset "
-                "does not support this analysis."
-            )
-        elif selected:
-            reason = proposed_reasons.get(
-                agent,
-                "Selected because the prepared dataset supports this analysis.",
-            )
-        else:
-            reason = proposed_reasons.get(
-                agent,
-                "Not selected by the orchestration planner.",
-            )
-
-        decisions.append(
-            AgentDecision(
-                agent=agent,
-                selected=selected,
-                reason=reason,
-            )
-        )
-
-    return OrchestrationPlan(
-        selected_agents=selected_agents,
-        decisions=decisions,
-    )
-
-
 class OrchestratorAgent:
     async def run(
         self,
@@ -405,23 +251,8 @@ class OrchestratorAgent:
             capabilities,
         )
 
-        try:
-            proposed_plan = await _request_groq_plan(
-                prepared_dataset,
-                capabilities,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Groq orchestration failed; using deterministic routing: %s",
-                exc,
-            )
-            result = _fallback_plan(supported_agents)
-        else:
-            result = _validate_plan(
-                proposed_plan,
-                supported_agents,
-            )
-            logger.info("Groq orchestration plan validated.")
+        result = _fallback_plan(supported_agents)
+        logger.info("Deterministic capability routing completed.")
 
         logger.info(
             "Selected specialist agents: %s",

@@ -4,10 +4,11 @@ import asyncio
 import hashlib
 import io
 import logging
+import math
 import re
 import tempfile
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Literal
 from uuid import UUID, uuid4
@@ -17,7 +18,9 @@ from fastapi import UploadFile
 
 from app.agents.multi.chat_agent import GroundedChatDraft, chat_agent
 from app.core.config import Settings, get_settings
+from app.guardrails.chat_input import chat_input_guardrail
 from app.guardrails.chat_grounding import chat_grounding_guardrail
+from app.orchestration.chat_graph import build_multi_agent_chat_graph
 from app.schemas.business_intelligence import (
     ApiMessage,
     BusinessIntelligenceAgentInput,
@@ -57,20 +60,44 @@ class InvalidUploadError(Exception):
     """Raised when an uploaded file cannot be processed."""
 
 
+class DatasetAlreadyExistsError(Exception):
+    """Raised when a user attempts to upload a second active dataset."""
+
+
 class BusinessIntelligenceService:
     def __init__(
         self,
         storage: SupabaseService | None = None,
         settings: Settings | None = None,
+        *,
+        rag: Any | None = None,
+        multi_chat_agent: Any | None = None,
+        input_guardrail: Any | None = None,
+        output_guardrail: Any | None = None,
+        multi_chat_graph: Any | None = None,
     ) -> None:
         self.storage = storage or supabase_service
         self.settings = settings or get_settings()
+        self._rag_service = rag or rag_service
+        self._multi_chat_agent = multi_chat_agent or chat_agent
+        self._input_guardrail = input_guardrail or chat_input_guardrail
+        self._output_guardrail = output_guardrail or chat_grounding_guardrail
+        self._multi_chat_graph = multi_chat_graph or build_multi_agent_chat_graph(
+            validate_session=self._load_dataset,
+            validate_input=self._input_guardrail.validate,
+            retrieve_documents=self._retrieve_multi_chat_documents,
+            generate_draft=self._generate_multi_chat_draft,
+            ground_draft=self._ground_multi_chat_draft,
+        )
 
     async def create_analysis(
         self,
         file: UploadFile,
+        user_id: str,
         description: str | None = None,
     ) -> dict[str, Any]:
+        if not user_id:
+            raise ValueError("An authenticated user is required.")
         original_name = Path(file.filename or "").name
         file_name = self._sanitize_file_name(original_name)
         mime_type = (file.content_type or "").strip()
@@ -83,33 +110,44 @@ class BusinessIntelligenceService:
         if len(content) > MAX_UPLOAD_BYTES:
             raise InvalidUploadError("The uploaded file is too large.")
 
+        dataset_info = self._inspect_file(file_name, content)
+        if self.storage.get_active_dataset(user_id) is not None:
+            raise DatasetAlreadyExistsError(
+                "You already have an active dataset. Use Start Over before uploading another file."
+            )
+
         session_id = str(uuid4())
-        storage_path = f"{session_id}/{file_name}"
+        storage_path = f"{user_id}/{session_id}/{file_name}"
         file_hash = hashlib.sha256(content).hexdigest()
 
-        self.storage.upload_file(
-            storage_path=storage_path,
-            content=content,
-            mime_type=mime_type,
-        )
-
         dataset_inserted = False
+        file_uploaded = False
         try:
             dataset = self.storage.create_dataset(
                 dataset_id=session_id,
+                user_id=user_id,
                 file_name=file_name,
                 storage_path=storage_path,
                 mime_type=mime_type,
                 file_size=len(content),
                 file_hash=file_hash,
                 description=description,
+                row_count=int(dataset_info["rowCount"]),
+                column_count=int(dataset_info["columnCount"]),
             )
             dataset_inserted = True
 
+            self.storage.upload_file(
+                storage_path=storage_path,
+                content=content,
+                mime_type=mime_type,
+            )
+            file_uploaded = True
+
             dashboard_response = await self._run_selected_pipeline(dataset, content)
-            self._save_dashboard(dataset.id, dashboard_response)
 
             if self.settings.bi_pipeline_mode == "single":
+                self._save_dashboard(dataset.id, dashboard_response)
                 self._try_index_rag(
                     dataset=dataset,
                     content=content,
@@ -128,6 +166,11 @@ class BusinessIntelligenceService:
             )
 
         except Exception as error:
+            if not dataset_inserted and self._is_duplicate_dataset_error(error):
+                raise DatasetAlreadyExistsError(
+                    "You already have an active dataset. Use Start Over before uploading another file."
+                ) from error
+
             safe_error = self._safe_error(error)
             logger.exception(
                 "Dataset processing failed session_id=%s operation=upload storage_path=%s",
@@ -135,13 +178,14 @@ class BusinessIntelligenceService:
                 storage_path,
             )
             if dataset_inserted:
-                self.storage.update_dataset_status(
-                    session_id,
-                    status="failed",
-                    error_message=safe_error,
-                )
-            else:
-                self.storage.delete_file(storage_path)
+                if file_uploaded:
+                    self.storage.update_dataset_status(
+                        session_id,
+                        status="failed",
+                        error_message=safe_error,
+                    )
+                else:
+                    self.storage.delete_dataset(session_id, user_id)
             raise
 
         return {
@@ -151,8 +195,73 @@ class BusinessIntelligenceService:
             "message": "File uploaded and analysis session created successfully.",
         }
 
-    async def get_dashboard(self, session_id: str) -> DashboardResponse:
-        dataset = self._load_dataset(session_id)
+    def get_active_dataset(self, user_id: str) -> DatasetRecord:
+        if not user_id:
+            raise SessionNotFoundError("No active dataset was found.")
+        dataset = self.storage.get_active_dataset(user_id)
+        if dataset is None:
+            raise SessionNotFoundError("No active dataset was found.")
+        return dataset
+
+    def get_active_dataset_details(self, user_id: str) -> dict[str, Any]:
+        dataset = self.get_active_dataset(user_id)
+        row_count = dataset.row_count
+        column_count = dataset.column_count
+        if row_count is None or column_count is None:
+            dataset_info = self._inspect_file(
+                dataset.file_name,
+                self.storage.download_file(dataset.storage_path),
+            )
+            row_count = int(dataset_info["rowCount"])
+            column_count = int(dataset_info["columnCount"])
+
+        return {
+            "sessionId": dataset.id,
+            "fileName": dataset.file_name,
+            "fileSize": dataset.file_size,
+            "uploadedAt": dataset.created_at or "",
+            "rowCount": row_count,
+            "columnCount": column_count,
+            "analysisStatus": dataset.status,
+            "originalPrompt": dataset.description,
+        }
+
+    def get_dataset_preview(
+        self,
+        user_id: str,
+        page: int,
+        page_size: int,
+    ) -> dict[str, Any]:
+        dataset = self.get_active_dataset(user_id)
+        content = self.storage.download_file(dataset.storage_path)
+        total_rows = (
+            dataset.row_count
+            if dataset.row_count is not None
+            else int(self._inspect_file(dataset.file_name, content)["rowCount"])
+        )
+        columns, rows = self._read_preview_page(
+            dataset.file_name,
+            content,
+            page,
+            page_size,
+        )
+        total_pages = math.ceil(total_rows / page_size) if total_rows else 0
+        return {
+            "columns": columns,
+            "rows": rows,
+            "page": page,
+            "page_size": page_size,
+            "total_rows": total_rows,
+            "total_pages": total_pages,
+        }
+
+    def reset_active_dataset(self, user_id: str) -> None:
+        dataset = self.get_active_dataset(user_id)
+        self.storage.delete_file(dataset.storage_path)
+        self.storage.delete_dataset(dataset.id, user_id)
+
+    async def get_dashboard(self, session_id: str, user_id: str) -> DashboardResponse:
+        dataset = self._load_dataset(session_id, user_id)
         dashboard = self.storage.get_dashboard(dataset.id)
 
         if dashboard is not None:
@@ -207,12 +316,16 @@ class BusinessIntelligenceService:
             else self.storage.download_file(session.storage_path)
         )
 
-        with self._temporary_agent_input(session, content) as agent_input:
+        with self._temporary_agent_workspace(
+            session,
+            content,
+        ) as (agent_input, workspace):
             initial_state = {
                 "session_id": session_id,
                 "dataset_id": session.id,
                 "business_description": session.description,
                 "uploaded_file_path": agent_input.filePath,
+                "working_directory": str(workspace),
                 "warnings": [],
                 "errors": [],
                 "completed_agents": [],
@@ -223,6 +336,16 @@ class BusinessIntelligenceService:
 
             try:
                 result = await business_intelligence_graph.ainvoke(initial_state)
+                persistence_result = result.get("persistence_result")
+                if (
+                    result.get("workflow_status") == "failed"
+                    or not isinstance(persistence_result, dict)
+                    or persistence_result.get("status") != "success"
+                ):
+                    raise RuntimeError(
+                        "The multi-agent workflow did not persist successfully."
+                    )
+
                 dashboard_output = result.get("dashboard_output")
                 if not isinstance(dashboard_output, dict):
                     raise ValueError("The workflow did not return a dashboard output.")
@@ -267,18 +390,20 @@ class BusinessIntelligenceService:
         )
         return response
 
-    def chat(self, session_id: str, query: str) -> ChatResponse:
-        dataset = self._load_dataset(session_id)
-        cleaned_query = query.strip()
+    def chat(self, session_id: str, query: str, user_id: str) -> ChatResponse:
+        if self.settings.bi_pipeline_mode == "multi":
+            return self._chat_with_multi_agent_pipeline(
+                session_id=session_id,
+                query=query,
+                user_id=user_id,
+            )
 
+        dataset = self._load_dataset(session_id, user_id)
+        cleaned_query = query.strip()
         if not cleaned_query:
             raise ValueError("The chat query cannot be empty.")
 
-        history = (
-            self._chat_history(dataset.id)
-            if self.settings.bi_pipeline_mode == "single"
-            else []
-        )
+        history = self._chat_history(dataset.id)
 
         self.storage.save_message(
             dataset_id=dataset.id,
@@ -287,66 +412,90 @@ class BusinessIntelligenceService:
             sources=[],
         )
 
-        if self.settings.bi_pipeline_mode == "single":
-            return self._chat_with_single_agent(
-                dataset=dataset,
-                query=cleaned_query,
-                history=history,
-            )
+        return self._chat_with_single_agent(
+            dataset=dataset,
+            query=cleaned_query,
+            history=history,
+        )
 
-        logger.info("Chat retrieval started session_id=%s", dataset.id)
-        try:
-            documents = rag_service.retrieve_for_session(
-                session_id=dataset.id,
-                query=cleaned_query,
-                limit=DEFAULT_RETRIEVAL_LIMIT,
-            )
-            logger.info(
-                "Chat documents retrieved session_id=%s count=%s",
-                dataset.id,
-                len(documents),
-            )
-        except Exception:
-            logger.exception(
-                "Chat retrieval or generation failed session_id=%s operation=retrieval",
-                dataset.id,
-            )
-            return self._save_chat_response(
-                dataset.id,
-                "The analysis assistant could not answer this question at the moment.",
-                [],
-            )
+    def _chat_with_multi_agent_pipeline(
+        self,
+        session_id: str,
+        query: str,
+        user_id: str,
+    ) -> ChatResponse:
+        result = self._multi_chat_graph.invoke(
+            {
+                "session_id": session_id,
+                "query": query,
+                "user_id": user_id,
+            }
+        )
+        dataset = result.get("dataset")
+        guarded_draft = result.get("guarded_draft")
+        cleaned_query = str(result.get("query") or "").strip()
+        if not isinstance(dataset, DatasetRecord):
+            raise RuntimeError("Chat session validation did not return a dataset.")
+        if not isinstance(guarded_draft, GroundedChatDraft):
+            raise RuntimeError("The multi-agent chat pipeline returned no response.")
 
-        try:
-            draft = asyncio.run(
-                chat_agent.run(
-                    session_id=dataset.id,
-                    query=cleaned_query,
-                    retrieved_documents=documents,
-                )
-            )
-            guarded_draft = chat_grounding_guardrail.validate(
-                query=cleaned_query,
-                retrieved_documents=documents,
-                draft=draft,
-            )
-            logger.info("Chat response guarded session_id=%s", dataset.id)
-        except Exception:
-            logger.exception(
-                "Chat agent or grounding failed session_id=%s",
-                dataset.id,
-            )
-            guarded_draft = GroundedChatDraft(
-                answer="The analysis assistant could not answer this question at the moment.",
-                source_ids=[],
-                insufficient_context=True,
-            )
-
+        self.storage.save_message(
+            dataset_id=dataset.id,
+            role="user",
+            content=cleaned_query,
+            sources=[],
+        )
         return self._save_chat_response(
             dataset.id,
             guarded_draft.answer,
             guarded_draft.source_ids,
         )
+
+    def _retrieve_multi_chat_documents(
+        self,
+        session_id: str,
+        query: str,
+    ) -> list[RetrievedDocument]:
+        logger.info("Chat retrieval started session_id=%s", session_id)
+        documents = self._rag_service.retrieve_for_session(
+            session_id=session_id,
+            query=query,
+            limit=DEFAULT_RETRIEVAL_LIMIT,
+        )
+        logger.info(
+            "Chat documents retrieved session_id=%s count=%s",
+            session_id,
+            len(documents),
+        )
+        return documents
+
+    def _generate_multi_chat_draft(
+        self,
+        session_id: str,
+        query: str,
+        documents: list[RetrievedDocument],
+    ) -> GroundedChatDraft:
+        return asyncio.run(
+            self._multi_chat_agent.run(
+                session_id=session_id,
+                query=query,
+                retrieved_documents=documents,
+            )
+        )
+
+    def _ground_multi_chat_draft(
+        self,
+        query: str,
+        documents: list[RetrievedDocument],
+        draft: GroundedChatDraft,
+    ) -> GroundedChatDraft:
+        guarded = self._output_guardrail.validate(
+            query=query,
+            retrieved_documents=documents,
+            draft=draft,
+        )
+        logger.info("Chat response guarded")
+        return guarded
 
     def _chat_with_single_agent(
         self,
@@ -430,8 +579,8 @@ class BusinessIntelligenceService:
             grounding or "No supporting dataset evidence was available.",
         )
 
-    def get_chat_history(self, session_id: str) -> dict[str, Any]:
-        dataset = self._load_dataset(session_id)
+    def get_chat_history(self, session_id: str, user_id: str) -> dict[str, Any]:
+        dataset = self._load_dataset(session_id, user_id)
         return {
             "sessionId": dataset.id,
             "messages": [
@@ -440,9 +589,13 @@ class BusinessIntelligenceService:
             ],
         }
 
-    def _load_dataset(self, session_id: str) -> DatasetRecord:
+    def _load_dataset(self, session_id: str, user_id: str) -> DatasetRecord:
         dataset_id = self._validate_session_id(session_id)
-        dataset = self.storage.get_dataset(dataset_id)
+        if not user_id:
+            raise SessionNotFoundError(
+                f"Analysis session '{session_id}' was not found."
+            )
+        dataset = self.storage.get_dataset(dataset_id, user_id)
         if dataset is None:
             raise SessionNotFoundError(
                 f"Analysis session '{session_id}' was not found."
@@ -561,17 +714,36 @@ class BusinessIntelligenceService:
         dataset: DatasetRecord,
         content: bytes,
     ) -> Iterator[BusinessIntelligenceAgentInput]:
+        """Provide a temporary source file to legacy single-agent callers."""
+        with self._temporary_agent_workspace(dataset, content) as (
+            agent_input,
+            _,
+        ):
+            yield agent_input
+
+    @contextmanager
+    def _temporary_agent_workspace(
+        self,
+        dataset: DatasetRecord,
+        content: bytes,
+    ) -> Iterator[tuple[BusinessIntelligenceAgentInput, Path]]:
         suffix = Path(dataset.file_name).suffix.lower()
         with tempfile.TemporaryDirectory(prefix="bi_dataset_") as directory:
-            path = Path(directory) / dataset.file_name
+            workspace_root = Path(directory)
+            path = workspace_root / dataset.file_name
             if path.suffix.lower() != suffix:
-                path = Path(directory) / f"dataset{suffix}"
+                path = workspace_root / f"dataset{suffix}"
             path.write_bytes(content)
-            yield BusinessIntelligenceAgentInput(
-                sessionId=dataset.id,
-                filePath=str(path),
-                fileName=dataset.file_name,
-                description=dataset.description,
+            workspace = workspace_root / "processing"
+            workspace.mkdir()
+            yield (
+                BusinessIntelligenceAgentInput(
+                    sessionId=dataset.id,
+                    filePath=str(path),
+                    fileName=dataset.file_name,
+                    description=dataset.description,
+                ),
+                workspace,
             )
 
     def _inspect_file(
@@ -625,6 +797,96 @@ class BusinessIntelligenceService:
             "duplicateRowCount": duplicate_row_count,
             "completenessPercent": completeness_percent,
         }
+
+    def _read_preview_page(
+        self,
+        file_name: str,
+        content: bytes,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        start_row = (page - 1) * page_size
+        suffix = Path(file_name).suffix.lower()
+
+        try:
+            if suffix == ".csv":
+                skiprows = (
+                    (lambda row_index: row_index != 0 and row_index <= start_row)
+                    if start_row
+                    else None
+                )
+                dataframe = pd.read_csv(
+                    io.BytesIO(content),
+                    low_memory=False,
+                    skiprows=skiprows,
+                    nrows=page_size,
+                )
+            elif suffix == ".xlsx":
+                dataframe = pd.read_excel(
+                    io.BytesIO(content),
+                    skiprows=range(1, start_row + 1) if start_row else None,
+                    nrows=page_size,
+                )
+            else:
+                raise InvalidUploadError("Only CSV and XLSX files are supported.")
+        except UnicodeDecodeError as error:
+            raise InvalidUploadError(
+                "The CSV file must use UTF-8 encoding."
+            ) from error
+        except InvalidUploadError:
+            raise
+        except Exception as error:
+            raise InvalidUploadError(
+                "The uploaded dataset preview could not be read."
+            ) from error
+
+        columns = self._unique_column_names(
+            [str(column) for column in dataframe.columns]
+        )
+        dataframe.columns = columns
+        rows = [
+            {
+                column: self._json_preview_value(value)
+                for column, value in row.items()
+            }
+            for row in dataframe.to_dict(orient="records")
+        ]
+        return columns, rows
+
+    @staticmethod
+    def _unique_column_names(columns: list[str]) -> list[str]:
+        used: dict[str, int] = {}
+        result: list[str] = []
+        for index, raw_name in enumerate(columns, start=1):
+            base_name = raw_name.strip() or f"Column {index}"
+            occurrence = used.get(base_name, 0)
+            used[base_name] = occurrence + 1
+            result.append(
+                base_name if occurrence == 0 else f"{base_name} ({occurrence + 1})"
+            )
+        return result
+
+    @staticmethod
+    def _json_preview_value(value: Any) -> str | int | float | bool | None:
+        if value is None:
+            return None
+        if hasattr(value, "item"):
+            try:
+                value = value.item()
+            except (AttributeError, ValueError):
+                pass
+        if isinstance(value, (datetime, date, pd.Timestamp)):
+            return value.isoformat()
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            pass
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if isinstance(value, (str, int, bool)):
+            return value
+        return str(value)
 
     def _build_placeholder_dashboard(
         self,
@@ -731,6 +993,26 @@ class BusinessIntelligenceService:
                         ),
                         "priority": "medium",
                         "sourceIds": [],
+                    },
+                    {
+                        "id": "review_dataset_quality",
+                        "title": "Review dataset quality",
+                        "description": (
+                            "Resolve the detected missing values and duplicate records "
+                            "before rerunning advanced analysis."
+                        ),
+                        "priority": "medium",
+                        "sourceIds": ["dataset_summary"],
+                    },
+                    {
+                        "id": "confirm_business_context",
+                        "title": "Confirm business context",
+                        "description": (
+                            "Confirm the intended KPI definitions, reporting period, "
+                            "and business priorities before the next analysis run."
+                        ),
+                        "priority": "low",
+                        "sourceIds": ["dataset_summary"],
                     }
                 ],
                 "datasetSummary": {
@@ -849,6 +1131,14 @@ class BusinessIntelligenceService:
         if not text:
             return "Processing failed."
         return text[:300]
+
+    @staticmethod
+    def _is_duplicate_dataset_error(error: Exception) -> bool:
+        code = str(getattr(error, "code", ""))
+        message = str(error).lower()
+        return code == "23505" or (
+            "duplicate" in message and "user" in message and "dataset" in message
+        )
 
     @staticmethod
     def _current_timestamp() -> str:

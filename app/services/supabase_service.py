@@ -24,6 +24,7 @@ class SupabaseUnavailableError(Exception):
 @dataclass(frozen=True)
 class DatasetRecord:
     id: str
+    user_id: str
     file_name: str
     storage_path: str
     mime_type: str
@@ -33,6 +34,8 @@ class DatasetRecord:
     status: str
     rag_status: str
     error_message: str | None
+    row_count: int | None = None
+    column_count: int | None = None
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -55,6 +58,16 @@ class MessageRecord:
     content: str
     sources: list[str]
     created_at: str
+
+
+@dataclass(frozen=True)
+class SessionProcessingRecord:
+    dataset_id: str
+    workflow_status: str
+    generic_cleaning_report: JsonDict
+    prepared_dataset: JsonDict
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
 class SupabaseService:
@@ -113,15 +126,19 @@ class SupabaseService:
     def create_dataset(
         self,
         dataset_id: str,
+        user_id: str,
         file_name: str,
         storage_path: str,
         mime_type: str,
         file_size: int,
         file_hash: str,
         description: str | None,
+        row_count: int,
+        column_count: int,
     ) -> DatasetRecord:
         payload: JsonDict = {
             "id": dataset_id,
+            "user_id": user_id,
             "file_name": file_name,
             "storage_path": storage_path,
             "mime_type": mime_type,
@@ -131,23 +148,62 @@ class SupabaseService:
             "status": "processing",
             "rag_status": "pending",
             "error_message": None,
+            "row_count": row_count,
+            "column_count": column_count,
         }
-        response = self.client.table("datasets").insert(payload).execute()
+        table = self.client.table("datasets")
+        try:
+            response = table.insert(payload).execute()
+        except Exception as error:
+            if not self._is_missing_dataset_metadata_column(error):
+                raise
+
+            # Existing deployments may not yet have run the single-active-
+            # dataset migration. The API can still serve them safely by
+            # calculating these values from the uploaded file when needed.
+            # Retain the fields in the primary insert so migrated databases
+            # avoid that additional read.
+            logger.warning(
+                "datasets table is missing row_count/column_count; falling back "
+                "to legacy storage. Apply scripts/migrate_single_active_dataset.sql."
+            )
+            legacy_payload = dict(payload)
+            legacy_payload.pop("row_count", None)
+            legacy_payload.pop("column_count", None)
+            response = table.insert(legacy_payload).execute()
         rows = list(response.data or [])
         if not rows:
             raise SupabaseUnavailableError("Dataset insert returned no row.")
         return self._dataset(rows[0])
 
-    def get_dataset(self, dataset_id: str) -> DatasetRecord | None:
+    def get_dataset(self, dataset_id: str, user_id: str) -> DatasetRecord | None:
         response = (
             self.client.table("datasets")
             .select("*")
             .eq("id", dataset_id)
+            .eq("user_id", user_id)
             .limit(1)
             .execute()
         )
         rows = list(response.data or [])
         return self._dataset(rows[0]) if rows else None
+
+    def get_active_dataset(self, user_id: str) -> DatasetRecord | None:
+        response = (
+            self.client.table("datasets")
+            .select("*")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        rows = list(response.data or [])
+        return self._dataset(rows[0]) if rows else None
+
+    def delete_dataset(self, dataset_id: str, user_id: str) -> None:
+        self.client.table("datasets").delete().eq("id", dataset_id).eq(
+            "user_id",
+            user_id,
+        ).execute()
 
     def update_dataset_status(
         self,
@@ -238,6 +294,48 @@ class SupabaseService:
         rows = list(response.data or [])
         return [self._message(row) for row in reversed(rows)]
 
+    def save_session_processing(
+        self,
+        dataset_id: str,
+        workflow_status: str,
+        generic_cleaning_report: JsonDict,
+        prepared_dataset: JsonDict,
+    ) -> SessionProcessingRecord:
+        payload: JsonDict = {
+            "dataset_id": dataset_id,
+            "workflow_status": workflow_status,
+            "generic_cleaning_report": generic_cleaning_report,
+            "prepared_dataset": prepared_dataset,
+        }
+        result = (
+            self.client.table("session_processing")
+            .upsert(payload, on_conflict="dataset_id")
+            .execute()
+        )
+        rows = list(result.data or [])
+        if not rows:
+            fetched = self.get_session_processing(dataset_id)
+            if fetched is None:
+                raise SupabaseUnavailableError(
+                    "Session-processing upsert returned no row."
+                )
+            return fetched
+        return self._session_processing(rows[0])
+
+    def get_session_processing(
+        self,
+        dataset_id: str,
+    ) -> SessionProcessingRecord | None:
+        response = (
+            self.client.table("session_processing")
+            .select("*")
+            .eq("dataset_id", dataset_id)
+            .limit(1)
+            .execute()
+        )
+        rows = list(response.data or [])
+        return self._session_processing(rows[0]) if rows else None
+
     def delete_document_chunks(self, dataset_id: str) -> None:
         self.client.table("document_chunks").delete().eq(
             "dataset_id",
@@ -276,6 +374,7 @@ class SupabaseService:
     def _dataset(row: JsonDict) -> DatasetRecord:
         return DatasetRecord(
             id=str(row["id"]),
+            user_id=str(row["user_id"]),
             file_name=str(row["file_name"]),
             storage_path=str(row["storage_path"]),
             mime_type=str(row["mime_type"]),
@@ -289,6 +388,16 @@ class SupabaseService:
             error_message=(
                 str(row["error_message"])
                 if row.get("error_message") is not None
+                else None
+            ),
+            row_count=(
+                int(row["row_count"])
+                if row.get("row_count") is not None
+                else None
+            ),
+            column_count=(
+                int(row["column_count"])
+                if row.get("column_count") is not None
                 else None
             ),
             created_at=(
@@ -333,6 +442,47 @@ class SupabaseService:
             if isinstance(sources, list)
             else [],
             created_at=str(row.get("created_at") or SupabaseService._now()),
+        )
+
+    @staticmethod
+    def _session_processing(row: JsonDict) -> SessionProcessingRecord:
+        generic_cleaning_report = row.get("generic_cleaning_report")
+        prepared_dataset = row.get("prepared_dataset")
+        return SessionProcessingRecord(
+            dataset_id=str(row["dataset_id"]),
+            workflow_status=str(row["workflow_status"]),
+            generic_cleaning_report=(
+                dict(generic_cleaning_report)
+                if isinstance(generic_cleaning_report, dict)
+                else {}
+            ),
+            prepared_dataset=(
+                dict(prepared_dataset)
+                if isinstance(prepared_dataset, dict)
+                else {}
+            ),
+            created_at=(
+                str(row["created_at"])
+                if row.get("created_at") is not None
+                else None
+            ),
+            updated_at=(
+                str(row["updated_at"])
+                if row.get("updated_at") is not None
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _is_missing_dataset_metadata_column(error: Exception) -> bool:
+        message = str(error).lower()
+        mentions_metadata_column = (
+            "row_count" in message or "column_count" in message
+        )
+        return mentions_metadata_column and (
+            "does not exist" in message
+            or "could not find" in message
+            or "schema cache" in message
         )
 
     @staticmethod

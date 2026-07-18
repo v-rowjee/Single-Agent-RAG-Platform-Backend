@@ -14,15 +14,17 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from groq import AsyncGroq
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.agents.multi.analysis_series import (
+    infer_time_granularity,
+    temporal_period_count,
+)
+from app.core.agent_models import agent_model_policy
+from app.core.groq_structured import request_structured
 
 
 load_dotenv(Path(__file__).resolve().parents[4] / ".env")
-
-MODEL_NAME = "llama-3.1-8b-instant"
-STORAGE_ROOT = Path("app/storage")
-SESSIONS_DIR = STORAGE_ROOT / "sessions"
 
 SUPPORTED_OPERATIONS = {
     "fill_constant",
@@ -207,17 +209,6 @@ class PreparedDatasetPackage(StrictModel):
 # 4. Generic cleaning functions
 
 
-def _safe_identifier(value: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
-    return safe or "default"
-
-
-def _session_dir(session_id: str) -> Path:
-    path = SESSIONS_DIR / _safe_identifier(session_id)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
 def _normalise_column_name(value: Any) -> str:
     name = re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
     return name or "unnamed"
@@ -272,11 +263,46 @@ def _parse_dates_for_column(series: pd.Series, column: str) -> pd.Series:
     return pd.to_datetime(series, errors="coerce")
 
 
+def _is_date_candidate_name(column: str) -> bool:
+    """Exclude calendar helper dimensions from destructive date coercion."""
+    name = column.lower()
+    helper_names = {
+        "day",
+        "day_name",
+        "day_of_week",
+        "month",
+        "month_name",
+        "quarter",
+        "week",
+        "year",
+    }
+    if name in helper_names or any(
+        name.endswith(suffix)
+        for suffix in (
+            "_day",
+            "_day_name",
+            "_month",
+            "_month_name",
+            "_quarter",
+            "_week",
+            "_year",
+        )
+    ):
+        return False
+    return (
+        name in {"date", "datetime", "time", "timestamp"}
+        or any(
+            token in name
+            for token in ("_date", "date_", "_datetime", "_timestamp", "_time")
+        )
+        or name.endswith("_period")
+    )
+
+
 def _convert_dates(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
     for column in result.columns:
-        name = str(column).lower()
-        if not any(token in name for token in ("date", "time", "year", "month", "period")):
+        if not _is_date_candidate_name(str(column)):
             continue
         parsed = _parse_dates_for_column(result[column], str(column))
         non_null = result[column].notna()
@@ -291,7 +317,7 @@ def _infer_column_type(series: pd.Series, column: str) -> str:
         return "date"
     if pd.api.types.is_numeric_dtype(series):
         return "numeric"
-    if any(token in column.lower() for token in ("date", "time", "year", "month", "period")):
+    if _is_date_candidate_name(column):
         parsed = _parse_dates_for_column(series, column)
         non_null = series.notna()
         ratio = float(parsed[non_null].notna().mean()) if non_null.any() else 0.0
@@ -304,16 +330,32 @@ def _infer_column_type(series: pd.Series, column: str) -> str:
 
 
 def _generic_clean_csv(uploaded_file_path: str, output_dir: Path) -> tuple[pd.DataFrame, GenericCleaningResult]:
+    """Clean a supported uploaded dataset and normalise it to CSV.
+
+    The historical function name is retained because it is an internal import
+    used by the orchestration layer.  Multi-agent uploads may arrive as CSV or
+    XLSX, while every downstream preparation/specialist node consumes the
+    cleaned CSV emitted here.
+    """
     path = Path(uploaded_file_path)
     if not path.is_file():
         raise DataPreparationError(f"Uploaded file was not found: {uploaded_file_path}")
-    if path.suffix.lower() != ".csv":
-        raise DataPreparationError("The data preparation agent currently accepts CSV files only.")
+    suffix = path.suffix.lower()
+    if suffix not in {".csv", ".xlsx"}:
+        raise DataPreparationError(
+            "The data preparation agent accepts CSV and XLSX files only."
+        )
 
     try:
-        original = pd.read_csv(path, low_memory=False)
+        original = (
+            pd.read_csv(path, low_memory=False)
+            if suffix == ".csv"
+            else pd.read_excel(path)
+        )
     except Exception as exc:
-        raise DataPreparationError(f"CSV could not be read: {exc}") from exc
+        raise DataPreparationError(
+            f"{suffix.removeprefix('.').upper()} could not be read: {exc}"
+        ) from exc
 
     original_rows, original_columns = original.shape
     warnings: list[str] = []
@@ -648,24 +690,21 @@ Return one JSON object matching this shape:
 """.strip()
 
 
-async def _request_groq_plan(profile: DatasetProfile, correction: str | None = None) -> PreparationPlan:
+async def _request_groq_plan(profile: DatasetProfile) -> PreparationPlan:
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
         raise DataPreparationError("GROQ_API_KEY is missing from the environment.")
 
-    client = AsyncGroq(api_key=api_key)
     user_payload: dict[str, Any] = {
         "profile": _compact_profile_payload(profile),
         "instruction": "Return only the preparation plan JSON object.",
     }
-    if correction:
-        user_payload["correction"] = correction
-
-    response = await client.chat.completions.create(
-        model=MODEL_NAME,
+    return await request_structured(
+        api_key=api_key,
+        policy=agent_model_policy("data_preparation"),
+        response_model=PreparationPlan,
+        schema_name="data_preparation_plan",
         temperature=0.1,
-        max_completion_tokens=1000,
-        response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": _system_prompt()},
             {
@@ -674,33 +713,19 @@ async def _request_groq_plan(profile: DatasetProfile, correction: str | None = N
             },
         ],
     )
-    content = response.choices[0].message.content or "{}"
-    try:
-        payload = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise DataPreparationError(f"Groq returned invalid JSON: {exc}") from exc
-    try:
-        return PreparationPlan.model_validate(payload)
-    except ValidationError as exc:
-        raise DataPreparationError(f"Groq plan failed schema validation: {exc}") from exc
 
 
 async def _plan_with_groq_or_fallback(profile: DatasetProfile) -> tuple[PreparationPlan, Literal["groq", "fallback"], list[str]]:
     warnings: list[str] = []
     try:
         return await _request_groq_plan(profile), "groq", warnings
-    except Exception as first_error:
-        warnings.append(f"Initial Groq planning failed: {first_error}")
-        try:
-            correction = (
-                "The previous response failed validation. Return a smaller JSON object "
-                "using only existing columns, supported operations and supported formula IDs."
-            )
-            return await _request_groq_plan(profile, correction=correction), "groq", warnings
-        except Exception as second_error:
-            warnings.append(f"Retry Groq planning failed: {second_error}")
-            warnings.append("Deterministic fallback preparation plan was used.")
-            return _fallback_plan(profile, "LLM planning failed; deterministic fallback was used."), "fallback", warnings
+    except Exception as error:
+        warnings.append(f"Groq preparation planning failed: {error}")
+        warnings.append("Deterministic fallback preparation plan was used.")
+        return _fallback_plan(
+            profile,
+            "LLM planning failed; deterministic fallback was used.",
+        ), "fallback", warnings
 
 
 # 8. Plan validation
@@ -849,11 +874,58 @@ def _temporal_profile(
     dates = pd.to_datetime(df[date_column], errors="coerce").dropna()
     return TemporalProfile(
         date_column=date_column,
-        unique_periods=int(dates.nunique()),
+        unique_periods=temporal_period_count(
+            dates,
+            granularity or "month",
+        ),
         minimum_date=dates.min().date().isoformat() if not dates.empty else None,
         maximum_date=dates.max().date().isoformat() if not dates.empty else None,
         inferred_frequency=granularity,
     )
+
+
+def _reconcile_temporal_capabilities(
+    plan: PreparationPlan,
+    prepared: pd.DataFrame,
+) -> str | None:
+    """Re-evaluate temporal capability after dates have been cleaned.
+
+    Capability flags from an LLM plan are only a proposal.  The cleaned data is
+    the authority for its usable periods and prevents a sparse daily transaction
+    series from incorrectly suppressing an otherwise valid forecast.
+    """
+    date_column = plan.date_column
+    if not date_column or date_column not in prepared:
+        return None
+
+    granularity = infer_time_granularity(
+        prepared[date_column],
+        plan.time_granularity,
+    )
+    plan.time_granularity = granularity
+    period_count = temporal_period_count(prepared[date_column], granularity)
+    measures = [
+        column
+        for column in plan.primary_measures
+        if column in prepared
+        and pd.api.types.is_numeric_dtype(prepared[column])
+        and prepared[column].notna().any()
+    ]
+    has_measure = bool(measures)
+    has_temporal_data = period_count >= MIN_TREND_PERIODS
+
+    plan.capability_flags.has_temporal_data = has_temporal_data
+    plan.capability_flags.supports_kpis = has_measure
+    plan.capability_flags.supports_trends = has_measure and has_temporal_data
+    plan.capability_flags.supports_forecasting = (
+        has_measure and period_count >= MIN_FORECAST_PERIODS
+    )
+    plan.capability_flags.supports_anomalies = (
+        has_measure and len(prepared) >= MIN_ANOMALY_OBSERVATIONS
+    )
+    if not plan.time_series_candidates and measures:
+        plan.time_series_candidates = measures[:3]
+    return granularity
 
 
 # 9. Pandas plan execution
@@ -988,13 +1060,18 @@ class DataPreparationAgent:
         business_description: str | None = None,
         generic_cleaning_report: GenericCleaningResult | None = None,
         file_name: str | None = None,
+        output_dir: Path | None = None,
     ) -> PreparedDatasetPackage:
         logger.info(
             "Data preparation started session_id=%s source_path=%s",
             session_id,
             uploaded_file_path,
         )
-        output_dir = _session_dir(session_id)
+        if output_dir is None:
+            raise DataPreparationError(
+                "A temporary processing workspace is required."
+            )
+        output_dir.mkdir(parents=True, exist_ok=True)
         if generic_cleaning_report is None:
             df, cleaning_report = _generic_clean_csv(uploaded_file_path, output_dir)
         else:
@@ -1041,6 +1118,7 @@ class DataPreparationAgent:
         )
         prepared_path = str(output_dir / "prepared_dataset.csv")
         prepared_profile = _profile_dataset(prepared, business_description)
+        effective_granularity = _reconcile_temporal_capabilities(plan, prepared)
 
         semantic_map = {role.column: role.role for role in plan.semantic_roles}
         warnings = _dedupe(
@@ -1066,7 +1144,7 @@ class DataPreparationAgent:
             temporal_profile=_temporal_profile(
                 prepared,
                 plan.date_column,
-                plan.time_granularity,
+                effective_granularity,
             ),
             cleaning_report=cleaning_report,
             preparation_report=preparation_report,
@@ -1113,11 +1191,14 @@ async def data_preparation_node(state: dict[str, Any]) -> dict[str, Any]:
     ).strip()
     business_description = state.get("business_description") or state.get("businessDescription")
     file_name = state.get("file_name") or state.get("fileName")
+    working_directory = str(state.get("working_directory") or "").strip()
 
     if not session_id:
         raise DataPreparationError("state.session_id is required.")
     if not uploaded_file_path:
         raise DataPreparationError("state.uploaded_file_path is required.")
+    if not working_directory:
+        raise DataPreparationError("state.working_directory is required.")
 
     result = await data_preparation_agent.run(
         uploaded_file_path=uploaded_file_path,
@@ -1130,6 +1211,7 @@ async def data_preparation_node(state: dict[str, Any]) -> dict[str, Any]:
             else None
         ),
         file_name=str(file_name) if file_name else None,
+        output_dir=Path(working_directory),
     )
 
     return {

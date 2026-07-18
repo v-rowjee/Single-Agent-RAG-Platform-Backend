@@ -9,20 +9,29 @@ from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
-from groq import AsyncGroq
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 
-MODEL_NAME = "llama-3.3-70b-versatile"
+from app.agents.multi.analysis_series import (
+    aggregation_for_measure,
+    is_numeric_measure,
+    ranked_measures,
+    select_primary_series,
+    selected_date_column,
+    selected_granularity,
+)
+from app.core.agent_models import agent_model_policy
+from app.core.groq_structured import request_structured
+
 MIN_TIME_PERIODS = 6
-MIN_ROLLING_PERIODS = 3
+MIN_ROLLING_PERIODS = 6
 MAX_GROUP_CARDINALITY = 20
 MAX_ANALYSES = 3
 MAX_ANOMALIES = 10
 SUPPORTED_METHODS = {"z_score", "iqr", "rolling_deviation", "percentage_change"}
 SUPPORTED_AGGREGATIONS = {"sum", "mean", "count"}
 SUPPORTED_GRANULARITIES = {"day", "week", "month", "quarter", "year"}
-SCORE_CRITICAL = 3.0
-SCORE_WARNING = 2.0
+SCORE_CRITICAL = 4.0
+SCORE_WARNING = 3.0
 PERCENT_CRITICAL = 40.0
 PERCENT_WARNING = 20.0
 
@@ -54,6 +63,8 @@ class AnomalyResult(StrictModel):
     id: str
     analysis_id: str
     metric: str
+    aggregation: str
+    granularity: str | None = None
     period: str | None = None
     observed_value: float
     expected_value: float | None = None
@@ -93,31 +104,75 @@ def _metadata(prepared: dict[str, Any]) -> dict[str, Any]:
 async def _request_groq_plan(prepared: dict[str, Any]) -> AnomalyPlan:
     key = os.getenv("GROQ_API_KEY", "").strip()
     if not key: raise AnomalyDetectionError("GROQ_API_KEY is missing.")
-    response = await AsyncGroq(api_key=key).chat.completions.create(
-        model=MODEL_NAME, temperature=0.1, max_completion_tokens=800, response_format={"type": "json_object"},
+    return await request_structured(
+        api_key=key,
+        policy=agent_model_policy("anomaly_detection"),
+        response_model=AnomalyPlan,
+        schema_name="anomaly_detection_plan",
+        temperature=0.1,
         messages=[{"role": "system", "content": "Return JSON only: {analyses:[{id,measure,method,aggregation,date_column?,granularity?,group_by?}],limitations:[]}. Use supported methods z_score, iqr, rolling_deviation, percentage_change; aggregations sum, mean, count; granularities day, week, month, quarter, year. Prefer time series when available. Do not calculate values."}, {"role": "user", "content": json.dumps(_metadata(prepared), default=str, separators=(",", ":"))}],
     )
-    try: return AnomalyPlan.model_validate_json(response.choices[0].message.content or "{}")
-    except ValidationError as exc: raise AnomalyDetectionError(f"Invalid Groq anomaly plan: {exc}") from exc
 
 
 def _numeric(df: pd.DataFrame, value: str) -> bool:
-    return value in df and pd.api.types.is_numeric_dtype(df[value])
+    return is_numeric_measure(df, value)
 
 
 def _fallback(prepared: dict[str, Any], df: pd.DataFrame) -> AnomalyPlan:
-    measures = [str(x) for x in prepared.get("primary_measures") or [] if _numeric(df, str(x))]
-    measures = measures or [str(c) for c in df if _numeric(df, str(c))]
+    measures = ranked_measures(prepared, df)
     if not measures: return AnomalyPlan(limitations=["No numeric measure is available for anomaly detection."])
-    date = prepared.get("date_column")
+    date = selected_date_column(prepared, df)
     periods = 0
     if isinstance(date, str) and date in df:
         periods = pd.to_datetime(df[date], errors="coerce").dropna().dt.to_period("M").nunique()
     if isinstance(date, str) and date in df and periods >= MIN_TIME_PERIODS:
-        definition = AnomalyDefinition(id=f"monthly_{_slug(measures[0])}_rolling", measure=measures[0], method="rolling_deviation", aggregation="sum", date_column=date, granularity="month")
+        granularity = selected_granularity(prepared)
+        definition = AnomalyDefinition(id=f"{granularity}_{_slug(measures[0])}_rolling", measure=measures[0], method="rolling_deviation", aggregation=aggregation_for_measure(measures[0]), date_column=date, granularity=granularity)
     else:
         definition = AnomalyDefinition(id=f"{_slug(measures[0])}_iqr", measure=measures[0], method="iqr")
     return AnomalyPlan(analyses=[definition], limitations=["Deterministic planning was used because Groq planning was unavailable or invalid."])
+
+
+def _ensure_primary_temporal_analysis(
+    analyses: list[AnomalyDefinition],
+    prepared: dict[str, Any],
+    df: pd.DataFrame,
+) -> list[AnomalyDefinition]:
+    """Always analyse the dashboard's primary time series at its own grain.
+
+    This prevents a row-level or differently aggregated metric from being
+    plotted as though it were an anomaly in the primary timeline.
+    """
+    primary = select_primary_series(prepared, df)
+    if not primary:
+        return analyses[:MAX_ANALYSES]
+
+    dates = pd.to_datetime(df[primary.date_column], errors="coerce").dropna()
+    periods = dates.dt.to_period(_frequency(primary.granularity)).nunique()
+    if periods < MIN_TIME_PERIODS:
+        return analyses[:MAX_ANALYSES]
+
+    canonical = AnomalyDefinition(
+        id=(
+            f"{primary.granularity}_{_slug(primary.measure)}_"
+            "rolling_deviation"
+        ),
+        measure=primary.measure,
+        method="rolling_deviation",
+        aggregation=primary.aggregation,
+        date_column=primary.date_column,
+        granularity=primary.granularity,
+    )
+    supplemental = [
+        item
+        for item in analyses
+        if not (
+            item.measure == canonical.measure
+            and item.date_column == canonical.date_column
+            and item.granularity == canonical.granularity
+        )
+    ]
+    return [canonical, *supplemental][:MAX_ANALYSES]
 
 
 def _validate(plan: AnomalyPlan, df: pd.DataFrame) -> tuple[list[AnomalyDefinition], list[str]]:
@@ -130,6 +185,13 @@ def _validate(plan: AnomalyPlan, df: pd.DataFrame) -> tuple[list[AnomalyDefiniti
             warnings.append(f"Rejected temporal anomaly analysis `{item.id}`."); continue
         if item.group_by and (item.group_by not in df or df[item.group_by].nunique(dropna=True) > MAX_GROUP_CARDINALITY):
             warnings.append(f"Rejected anomaly grouping for `{item.id}`."); continue
+        expected = aggregation_for_measure(item.measure)
+        if item.aggregation != "count" and item.aggregation != expected:
+            warnings.append(
+                f"Adjusted anomaly analysis `{item.id}` aggregation "
+                f"from `{item.aggregation}` to `{expected}`."
+            )
+            item = item.model_copy(update={"aggregation": expected})
         ids.add(item.id); valid.append(item)
     return valid, warnings
 
@@ -166,7 +228,7 @@ def _result(item: AnomalyDefinition, period: Any, observed: float, expected: flo
     label = str(period) if period is not None else None
     stable_id = "_".join(part for part in [item.granularity or "row", _slug(item.measure), _slug(group or ""), _slug(label or "value"), item.method] if part)
     evidence = (f"{item.group_by}={group}; " if group is not None else "") + f"Observed {observed:.2f}" + (f" versus expected {expected:.2f}" if expected is not None else "")
-    return AnomalyResult(id=stable_id, analysis_id=item.id, metric=item.measure, period=label, observed_value=round(observed, 6), expected_value=round(expected, 6) if expected is not None else None, deviation_percentage=round(percentage, 6) if percentage is not None else None, anomaly_score=round(score, 6) if score is not None else None, severity=_severity(score, percentage), method=item.method, evidence=evidence)
+    return AnomalyResult(id=stable_id, analysis_id=item.id, metric=item.measure, aggregation=item.aggregation, granularity=item.granularity, period=label, observed_value=round(observed, 6), expected_value=round(expected, 6) if expected is not None else None, deviation_percentage=round(percentage, 6) if percentage is not None else None, anomaly_score=round(score, 6) if score is not None else None, severity=_severity(score, percentage), method=item.method, evidence=evidence)
 
 
 def _detect(item: AnomalyDefinition, values: pd.Series, group: str | None = None) -> list[AnomalyResult]:
@@ -217,6 +279,11 @@ class AnomalyDetectionAgent:
             limitations = proposed.limitations
         except Exception as exc:
             warnings.append(str(exc)); fallback = _fallback(prepared_dataset, df); analyses, validation = _validate(fallback, df); warnings.extend(validation); limitations = fallback.limitations
+        analyses = _ensure_primary_temporal_analysis(
+            analyses,
+            prepared_dataset,
+            df,
+        )
         anomalies: list[AnomalyResult] = []
         for item in analyses:
             for group, values in _series(df, item):

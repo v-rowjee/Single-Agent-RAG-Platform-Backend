@@ -8,7 +8,7 @@ openpyxl
 xlrd
 
 python-dotenv
-supabase
+supabase>=2.25.0
 
 langchain
 langchain-groq
