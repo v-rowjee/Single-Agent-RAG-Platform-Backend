@@ -3,16 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-
-DocumentType = Literal[
-    "dataset_overview",
-    "column_profile",
-    "numeric_summary",
-    "category_analysis",
-    "timeline_analysis",
-    "row_batch",
-]
-
 QueryType = Literal[
     "calculation",
     "forecast",

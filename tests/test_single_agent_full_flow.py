@@ -22,7 +22,6 @@ from app.api import business_intelligence as business_intelligence_api
 from app.core.auth import CurrentUser, get_current_user
 from app.core.config import Settings
 from app.main import app
-from app.rag import rag_service as rag_service_module
 from app.schemas.business_intelligence import DashboardResponse
 from app.services.business_intelligence_service import BusinessIntelligenceService
 from app.services.supabase_service import (
@@ -283,6 +282,7 @@ def full_flow(monkeypatch: pytest.MonkeyPatch):
     service = BusinessIntelligenceService(
         storage=storage,  # type: ignore[arg-type]
         settings=Settings("", "", bi_pipeline_mode="single"),
+        rag=rag,
     )
 
     async def multi_agent_pipeline_must_not_run(*args: object, **kwargs: object):
@@ -299,7 +299,6 @@ def full_flow(monkeypatch: pytest.MonkeyPatch):
         service,
     )
     monkeypatch.setattr(single_agent_module, "business_intelligence_agent", agent)
-    monkeypatch.setattr(rag_service_module, "rag_service", rag)
     app.dependency_overrides[get_current_user] = lambda: CurrentUser(id=USER_ID)
 
     try:

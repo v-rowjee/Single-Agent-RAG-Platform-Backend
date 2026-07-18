@@ -5,11 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Literal, TypeAlias
 
-from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-
-
-load_dotenv()
 
 MIN_TREND_PERIODS = 2
 MIN_FORECAST_PERIODS = 4
@@ -160,50 +156,6 @@ def _supported_agents(
         supported.add("forecasting")
 
     return supported
-
-
-def _compact_input(
-    prepared_dataset: dict[str, Any],
-    capabilities: dict[str, bool],
-) -> dict[str, Any]:
-    temporal_profile = prepared_dataset.get("temporal_profile")
-    temporal_profile = (
-        temporal_profile
-        if isinstance(temporal_profile, dict)
-        else {}
-    )
-
-    dataset_profile = prepared_dataset.get("dataset_profile")
-    dataset_profile = (
-        dataset_profile
-        if isinstance(dataset_profile, dict)
-        else {}
-    )
-
-    return {
-        "validated_capabilities": capabilities,
-        "row_count": dataset_profile.get("row_count"),
-        "date_column": prepared_dataset.get("date_column"),
-        "primary_measures": (
-            prepared_dataset.get("primary_measures") or []
-        ),
-        "dimensions": (
-            prepared_dataset.get("dimension_candidates") or []
-        ),
-        "time_series_candidates": (
-            prepared_dataset.get("time_series_candidates") or []
-        ),
-        "temporal_profile": {
-            "unique_periods": temporal_profile.get("unique_periods"),
-            "minimum_date": temporal_profile.get("minimum_date"),
-            "maximum_date": temporal_profile.get("maximum_date"),
-            "inferred_frequency": temporal_profile.get(
-                "inferred_frequency"
-            ),
-        },
-        "limitations": prepared_dataset.get("limitations") or [],
-    }
-
 
 def _fallback_plan(
     supported_agents: set[AgentName],

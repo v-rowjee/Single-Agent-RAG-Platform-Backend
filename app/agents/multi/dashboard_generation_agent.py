@@ -1,7 +1,6 @@
 """Validated dashboard assembly from authoritative specialist outputs."""
 from __future__ import annotations
 
-import json
 import os
 import re
 from datetime import datetime, timezone
@@ -12,15 +11,16 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.agents.multi.analysis_series import (
+from app.services.series import (
     aggregation_for_measure,
     is_numeric_measure,
     is_temporal_dimension,
     ranked_measures,
     value_format_for_measure,
 )
-from app.core.agent_models import agent_model_policy
+from app.core.config import agent_model_policy
 from app.core.groq_structured import request_structured
+from app.core.prompts import render_agent_prompts
 from app.schemas.business_intelligence import DashboardResponse
 
 
@@ -163,6 +163,7 @@ async def _request_groq_layout(
     key = os.getenv("GROQ_API_KEY", "").strip()
     if not key:
         raise RuntimeError("GROQ_API_KEY is missing.")
+    prompts = render_agent_prompts("multi/dashboard_generation", payload=payload)
     return await request_structured(
         api_key=key,
         policy=agent_model_policy("dashboard_generation"),
@@ -170,28 +171,8 @@ async def _request_groq_layout(
         schema_name="dashboard_layout_plan",
         temperature=0.2,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Return JSON only matching the supplied dashboard layout "
-                    "shape. Select only supplied IDs and columns. Propose 2-4 "
-                    "supporting_chart_specs with unique types chosen from bar, "
-                    "horizontalBar, stackedBar, donut, pie, scatter. Supporting "
-                    "charts must use business dimensions, never dates, years, "
-                    "quarters, months, weeks, or time trends. Use dimension and "
-                    "measure for categorical charts, secondary_measure only for "
-                    "stackedBar, and x_measure/y_measure for scatter. This is a "
-                    "selection plan only; never calculate values."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    payload,
-                    default=str,
-                    separators=(",", ":"),
-                ),
-            },
+            {"role": "system", "content": prompts.system},
+            {"role": "user", "content": prompts.user},
         ],
     )
 

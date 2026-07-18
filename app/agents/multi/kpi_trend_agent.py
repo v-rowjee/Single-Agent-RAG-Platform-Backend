@@ -1,7 +1,6 @@
 """KPI and trend specialist.  Groq chooses definitions; pandas calculates values."""
 from __future__ import annotations
 
-import json
 import math
 import os
 import re
@@ -11,7 +10,7 @@ from typing import Any, Literal
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.agents.multi.analysis_series import (
+from app.services.series import (
     aggregation_for_measure,
     period_frequency,
     ranked_measures,
@@ -19,8 +18,9 @@ from app.agents.multi.analysis_series import (
     selected_date_column,
     selected_granularity,
 )
-from app.core.agent_models import agent_model_policy
+from app.core.config import agent_model_policy
 from app.core.groq_structured import request_structured
+from app.core.prompts import render_agent_prompts
 
 MAX_KPIS = 8
 MAX_TRENDS = 3
@@ -136,6 +136,10 @@ async def _request_groq_plan(prepared: dict[str, Any]) -> KPITrendPlan:
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         raise KPITrendError("GROQ_API_KEY is missing.")
+    prompts = render_agent_prompts(
+        "multi/kpi_trend",
+        payload=_planning_payload(prepared),
+    )
     return await request_structured(
         api_key=api_key,
         policy=agent_model_policy("kpi_trend"),
@@ -143,8 +147,8 @@ async def _request_groq_plan(prepared: dict[str, Any]) -> KPITrendPlan:
         schema_name="kpi_trend_plan",
         temperature=0.1,
         messages=[
-            {"role": "system", "content": "Return JSON only: {kpis:[{id,title,measure,aggregation,dimension?,dimension_value?}],trends:[{id,title,measure,aggregation,date_column,granularity,group_by?}],limitations:[]}. Use only supplied columns and supported aggregations sum, mean, median, count, distinct_count, min, max and granularities day, week, month, quarter, year. Do not calculate values."},
-            {"role": "user", "content": json.dumps(_planning_payload(prepared), default=str, separators=(",", ":"))},
+            {"role": "system", "content": prompts.system},
+            {"role": "user", "content": prompts.user},
         ],
     )
 

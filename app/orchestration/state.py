@@ -29,8 +29,6 @@ class BusinessIntelligenceState(TypedDict, total=False):
     dashboard_layout_plan: dict[str, Any]
     retrieval_output: dict[str, Any]
     retrieval_documents: list[dict[str, Any]]
-    retrieval_indexing_result: dict[str, Any]
-    persistence_result: dict[str, Any]
 
     workflow_status: str
 

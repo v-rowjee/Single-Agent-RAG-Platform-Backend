@@ -260,12 +260,23 @@ class ApiMessage(BaseModel):
     recoverable: bool | None = None
 
 
+class AgentModelUsage(BaseModel):
+    """A model assigned to an agent that contributed to a dashboard."""
+
+    agent: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    provider: str | None = None
+
+
 class DashboardResponse(BaseModel):
     status: DashboardStatus
     sessionId: str = Field(min_length=1)
     dashboard: Dashboard | None
     warnings: list[ApiMessage] = Field(default_factory=list)
     errors: list[ApiMessage] = Field(default_factory=list)
+    pipelineMode: Literal["single", "multi"] | None = None
+    model: str | None = None
+    agentModels: list[AgentModelUsage] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_dashboard_response(self) -> "DashboardResponse":
@@ -303,13 +314,6 @@ class DashboardResponse(BaseModel):
             )
 
         return self
-
-
-class UploadResponse(BaseModel):
-    status: Literal["success"]
-    sessionId: str = Field(min_length=1)
-    fileName: str
-    message: str
 
 
 class ActiveDatasetResponse(BaseModel):

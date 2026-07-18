@@ -3,12 +3,15 @@ from __future__ import annotations
 import threading
 from collections.abc import Iterable
 
-from app.rag.config import EMBEDDING_BATCH_SIZE, EMBEDDING_MODEL_NAME
+from app.core.config import get_rag_config
+
+
+_EMBEDDING_POLICY = get_rag_config().embedding
 
 
 class FastEmbedEmbeddingService:
-    def __init__(self, model_name: str = EMBEDDING_MODEL_NAME) -> None:
-        self.model_name = model_name
+    def __init__(self, model_name: str | None = None) -> None:
+        self.model_name = model_name or _EMBEDDING_POLICY.model
         self._model: object | None = None
         self._lock = threading.Lock()
 
@@ -18,7 +21,7 @@ class FastEmbedEmbeddingService:
         return self._normalise_vectors(
             self._model_instance().embed(
                 texts,
-                batch_size=EMBEDDING_BATCH_SIZE,
+                batch_size=_EMBEDDING_POLICY.batch_size,
             )
         )
 

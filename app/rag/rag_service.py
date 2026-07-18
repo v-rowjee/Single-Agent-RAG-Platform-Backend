@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from app.rag.config import MAX_CONTEXT_CHARS, RERANK_LIMIT, VECTOR_SEARCH_LIMIT
+from app.core.config import get_rag_config
 from app.rag.document_builder import DatasetDocumentBuilder
 from app.rag.embedding_service import get_embedding_service
 from app.rag.models import CalculatedEvidence, IndexStatus, QueryType, RerankedDocument, RetrievedDocument
@@ -21,8 +21,19 @@ from app.services.supabase_service import SupabaseService, supabase_service
 
 
 logger = logging.getLogger(__name__)
+_RAG_CONFIG = get_rag_config()
 
-DEFAULT_RETRIEVAL_LIMIT = 6
+DERIVED_REVENUE_COLUMN = "__calculated_revenue__"
+REVENUE_COLUMN_TERMS = (
+    "revenue",
+    "turnover",
+    "sales amount",
+    "sales_amount",
+    "net sales",
+    "net_sales",
+    "sales value",
+    "sales_value",
+)
 
 
 class RagService:
@@ -76,57 +87,148 @@ class RagService:
                 session_id=agent_input.sessionId,
                 file_name=agent_input.fileName,
             )
-            logger.info(
-                "Retrieval replacement started session_id=%s document_count=%s",
-                agent_input.sessionId,
-                len(documents),
-            )
-            # document_chunks is keyed by dataset_id, which is the single-agent
-            # session identifier.  Delete only this session before replacements.
-            self.storage.delete_document_chunks(agent_input.sessionId)
-            logger.info(
-                "Existing session documents deleted session_id=%s",
-                agent_input.sessionId,
-            )
-            embeddings = get_embedding_service().embed_documents(
-                [document.page_content for document in documents]
-            )
-            if documents and len(documents) != len(embeddings):
-                raise ValueError("Document and embedding counts do not match.")
-
-            rows: list[dict[str, object]] = []
-            for index, document in enumerate(documents):
-                metadata = dict(document.metadata)
-                source_id = str(metadata.get("source_id", f"document_{index}"))
-                document_type = str(metadata.get("document_type", "dataset_overview"))
-                chunk_index = int(metadata.get("chunk_index", index))
-                metadata["chunk_index"] = chunk_index
-                rows.append(
+            result = self.index_documents(
+                session_id=agent_input.sessionId,
+                dataset_id=agent_input.sessionId,
+                retrieval_documents=[
                     {
-                        "dataset_id": agent_input.sessionId,
-                        "source_id": source_id,
-                        "document_type": document_type,
-                        "chunk_index": chunk_index,
+                        "id": str(
+                            document.metadata.get("source_id")
+                            or f"document_{index}"
+                        ),
                         "content": document.page_content,
-                        "metadata": metadata,
-                        "embedding": [float(value) for value in embeddings[index]],
+                        "document_type": str(
+                            document.metadata.get("document_type")
+                            or "dataset_overview"
+                        ),
+                        "metadata": dict(document.metadata),
                     }
-                )
-            self.storage.insert_document_chunks(rows, batch_size=50)
-            logger.info(
-                "New documents indexed session_id=%s indexed_count=%s",
-                agent_input.sessionId,
-                len(rows),
+                    for index, document in enumerate(documents)
+                ],
             )
+            if result["status"] != "success":
+                raise RuntimeError(str(result.get("message") or "RAG indexing failed."))
+
             self._completed_signatures[agent_input.sessionId] = signature
-            vector_size = len(embeddings[0]) if embeddings else 0
             return IndexStatus(
                 session_id=agent_input.sessionId,
                 collection_name="document_chunks",
                 document_count=len(documents),
                 chunk_count=len(documents),
-                vector_size=vector_size,
+                vector_size=int(result.get("vector_size") or 0),
             )
+
+    def index_documents(
+        self,
+        session_id: str,
+        dataset_id: str,
+        retrieval_documents: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Replace one dataset's retrieval index from either pipeline."""
+        document_count = len(retrieval_documents)
+        try:
+            if not session_id or not dataset_id:
+                raise ValueError("session_id and dataset_id are required.")
+            if any(
+                not isinstance(document, dict)
+                or not str(document.get("id") or "").strip()
+                or not str(document.get("content") or "").strip()
+                for document in retrieval_documents
+            ):
+                raise ValueError("Retrieval documents require id and content.")
+
+            logger.info(
+                "Retrieval replacement started session_id=%s document_count=%s",
+                session_id,
+                document_count,
+            )
+            self.storage.delete_document_chunks(dataset_id)
+            logger.info(
+                "Existing session documents deleted session_id=%s",
+                session_id,
+            )
+
+            if not retrieval_documents:
+                return {
+                    "status": "success",
+                    "document_count": 0,
+                    "indexed_count": 0,
+                    "failed_count": 0,
+                    "vector_size": 0,
+                }
+
+            embeddings = get_embedding_service().embed_documents(
+                [str(document["content"]) for document in retrieval_documents]
+            )
+            if len(embeddings) != document_count:
+                raise ValueError("Document and embedding counts do not match.")
+
+            rows: list[dict[str, object]] = []
+            for index, (document, embedding) in enumerate(
+                zip(retrieval_documents, embeddings)
+            ):
+                metadata = dict(document.get("metadata") or {})
+                source_id = str(document["id"])
+                source_ids = document.get("source_ids")
+                if not isinstance(source_ids, list):
+                    source_ids = metadata.get("source_ids")
+                metadata.update(
+                    {
+                        "session_id": session_id,
+                        "dataset_id": dataset_id,
+                        "source_ids": list(source_ids or []),
+                        "title": str(
+                            document.get("title")
+                            or metadata.get("title")
+                            or source_id
+                        ),
+                    }
+                )
+                chunk_index = int(metadata.get("chunk_index", index))
+                metadata["chunk_index"] = chunk_index
+                rows.append(
+                    {
+                        "dataset_id": dataset_id,
+                        "source_id": source_id,
+                        "document_type": str(
+                            document.get("document_type")
+                            or metadata.get("document_type")
+                            or "dataset_overview"
+                        ),
+                        "chunk_index": chunk_index,
+                        "content": str(document["content"]),
+                        "metadata": metadata,
+                        "embedding": [float(value) for value in embedding],
+                    }
+                )
+
+            self.storage.insert_document_chunks(rows, batch_size=50)
+            logger.info(
+                "New documents indexed session_id=%s indexed_count=%s",
+                session_id,
+                len(rows),
+            )
+            return {
+                "status": "success",
+                "document_count": document_count,
+                "indexed_count": len(rows),
+                "failed_count": 0,
+                "vector_size": len(embeddings[0]) if embeddings else 0,
+            }
+        except Exception as exc:
+            logger.exception(
+                "Retrieval replacement failed session_id=%s document_count=%s",
+                session_id,
+                document_count,
+            )
+            return {
+                "status": "failed",
+                "document_count": document_count,
+                "indexed_count": 0,
+                "failed_count": document_count,
+                "vector_size": 0,
+                "message": str(exc),
+            }
 
     def ensure_index(
         self,
@@ -143,28 +245,28 @@ class RagService:
             )
             return False
 
-    def index_exists(self, session_id: str) -> bool:
-        return session_id in self._completed_signatures
-
-    def delete_session_index(self, session_id: str) -> None:
-        self.storage.delete_document_chunks(session_id)
-        self._completed_signatures.pop(session_id, None)
-
-    def close(self) -> None:
-        return None
-
     def retrieve(
         self,
-        agent_input: BusinessIntelligenceAgentInput,
+        session_id: str,
         query: str,
+        limit: int = _RAG_CONFIG.retrieval.vector_search_limit,
     ) -> list[RetrievedDocument]:
+        """Retrieve evidence through one session-scoped vector-search path."""
+        if not session_id:
+            raise ValueError("A session ID is required for retrieval.")
+
         try:
             query_vector = get_embedding_service().embed_query(query)
+            logger.info(
+                "RAG session filter applied session_id=%s dataset_id=%s",
+                session_id,
+                session_id,
+            )
             rows = self.storage.match_document_chunks(
-                dataset_id=agent_input.sessionId,
+                dataset_id=session_id,
                 query_embedding=[float(value) for value in query_vector],
-                match_count=VECTOR_SEARCH_LIMIT,
-                match_threshold=0.2,
+                match_count=limit,
+                match_threshold=_RAG_CONFIG.retrieval.match_threshold,
             )
             documents = self._dedupe_retrieved(
                 [
@@ -177,58 +279,28 @@ class RagService:
                     if str(row.get("content", "")).strip()
                 ]
             )
+            session_documents = [
+                document
+                for document in documents
+                if self._matches_session(document, session_id)
+            ][:limit]
             logger.info(
-                "RAG retrieval session_id=%s query=%r candidates=%s",
-                agent_input.sessionId,
+                "RAG retrieval session_id=%s query=%r candidates=%s matches=%s",
+                session_id,
                 query[:120],
                 len(documents),
+                [
+                    (
+                        str(document.metadata.get("source_id", "unknown_source")),
+                        round(document.score, 3),
+                    )
+                    for document in session_documents
+                ],
             )
-            return documents
+            return session_documents
         except Exception:
-            logger.exception(
-                "RAG retrieval failed session_id=%s",
-                agent_input.sessionId,
-            )
+            logger.exception("RAG retrieval failed session_id=%s", session_id)
             return []
-
-    def retrieve_for_session(
-        self,
-        session_id: str,
-        query: str,
-        limit: int = DEFAULT_RETRIEVAL_LIMIT,
-    ) -> list[RetrievedDocument]:
-        """Retrieve multi-agent evidence through the database-scoped vector query."""
-        if not session_id:
-            raise ValueError("A session ID is required for retrieval.")
-
-        query_vector = get_embedding_service().embed_query(query)
-        logger.info(
-            "RAG session filter applied session_id=%s dataset_id=%s",
-            session_id,
-            session_id,
-        )
-        rows = self.storage.match_document_chunks(
-            dataset_id=session_id,
-            query_embedding=[float(value) for value in query_vector],
-            match_count=limit,
-            match_threshold=0.2,
-        )
-        documents = self._dedupe_retrieved(
-            [
-                RetrievedDocument(
-                    page_content=str(row.get("content", "")).strip(),
-                    metadata=self._result_metadata(row),
-                    score=float(row.get("similarity") or 0.0),
-                )
-                for row in rows
-                if str(row.get("content", "")).strip()
-            ]
-        )
-        return [
-            document
-            for document in documents
-            if self._matches_session(document, session_id)
-        ][:limit]
 
     def rerank(
         self,
@@ -237,7 +309,11 @@ class RagService:
     ) -> list[RerankedDocument]:
         if not documents:
             return []
-        return get_reranker().rerank(query=query, documents=documents, limit=RERANK_LIMIT)
+        return get_reranker().rerank(
+            query=query,
+            documents=documents,
+            limit=_RAG_CONFIG.reranking.limit,
+        )
 
     def build_context(
         self,
@@ -251,7 +327,7 @@ class RagService:
             sections.append(evidence)
             used_chars += len(evidence)
 
-        for document in documents[:RERANK_LIMIT]:
+        for document in documents[:_RAG_CONFIG.reranking.limit]:
             metadata = document.metadata
             source_id = str(metadata.get("source_id", "unknown_source"))
             header = [
@@ -266,7 +342,12 @@ class RagService:
                 if metadata.get(key):
                     header.append(f"{label}: {metadata[key]}")
             header.append("Content:")
-            remaining = MAX_CONTEXT_CHARS - used_chars - sum(len(item) for item in header) - 32
+            remaining = (
+                _RAG_CONFIG.retrieval.max_context_chars
+                - used_chars
+                - sum(len(item) for item in header)
+                - 32
+            )
             if remaining <= 0:
                 break
             content = document.page_content.strip()
@@ -275,9 +356,16 @@ class RagService:
             item = "\n".join([*header, content])
             sections.append(item)
             used_chars += len(item)
-            if used_chars >= MAX_CONTEXT_CHARS:
+            if used_chars >= _RAG_CONFIG.retrieval.max_context_chars:
                 break
-        return "\n\n".join(sections).strip()
+        context = "\n\n".join(sections).strip()
+        logger.debug(
+            "RAG context built sources=%s chars=%s calculated=%s",
+            [str(document.metadata.get("source_id", "unknown_source")) for document in documents],
+            len(context),
+            bool(calculated_evidence),
+        )
+        return context
 
     def route_query(self, query: str, profile: dict[str, Any]) -> QueryType:
         lowered = query.casefold()
@@ -301,7 +389,9 @@ class RagService:
                 "minimum",
                 "top",
                 "bottom",
-            )
+                "best",
+                "performed best",
+                )
         )
         has_forecast = any(word in lowered for word in ("predict", "forecast", "project"))
         has_compare = any(word in lowered for word in ("compare", "versus", " vs ", "difference"))
@@ -399,22 +489,38 @@ class DeterministicAnalytics:
         self.profile = profile
         self.df = load_dataframe(agent_input.filePath)
         self.summary = profile.get("summary", {})
+        self.date_field = self._date_field()
         self.measures = self._measures()
         self.dimensions = self._dimensions()
-        self.date_field = self.summary.get("timeField")
+        self._revenue_source_columns: tuple[str, str] | None = None
+        self._revenue_measure = self._find_revenue_measure()
+        if self._revenue_measure is None:
+            source_columns = self._find_derived_revenue_columns()
+            if source_columns is not None:
+                price_column, quantity_column = source_columns
+                price = pd.to_numeric(self.df[price_column], errors="coerce")
+                quantity = pd.to_numeric(self.df[quantity_column], errors="coerce")
+                derived = price * quantity
+                if derived.notna().any():
+                    self.df[DERIVED_REVENUE_COLUMN] = derived
+                    self.measures.append(DERIVED_REVENUE_COLUMN)
+                    self._revenue_measure = DERIVED_REVENUE_COLUMN
+                    self._revenue_source_columns = source_columns
 
     def calculate(self, query: str) -> CalculatedEvidence | None:
         lowered = query.casefold()
-        if any(word in lowered for word in ("forecast", "predict", "project")) and "revenue" in lowered:
-            return self._forecast_revenue(query)
+        if any(word in lowered for word in ("forecast", "predict", "project")):
+            return self._forecast(query)
 
         operation = self._operation(lowered)
         if not operation:
             return None
 
-        measure = self._query_column(query, self.measures)
+        measure = self._query_measure(query)
         if operation == "count" and measure is None:
             return self._count_rows(query)
+        if measure is None and operation in {"top", "bottom", "group_by"}:
+            measure = self._default_performance_measure()
         if measure is None:
             return None
 
@@ -436,21 +542,22 @@ class DeterministicAnalytics:
             }[operation]
             filter_text = self._filter_text(filters)
             label = operation.title()
+            measure_label = self._measure_label(measure)
             text = (
                 f"Calculated evidence:\n"
-                f"{label} {measure}{filter_text}: {self._number(value)}.\n"
-                f"Source fields: {self._source_fields([measure, *filters.keys()])}."
+                f"{label} {measure_label}{filter_text}: {self._number(value)}.\n"
+                f"Source fields: {self._source_fields([*self._measure_source_fields(measure), *filters.keys()])}."
             )
             direct = (
-                f"**Answer:** {label} `{measure}`{filter_text} is **{self._number(value)}**.\n\n"
-                f"**Grounding:** Calculated from `{measure}`"
+                f"**Answer:** {label} `{measure_label}`{filter_text} is **{self._number(value)}**.\n\n"
+                f"**Grounding:** Calculated from {self._measure_grounding(measure)}"
                 f"{self._fields_suffix(filters)} in dataset `{self.agent_input.fileName}`."
             )
             return CalculatedEvidence(text=text, direct_answer=direct)
 
         if operation in {"top", "bottom", "group_by"}:
             if dimension is None:
-                dimension = self._best_dimension()
+                dimension = self._best_dimension(query)
             if dimension is None:
                 return None
             filters = self._filters(query, exclude={dimension})
@@ -475,15 +582,16 @@ class DeterministicAnalytics:
                 item_label = "Grouped"
             values = "; ".join(f"{label}: {self._number(value)}" for label, value in selected.items())
             filter_text = self._filter_text(filters)
+            measure_label = self._measure_label(measure)
             text = (
                 f"Calculated evidence:\n"
-                f"{item_label} {measure} by {dimension}{filter_text}: {values}.\n"
-                f"Source fields: {self._source_fields([measure, dimension, *filters.keys()])}."
+                f"{item_label} {measure_label} by {dimension}{filter_text}: {values}.\n"
+                f"Source fields: {self._source_fields([*self._measure_source_fields(measure), dimension, *filters.keys()])}."
             )
             direct = (
-                f"**Answer:** {item_label} `{measure}` by `{dimension}`{filter_text}: "
+                f"**Answer:** {item_label} `{measure_label}` by `{dimension}`{filter_text}: "
                 f"**{values}**.\n\n"
-                f"**Grounding:** Calculated from `{measure}` grouped by `{dimension}`"
+                f"**Grounding:** Calculated from {self._measure_grounding(measure)} grouped by `{dimension}`"
                 f"{self._fields_suffix(filters)} in dataset `{self.agent_input.fileName}`."
             )
             return CalculatedEvidence(text=text, direct_answer=direct)
@@ -509,74 +617,65 @@ class DeterministicAnalytics:
         )
         return CalculatedEvidence(text=text, direct_answer=direct)
 
-    def _forecast_revenue(self, query: str) -> CalculatedEvidence | None:
-        year_column = self._column("Year")
-        price_column = self._column("Price_USD")
-        volume_column = self._column("Sales_Volume")
-        if not year_column or not price_column or not volume_column:
+    def _forecast(self, query: str) -> CalculatedEvidence | None:
+        measure = self._query_measure(query) or self._revenue_measure or self._default_performance_measure()
+        time_column = self._forecast_time_column()
+        if measure is None or time_column is None:
             return None
 
-        match = re.search(r"\b(19\d{2}|20\d{2})\b", query)
-        if not match:
-            return None
-        target_year = int(match.group(1))
-
-        working = self.df[[year_column, price_column, volume_column]].copy()
-        region_column = self._column("Region")
-        region = self._query_category(region_column, query) if region_column else None
-        if region_column and region:
-            working[region_column] = self.df[region_column]
-            working = working[
-                working[region_column].astype(str).str.casefold() == region.casefold()
-            ]
-
-        working[year_column] = pd.to_numeric(working[year_column], errors="coerce")
-        working[price_column] = pd.to_numeric(working[price_column], errors="coerce")
-        working[volume_column] = pd.to_numeric(working[volume_column], errors="coerce")
-        working = working.dropna(subset=[year_column, price_column, volume_column])
+        filters = self._filters(query, exclude={time_column})
+        working = self._apply_filters(self.df, filters)
         if working.empty:
             return None
 
-        working["revenue"] = working[price_column] * working[volume_column]
-        grouped = working.groupby(year_column)["revenue"].sum().sort_index()
-        grouped = grouped[grouped.index.astype(int) == grouped.index]
+        periods = self._annual_periods(working[time_column])
+        values = pd.to_numeric(working[measure], errors="coerce")
+        series = pd.DataFrame({"period": periods, "value": values}).dropna()
+        if series.empty:
+            return None
+        grouped = series.groupby("period")["value"].sum().sort_index()
         if len(grouped) < 4:
             return None
 
         years = [int(year) for year in grouped.index]
         last_year = max(years)
+        match = re.search(r"\b(19\d{2}|20\d{2})\b", query)
+        target_year = int(match.group(1)) if match else last_year + 1
         if target_year <= last_year:
             return None
 
-        values = grouped.astype(float).to_numpy()
-        x = np.arange(len(values), dtype=float)
-        slope, intercept = np.polyfit(x, values, 1)
-        steps_ahead = target_year - last_year
-        prediction = float(slope * (len(values) - 1 + steps_ahead) + intercept)
-
-        region_text = f" for {region}" if region else ""
-        filter_text = f", filtered to Region={region}" if region else ""
-        value_text = self._currency(prediction)
+        x = np.arange(len(grouped), dtype=float)
+        slope, intercept = np.polyfit(x, grouped.astype(float).to_numpy(), 1)
+        prediction = float(slope * (len(grouped) - 1 + target_year - last_year) + intercept)
+        measure_label = self._measure_label(measure)
+        filter_text = self._filter_text(filters)
+        value_text = (
+            self._currency(prediction)
+            if self._is_revenue_measure(measure)
+            else self._number(prediction)
+        )
+        target_text = f"in {target_year}" if match else f"for the next year ({target_year})"
+        source_fields = self._source_fields(
+            [time_column, *self._measure_source_fields(measure), *filters.keys()]
+        )
         text = (
             "Calculated evidence:\n"
-            f"Forecasted total revenue{region_text} in {target_year}: {value_text}.\n"
-            f"Method: linear trend on annual revenue from {min(years)} to {last_year}.\n"
-            f"Source fields: {year_column}, {price_column}, {volume_column}"
-            f"{', ' + region_column if region_column and region else ''}."
+            f"Forecasted total {measure_label}{filter_text} {target_text}: {value_text}.\n"
+            f"Method: linear trend on annual totals from {min(years)} to {last_year}.\n"
+            f"Source fields: {source_fields}."
         )
         direct = (
-            f"**Answer:** The forecasted total revenue{region_text} in "
-            f"{target_year} is **{value_text}**, using a linear trend on annual revenue.\n\n"
-            f"**Grounding:** Dataset `{self.agent_input.fileName}`; revenue = "
-            f"`{price_column} * {volume_column}`{filter_text}, using "
-            f"`{year_column}` {min(years)}-{last_year}."
+            f"**Answer:** The forecasted total `{measure_label}`{filter_text} {target_text} "
+            f"is **{value_text}**, using a linear trend on annual totals.\n\n"
+            f"**Grounding:** Calculated from {self._measure_grounding(measure)} using "
+            f"`{time_column}` from {min(years)} to {last_year}."
         )
         return CalculatedEvidence(text=text, direct_answer=direct)
 
     def _operation(self, lowered: str) -> str | None:
         if any(word in lowered for word in ("how many", "count", "number of rows", "row count")):
             return "count"
-        if any(word in lowered for word in ("highest", "top", "largest", "most")):
+        if any(word in lowered for word in ("highest", "top", "largest", "most", "best")):
             return "top"
         if any(word in lowered for word in ("lowest", "bottom", "smallest", "least")):
             return "bottom"
@@ -639,16 +738,53 @@ class DeterministicAnalytics:
             title = column.replace("_", " ").replace("-", " ")
             if title.casefold() in lowered:
                 return column
+            if re.search(rf"\b{re.escape(title.casefold())}s\b", lowered):
+                return column
+            if "product" in lowered and "product" in title.casefold():
+                return column
         if len(columns) == 1:
             return columns[0]
         return None
 
-    def _best_dimension(self) -> str | None:
+    def _query_measure(self, query: str) -> str | None:
+        measure = self._query_column(
+            query,
+            [item for item in self.measures if item != DERIVED_REVENUE_COLUMN],
+        )
+        if measure is not None:
+            return measure
+        if any(term in query.casefold() for term in ("revenue", "turnover")):
+            return self._revenue_measure
+        return None
+
+    def _default_performance_measure(self) -> str | None:
+        if self._revenue_measure is not None:
+            return self._revenue_measure
+        preferred_terms = ("sales", "profit", "amount", "value")
+        for term in preferred_terms:
+            for measure in self.measures:
+                if term in measure.casefold():
+                    return measure
+        return next(
+            (measure for measure in self.measures if measure != DERIVED_REVENUE_COLUMN),
+            None,
+        )
+
+    def _best_dimension(self, query: str = "") -> str | None:
         candidates = [
             dimension
             for dimension in self.dimensions
             if dimension in self.df.columns and 2 <= self.df[dimension].nunique(dropna=True) <= 50
         ]
+        lowered = query.casefold()
+        for keyword in ("product", "category", "customer", "region"):
+            if keyword in lowered:
+                matched = next(
+                    (dimension for dimension in candidates if keyword in dimension.casefold()),
+                    None,
+                )
+                if matched is not None:
+                    return matched
         return candidates[0] if candidates else None
 
     def _query_category(self, column: str | None, query: str) -> str | None:
@@ -684,6 +820,94 @@ class DeterministicAnalytics:
             for column in self.df.columns
             if str(column) not in self.measures and str(column) != self.date_field
         ]
+
+    def _date_field(self) -> str | None:
+        configured = self.summary.get("timeField")
+        if isinstance(configured, str) and configured in self.df.columns:
+            return configured
+        return self._year_like_column()
+
+    def _find_revenue_measure(self) -> str | None:
+        candidates = [*self.measures]
+        candidates.extend(
+            str(column)
+            for column in self.df.select_dtypes(include="number").columns
+            if str(column) not in candidates
+        )
+        for column in candidates:
+            name = self._normalised_name(column)
+            if any(term in name for term in REVENUE_COLUMN_TERMS):
+                return column
+        return None
+
+    def _find_derived_revenue_columns(self) -> tuple[str, str] | None:
+        numeric_columns = [
+            str(column)
+            for column in self.df.columns
+            if pd.to_numeric(self.df[column], errors="coerce").notna().any()
+        ]
+        price_column = self._best_named_column(
+            numeric_columns,
+            ("unit price", "price", "unit cost"),
+        )
+        quantity_column = self._best_named_column(
+            numeric_columns,
+            ("sales volume", "quantity", "qty", "units sold", "unit volume", "volume"),
+        )
+        if price_column is None or quantity_column is None or price_column == quantity_column:
+            return None
+        return price_column, quantity_column
+
+    @classmethod
+    def _best_named_column(
+        cls,
+        columns: list[str],
+        terms: tuple[str, ...],
+    ) -> str | None:
+        for term in terms:
+            for column in columns:
+                if term in cls._normalised_name(column):
+                    return column
+        return None
+
+    def _measure_label(self, measure: str) -> str:
+        if measure == DERIVED_REVENUE_COLUMN:
+            return "Revenue"
+        return measure.replace("_", " ")
+
+    def _measure_source_fields(self, measure: str) -> list[str]:
+        if measure == DERIVED_REVENUE_COLUMN and self._revenue_source_columns:
+            return list(self._revenue_source_columns)
+        return [measure]
+
+    def _measure_grounding(self, measure: str) -> str:
+        if measure == DERIVED_REVENUE_COLUMN and self._revenue_source_columns:
+            price_column, quantity_column = self._revenue_source_columns
+            return f"`Revenue` derived as `{price_column}` × `{quantity_column}`"
+        return f"`{measure}`"
+
+    def _is_revenue_measure(self, measure: str) -> bool:
+        return measure == self._revenue_measure or any(
+            term in self._normalised_name(measure) for term in REVENUE_COLUMN_TERMS
+        )
+
+    def _forecast_time_column(self) -> str | None:
+        if self.date_field and self.date_field in self.df.columns:
+            return self.date_field
+        return self._year_like_column()
+
+    @staticmethod
+    def _annual_periods(values: pd.Series) -> pd.Series:
+        numeric = pd.to_numeric(values, errors="coerce")
+        numeric_values = numeric.dropna()
+        if not numeric_values.empty and numeric_values.between(1800, 3000).all():
+            return numeric.round().astype("Int64")
+        dates = pd.to_datetime(values, errors="coerce")
+        return dates.dt.year.astype("Int64")
+
+    @staticmethod
+    def _normalised_name(value: str) -> str:
+        return re.sub(r"[_-]+", " ", value).casefold()
 
     def _column(self, name: str) -> str | None:
         expected = name.casefold()

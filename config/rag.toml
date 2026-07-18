@@ -1,0 +1,20 @@
+[embedding]
+model = "sentence-transformers/all-MiniLM-L6-v2"
+batch_size = 64
+
+[reranking]
+model = "Xenova/ms-marco-MiniLM-L-6-v2"
+limit = 5
+
+[retrieval]
+vector_search_limit = 12
+chat_search_limit = 6
+match_threshold = 0.2
+max_context_chars = 7000
+
+[chunking]
+size = 800
+overlap = 100
+max_row_batch_documents = 24
+rows_per_batch_document = 25
+max_columns_per_row_document = 12

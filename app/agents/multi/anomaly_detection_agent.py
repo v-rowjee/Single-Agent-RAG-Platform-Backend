@@ -1,7 +1,6 @@
 """Independent anomaly-detection specialist using pandas and numpy."""
 from __future__ import annotations
 
-import json
 import os
 import re
 from pathlib import Path
@@ -11,7 +10,7 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.agents.multi.analysis_series import (
+from app.services.series import (
     aggregation_for_measure,
     is_numeric_measure,
     ranked_measures,
@@ -19,8 +18,9 @@ from app.agents.multi.analysis_series import (
     selected_date_column,
     selected_granularity,
 )
-from app.core.agent_models import agent_model_policy
+from app.core.config import agent_model_policy
 from app.core.groq_structured import request_structured
+from app.core.prompts import render_agent_prompts
 
 MIN_TIME_PERIODS = 6
 MIN_ROLLING_PERIODS = 6
@@ -104,13 +104,20 @@ def _metadata(prepared: dict[str, Any]) -> dict[str, Any]:
 async def _request_groq_plan(prepared: dict[str, Any]) -> AnomalyPlan:
     key = os.getenv("GROQ_API_KEY", "").strip()
     if not key: raise AnomalyDetectionError("GROQ_API_KEY is missing.")
+    prompts = render_agent_prompts(
+        "multi/anomaly_detection",
+        payload=_metadata(prepared),
+    )
     return await request_structured(
         api_key=key,
         policy=agent_model_policy("anomaly_detection"),
         response_model=AnomalyPlan,
         schema_name="anomaly_detection_plan",
         temperature=0.1,
-        messages=[{"role": "system", "content": "Return JSON only: {analyses:[{id,measure,method,aggregation,date_column?,granularity?,group_by?}],limitations:[]}. Use supported methods z_score, iqr, rolling_deviation, percentage_change; aggregations sum, mean, count; granularities day, week, month, quarter, year. Prefer time series when available. Do not calculate values."}, {"role": "user", "content": json.dumps(_metadata(prepared), default=str, separators=(",", ":"))}],
+        messages=[
+            {"role": "system", "content": prompts.system},
+            {"role": "user", "content": prompts.user},
+        ],
     )
 
 

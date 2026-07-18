@@ -77,7 +77,7 @@ class DummyRag:
         self.documents = documents
         self.calls: list[tuple[str, str, int]] = []
 
-    def retrieve_for_session(
+    def retrieve(
         self,
         session_id: str,
         query: str,

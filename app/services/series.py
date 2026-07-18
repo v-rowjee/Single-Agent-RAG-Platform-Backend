@@ -1,4 +1,4 @@
-"""Shared deterministic semantics for KPI, trend, forecast, and chart agents."""
+"""Shared deterministic semantics for KPI, trend, forecast, and chart analysis."""
 from __future__ import annotations
 
 from dataclasses import dataclass

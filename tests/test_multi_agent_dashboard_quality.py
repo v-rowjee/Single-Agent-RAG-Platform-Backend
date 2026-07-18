@@ -9,7 +9,7 @@ import pytest
 
 from app.agents.multi import dashboard_generation_agent as dashboard_module
 from app.agents.multi import forecasting_agent as forecasting_module
-from app.agents.multi.analysis_series import (
+from app.services.series import (
     aggregation_for_measure,
     infer_time_granularity,
 )
@@ -19,7 +19,7 @@ from app.agents.multi.forecasting_agent import ForecastingAgent
 from app.agents.multi.insight_synthesis_agent import _fallback as synthesis_fallback
 from app.agents.multi.kpi_trend_agent import KPITrendAgent
 from app.agents.multi.orchestrator_agent import OrchestratorAgent
-from app.core.agent_models import configured_agent_models
+from app.core.config import configured_agent_models
 
 
 def _rows(periods: int = 24) -> pd.DataFrame:

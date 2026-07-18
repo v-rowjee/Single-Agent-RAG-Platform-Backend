@@ -4,16 +4,17 @@ import logging
 import threading
 from typing import Any
 
-from app.rag.config import RERANK_LIMIT, RERANKER_MODEL_NAME
+from app.core.config import get_rag_config
 from app.rag.models import RerankedDocument, RetrievedDocument
 
 
 logger = logging.getLogger(__name__)
+_RERANKING_POLICY = get_rag_config().reranking
 
 
 class FastEmbedReranker:
-    def __init__(self, model_name: str = RERANKER_MODEL_NAME) -> None:
-        self.model_name = model_name
+    def __init__(self, model_name: str | None = None) -> None:
+        self.model_name = model_name or _RERANKING_POLICY.model
         self._model: Any | None = None
         self._lock = threading.Lock()
 
@@ -21,7 +22,7 @@ class FastEmbedReranker:
         self,
         query: str,
         documents: list[RetrievedDocument],
-        limit: int = RERANK_LIMIT,
+        limit: int = _RERANKING_POLICY.limit,
     ) -> list[RerankedDocument]:
         if not documents:
             return []

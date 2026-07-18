@@ -21,6 +21,7 @@ USER_ID = "59b3d0fc-2d4a-40a0-8bb1-99e19da406ee"
 class UploadStorage:
     def __init__(self) -> None:
         self.saved_dashboards = 0
+        self.saved_processing = 0
         self.status_updates: list[dict[str, Any]] = []
 
     def upload_file(self, storage_path: str, content: bytes, mime_type: str) -> None:
@@ -49,6 +50,9 @@ class UploadStorage:
     def save_dashboard(self, **values: Any) -> None:
         self.saved_dashboards += 1
 
+    def save_session_processing(self, **values: Any) -> None:
+        self.saved_processing += 1
+
     def update_dataset_status(self, dataset_id: str, **values: Any) -> None:
         self.status_updates.append({"dataset_id": dataset_id, **values})
 
@@ -59,13 +63,24 @@ class UploadStorage:
         return None
 
 
-def test_multi_upload_uses_graph_owned_persistence_and_never_single_agent(
+class IndexingRag:
+    def index_documents(self, **values: Any) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "document_count": len(values["retrieval_documents"]),
+            "indexed_count": len(values["retrieval_documents"]),
+            "failed_count": 0,
+        }
+
+
+def test_multi_upload_uses_service_owned_persistence_and_never_single_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage = UploadStorage()
     service = BusinessIntelligenceService(
         storage=storage,  # type: ignore[arg-type]
         settings=Settings("", "", bi_pipeline_mode="multi"),
+        rag=IndexingRag(),
     )
     multi_calls: list[str] = []
 
@@ -103,11 +118,14 @@ def test_multi_upload_uses_graph_owned_persistence_and_never_single_agent(
 
     assert response["status"] == "success"
     assert len(multi_calls) == 1
-    assert storage.saved_dashboards == 0
+    assert storage.saved_dashboards == 1
+    assert storage.saved_processing == 1
+    assert len(storage.status_updates) == 1
     assert storage.status_updates[-1]["status"] == "ready"
+    assert storage.status_updates[-1]["rag_status"] == "ready"
 
 
-def test_failed_graph_persistence_returns_failed_dashboard_response(
+def test_failed_graph_returns_failed_dashboard_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dataset = DatasetRecord(
@@ -128,12 +146,11 @@ def test_failed_graph_persistence_returns_failed_dashboard_response(
         settings=Settings("", "", bi_pipeline_mode="multi"),
     )
 
-    class FailedPersistenceGraph:
+    class FailedWorkflowGraph:
         async def ainvoke(self, state: dict[str, Any]) -> dict[str, Any]:
             return {
                 **state,
                 "workflow_status": "failed",
-                "persistence_result": {"status": "failed"},
                 "dashboard_output": {
                     "status": "partial",
                     "sessionId": dataset.id,
@@ -146,16 +163,16 @@ def test_failed_graph_persistence_returns_failed_dashboard_response(
     monkeypatch.setattr(
         service_module,
         "business_intelligence_graph",
-        FailedPersistenceGraph(),
+        FailedWorkflowGraph(),
     )
 
-    response = asyncio.run(
+    execution = asyncio.run(
         service._run_multi_agent_pipeline(
             dataset,
             b"date,revenue\n2025-01-01,100\n",
         )
     )
 
-    assert response.status == "failed"
-    assert response.dashboard is None
-    assert response.errors[0].code == "MULTI_AGENT_PIPELINE_FAILED"
+    assert execution.response.status == "failed"
+    assert execution.response.dashboard is None
+    assert execution.response.errors[0].code == "MULTI_AGENT_PIPELINE_FAILED"

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 # 1. Imports and constants
 
-import json
 import logging
 import math
 import os
@@ -13,18 +12,16 @@ from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
-from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.agents.multi.analysis_series import (
+from app.services.series import (
     infer_time_granularity,
     temporal_period_count,
 )
-from app.core.agent_models import agent_model_policy
+from app.core.config import agent_model_policy
 from app.core.groq_structured import request_structured
+from app.core.prompts import render_agent_prompts
 
-
-load_dotenv(Path(__file__).resolve().parents[4] / ".env")
 
 SUPPORTED_OPERATIONS = {
     "fill_constant",
@@ -652,53 +649,17 @@ def _compact_profile_payload(profile: DatasetProfile) -> dict[str, Any]:
     return profile.model_dump(mode="json", exclude_none=True)
 
 
-def _system_prompt() -> str:
-    return f"""
-You are a dataset preparation planning agent.
-
-You receive a compact profile of an already generically cleaned dataset.
-
-Identify the dataset semantics and produce a conservative preparation plan.
-
-You may select only these supported operations: {", ".join(sorted(SUPPORTED_OPERATIONS))}.
-You may select only these formula IDs: {", ".join(sorted(SUPPORTED_FORMULAS))}.
-
-You must not:
-- invent columns;
-- invent missing business values;
-- replace missing numeric measures with zero by default;
-- write Python, Pandas or SQL;
-- create arbitrary formulas;
-- modify existing non-null values;
-- claim unsupported analysis capabilities.
-
-Return one JSON object matching this shape:
-{{
-  "semantic_roles": [{{"column": "column_name", "role": "date|transaction_id|primary_measure|dimension|category|description|unknown", "reason": "short reason"}}],
-  "date_column": null,
-  "transaction_id_columns": [],
-  "primary_measures": [],
-  "dimensions": [],
-  "categorical_columns": [],
-  "currency": null,
-  "time_granularity": null,
-  "time_series_candidates": [],
-  "transformations": [{{"operation": "preserve_missing", "column": "column_name", "reason": "short reason", "value": null, "analysis_types": [], "formula_id": null, "source_columns": []}}],
-  "capability_flags": {{"supports_kpis": false, "supports_trends": false, "supports_anomalies": false, "supports_forecasting": false, "has_temporal_data": false}},
-  "limitations": []
-}}
-""".strip()
-
-
 async def _request_groq_plan(profile: DatasetProfile) -> PreparationPlan:
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
         raise DataPreparationError("GROQ_API_KEY is missing from the environment.")
 
-    user_payload: dict[str, Any] = {
-        "profile": _compact_profile_payload(profile),
-        "instruction": "Return only the preparation plan JSON object.",
-    }
+    prompts = render_agent_prompts(
+        "multi/data_preparation",
+        supported_operations=sorted(SUPPORTED_OPERATIONS),
+        supported_formulas=sorted(SUPPORTED_FORMULAS),
+        profile=_compact_profile_payload(profile),
+    )
     return await request_structured(
         api_key=api_key,
         policy=agent_model_policy("data_preparation"),
@@ -706,11 +667,8 @@ async def _request_groq_plan(profile: DatasetProfile) -> PreparationPlan:
         schema_name="data_preparation_plan",
         temperature=0.1,
         messages=[
-            {"role": "system", "content": _system_prompt()},
-            {
-                "role": "user",
-                "content": json.dumps(user_payload, ensure_ascii=False, separators=(",", ":"), default=str),
-            },
+            {"role": "system", "content": prompts.system},
+            {"role": "user", "content": prompts.user},
         ],
     )
 

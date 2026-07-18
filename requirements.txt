@@ -8,6 +8,9 @@ openpyxl
 xlrd
 
 python-dotenv
+Jinja2
+toons==0.7.0
+tomli>=2.0; python_version < "3.11"
 supabase>=2.25.0
 
 langchain

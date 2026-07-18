@@ -18,18 +18,24 @@ only when the session belongs to its authenticated user.
 
 ## Pipeline mode
 
-Set `BI_PIPELINE_MODE` in `.env`:
+Set the pipeline mode in `config/agents.toml`:
 
-```dotenv
-# Existing single-agent dashboard and chat workflow
-BI_PIPELINE_MODE=single
-
-# Multi-agent analysis and session-scoped retrieval chat
-BI_PIPELINE_MODE=multi
+```toml
+[pipeline]
+# Change this to "single" for the existing single-agent dashboard and chat workflow.
+mode = "multi"
 ```
 
-`single` remains the default when the variable is omitted. The two modes expose
+`multi` is the checked-in default. The two modes expose
 the same upload, dashboard, chat, and chat-history API contracts.
+
+Each `agents.<name>` section selects the provider, model, generation limits,
+and reasoning effort for one LLM invocation. Each LLM agent has one versioned
+TOON bundle in `app/prompts/`; the backend validates the bundle at startup and
+serializes its structured system and user context as TOON before invocation.
+Mode and model settings are deliberately not read from `.env`.
+The `[forecasting]` table configures the TimesFM model and its limits.
+Keep `GROQ_API_KEY`, Supabase credentials, and other secrets in `.env` only.
 
 The multi-agent analysis flow is:
 
@@ -37,16 +43,23 @@ The multi-agent analysis flow is:
 Upload -> Generic Cleaning -> Data Preparation -> Orchestrator
        -> capability-gated KPI/Trend, Anomaly, and Forecast specialists
        -> Specialist Join -> Insight Synthesis
-       -> Dashboard Generation --------------------\
-       -> Retrieval Preparation -> Retrieval Indexing
-                                                    -> Output Join
-                                                    -> Persistence -> END
+       -> Dashboard Generation ----\
+       -> Retrieval Preparation -----> Output Join
+                                      -> Service-owned Retrieval Indexing
+                                      -> Service-owned Persistence -> END
 ```
 
-Dashboard generation and retrieval indexing must both report completion or
-failure before the output join runs. Optional specialist and retrieval failures
-produce a partial dashboard with warnings; cleaning, preparation, dashboard, or
-persistence failures produce a failed result.
+RAG model assignments, embedding and reranking limits, retrieval thresholds,
+and document chunking settings live in `config/rag.toml`. Both checked-in TOML
+files are validated when the API starts, so invalid settings fail early with a
+configuration error.
+
+Dashboard generation and retrieval preparation must both report completion or
+failure before the graph's output join runs. The top-level business intelligence
+service then owns retrieval indexing, dashboard/workflow persistence, and the
+final dataset status update for both pipeline modes. Optional specialist and
+retrieval failures produce a partial dashboard with warnings; cleaning,
+preparation, dashboard, or persistence failures produce a failed result.
 
 Multi-agent chat uses a separate pipeline:
 
@@ -60,3 +73,41 @@ Session Validation -> Input Guardrail -> Session-Filtered Retrieval
 ```powershell
 pytest -q
 ```
+
+## Orchestration
+
+USER UPLOAD
+    │
+    ▼
+Generic Cleaning Service
+    │
+    ▼
+Data Preparation Agent
+    │
+    ▼
+Orchestrator Agent
+    │
+    ├──────────────┬──────────────────┐
+    ▼              ▼                  ▼
+KPI & Trend     Anomaly Detection   Forecasting
+Agent           Agent               Agent
+    │              │                  │
+    └──────────────┴──────────────────┘
+                   │
+                   ▼
+             Specialist Join
+                   │
+                   ▼
+         Insight Synthesis Agent
+                   │
+         ┌─────────┴──────────┐
+         ▼                    ▼
+Dashboard Generation   Retrieval Preparation
+Agent                  Agent
+         │                    │
+         ▼                    ▼
+ Dashboard JSON       RAG Documents / Chunks
+         │                    │
+         └─────────┬──────────┘
+                   ▼
+          Supabase Persistence

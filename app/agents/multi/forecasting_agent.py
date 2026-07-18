@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.agents.multi.analysis_series import (
+from app.services.series import (
     is_numeric_measure,
     period_frequency,
     select_primary_series,

@@ -7,9 +7,12 @@ from typing import Any
 
 import numpy as np
 
-TIMESFM_MODEL_ID = "google/timesfm-2.5-200m-pytorch"
-MAX_CONTEXT = 1024
-MAX_HORIZON = 256
+from app.core.config import get_runtime_config
+
+_FORECASTING_POLICY = get_runtime_config().forecasting
+TIMESFM_MODEL_ID = _FORECASTING_POLICY.model
+MAX_CONTEXT = _FORECASTING_POLICY.max_context
+MAX_HORIZON = _FORECASTING_POLICY.max_horizon
 
 
 class TimesFMServiceError(RuntimeError):

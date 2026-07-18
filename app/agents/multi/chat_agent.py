@@ -1,14 +1,14 @@
 """Grounded chat generation over session-scoped retrieval evidence only."""
 from __future__ import annotations
 
-import json
 import logging
 import os
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app.core.agent_models import agent_model_policy
+from app.core.config import agent_model_policy
 from app.core.groq_structured import request_structured
+from app.core.prompts import render_agent_prompts
 from app.rag.models import RetrievedDocument
 
 
@@ -91,6 +91,10 @@ async def _request_groq_draft(query: str, context: str) -> GroundedChatDraft:
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GROQ_API_KEY is missing.")
+    prompts = render_agent_prompts(
+        "multi/chat",
+        payload={"query": query, "documents": context},
+    )
     return await request_structured(
         api_key=api_key,
         policy=agent_model_policy("chat"),
@@ -98,28 +102,8 @@ async def _request_groq_draft(query: str, context: str) -> GroundedChatDraft:
         schema_name="grounded_chat_draft",
         temperature=0.1,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a grounded business intelligence assistant. Answer only "
-                    "from the supplied retrieved analysis documents. Do not invent "
-                    "facts, values, causes, trends, anomalies, forecasts, or "
-                    "recommendations. Do not perform authoritative calculations. Use "
-                    "numeric values only when they appear in the documents. Do not "
-                    "claim causation unless the evidence explicitly supports it. When "
-                    "evidence is insufficient, say so clearly. Return JSON only with "
-                    "answer, source_ids, and insufficient_context. source_ids must "
-                    "contain only supplied document IDs. Keep the answer concise and "
-                    "non-technical."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {"query": query, "documents": context},
-                    separators=(",", ":"),
-                ),
-            },
+            {"role": "system", "content": prompts.system},
+            {"role": "user", "content": prompts.user},
         ],
     )
 

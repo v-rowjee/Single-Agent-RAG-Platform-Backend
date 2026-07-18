@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import io
 import logging
@@ -8,6 +7,7 @@ import math
 import re
 import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Literal
@@ -16,11 +16,11 @@ from uuid import UUID, uuid4
 import pandas as pd
 from fastapi import UploadFile
 
-from app.agents.multi.chat_agent import GroundedChatDraft, chat_agent
 from app.core.config import Settings, get_settings
-from app.guardrails.chat_input import chat_input_guardrail
-from app.guardrails.chat_grounding import chat_grounding_guardrail
-from app.orchestration.chat_graph import build_multi_agent_chat_graph
+from app.core.model_usage import (
+    multi_dashboard_model_usage,
+    single_dashboard_model_usage,
+)
 from app.schemas.business_intelligence import (
     ApiMessage,
     BusinessIntelligenceAgentInput,
@@ -30,8 +30,8 @@ from app.schemas.business_intelligence import (
 from app.orchestration.business_intelligence_graph import (
     business_intelligence_graph,
 )
-from app.rag.models import RetrievedDocument
-from app.rag.rag_service import DEFAULT_RETRIEVAL_LIMIT, rag_service
+from app.rag.rag_service import rag_service
+from app.services.chat_service import ChatService
 from app.services.supabase_service import (
     DatasetRecord,
     MessageRecord,
@@ -64,6 +64,13 @@ class DatasetAlreadyExistsError(Exception):
     """Raised when a user attempts to upload a second active dataset."""
 
 
+@dataclass
+class PipelineExecution:
+    response: DashboardResponse
+    workflow: dict[str, Any] | None = None
+    retrieval_documents: list[dict[str, Any]] | None = None
+
+
 class BusinessIntelligenceService:
     def __init__(
         self,
@@ -72,22 +79,14 @@ class BusinessIntelligenceService:
         *,
         rag: Any | None = None,
         multi_chat_agent: Any | None = None,
-        input_guardrail: Any | None = None,
-        output_guardrail: Any | None = None,
-        multi_chat_graph: Any | None = None,
+        chat_service: ChatService | None = None,
     ) -> None:
         self.storage = storage or supabase_service
         self.settings = settings or get_settings()
         self._rag_service = rag or rag_service
-        self._multi_chat_agent = multi_chat_agent or chat_agent
-        self._input_guardrail = input_guardrail or chat_input_guardrail
-        self._output_guardrail = output_guardrail or chat_grounding_guardrail
-        self._multi_chat_graph = multi_chat_graph or build_multi_agent_chat_graph(
-            validate_session=self._load_dataset,
-            validate_input=self._input_guardrail.validate,
-            retrieve_documents=self._retrieve_multi_chat_documents,
-            generate_draft=self._generate_multi_chat_draft,
-            ground_draft=self._ground_multi_chat_draft,
+        self._chat_service = chat_service or ChatService(
+            rag=self._rag_service,
+            agent=multi_chat_agent,
         )
 
     async def create_analysis(
@@ -144,26 +143,7 @@ class BusinessIntelligenceService:
             )
             file_uploaded = True
 
-            dashboard_response = await self._run_selected_pipeline(dataset, content)
-
-            if self.settings.bi_pipeline_mode == "single":
-                self._save_dashboard(dataset.id, dashboard_response)
-                self._try_index_rag(
-                    dataset=dataset,
-                    content=content,
-                )
-
-            self.storage.update_dataset_status(
-                dataset.id,
-                status=(
-                    "failed" if dashboard_response.status == "failed" else "ready"
-                ),
-                error_message=(
-                    "Business intelligence pipeline failed."
-                    if dashboard_response.status == "failed"
-                    else None
-                ),
-            )
+            await self._run_selected_pipeline(dataset, content)
 
         except Exception as error:
             if not dataset_inserted and self._is_duplicate_dataset_error(error):
@@ -266,7 +246,9 @@ class BusinessIntelligenceService:
 
         if dashboard is not None:
             try:
-                return DashboardResponse.model_validate(dashboard.response)
+                return self._with_dashboard_model_metadata(
+                    DashboardResponse.model_validate(dashboard.response)
+                )
             except Exception:
                 logger.exception(
                     "Saved dashboard validation failed session_id=%s operation=get_dashboard",
@@ -285,30 +267,49 @@ class BusinessIntelligenceService:
             self.settings.bi_pipeline_mode,
             session.id,
         )
+        source_content = (
+            content
+            if content is not None
+            else self.storage.download_file(session.storage_path)
+        )
         if self.settings.bi_pipeline_mode == "multi":
-            return await self._run_multi_agent_pipeline(session, content)
-        return await self._run_single_agent_pipeline(session, content)
+            execution = await self._run_multi_agent_pipeline(session, source_content)
+        else:
+            execution = await self._run_single_agent_pipeline(session, source_content)
+
+        # Keep test doubles and extensions returning the pre-refactor type working.
+        if isinstance(execution, DashboardResponse):
+            execution = PipelineExecution(response=execution)
+        return self._persist_pipeline_execution(
+            session=session,
+            content=source_content,
+            execution=execution,
+        )
 
     async def _run_single_agent_pipeline(
         self,
         session: DatasetRecord,
         content: bytes | None = None,
-    ) -> DashboardResponse:
-        return self._generate_dashboard_from_bytes(
-            dataset=session,
-            content=(
-                content
-                if content is not None
-                else self.storage.download_file(session.storage_path)
-            ),
+    ) -> PipelineExecution:
+        return PipelineExecution(
+            response=self._with_dashboard_model_metadata(
+                self._generate_dashboard_from_bytes(
+                    dataset=session,
+                    content=(
+                        content
+                        if content is not None
+                        else self.storage.download_file(session.storage_path)
+                    ),
+                )
+            )
         )
 
     async def _run_multi_agent_pipeline(
         self,
         session: DatasetRecord,
         content: bytes | None = None,
-    ) -> DashboardResponse:
-        """Run the compiled workflow and return only its canonical dashboard."""
+    ) -> PipelineExecution:
+        """Run the compiled workflow and return its dashboard and durable artifacts."""
         session_id = session.id
         content = (
             content
@@ -336,23 +337,43 @@ class BusinessIntelligenceService:
 
             try:
                 result = await business_intelligence_graph.ainvoke(initial_state)
-                persistence_result = result.get("persistence_result")
-                if (
-                    result.get("workflow_status") == "failed"
-                    or not isinstance(persistence_result, dict)
-                    or persistence_result.get("status") != "success"
-                ):
-                    raise RuntimeError(
-                        "The multi-agent workflow did not persist successfully."
-                    )
-
                 dashboard_output = result.get("dashboard_output")
                 if not isinstance(dashboard_output, dict):
                     raise ValueError("The workflow did not return a dashboard output.")
 
                 dashboard_output = dict(dashboard_output)
                 dashboard_output["sessionId"] = session_id
-                response = DashboardResponse.model_validate(dashboard_output)
+                workflow_status = str(result.get("workflow_status") or "failed")
+                if workflow_status == "failed":
+                    raise RuntimeError("The multi-agent workflow failed.")
+                dashboard_output["status"] = workflow_status
+                response = self._with_dashboard_model_metadata(
+                    DashboardResponse.model_validate(dashboard_output),
+                    selected_agents=(
+                        result.get("orchestration_plan") or {}
+                    ).get("selected_agents", []),
+                )
+                workflow = {
+                    key: result.get(key)
+                    for key in (
+                        "session_id",
+                        "dataset_id",
+                        "prepared_dataset",
+                        "orchestration_plan",
+                        "generic_cleaning_report",
+                        "kpi_trend_output",
+                        "anomaly_output",
+                        "forecasting_output",
+                        "synthesis_output",
+                        "retrieval_documents",
+                        "warnings",
+                        "errors",
+                        "completed_agents",
+                        "failed_agents",
+                        "skipped_agents",
+                        "workflow_status",
+                    )
+                }
             except Exception:
                 logger.exception(
                     "Unexpected multi-agent pipeline failure session_id=%s",
@@ -380,7 +401,20 @@ class BusinessIntelligenceService:
                     session_id,
                     failed_response.status,
                 )
-                return failed_response
+                return PipelineExecution(
+                    response=self._with_dashboard_model_metadata(failed_response),
+                    workflow={
+                        "session_id": session_id,
+                        "dataset_id": session.id,
+                        "workflow_status": "failed",
+                        "warnings": [],
+                        "errors": ["The multi-agent workflow failed."],
+                        "completed_agents": [],
+                        "failed_agents": ["business_intelligence"],
+                        "skipped_agents": [],
+                    },
+                    retrieval_documents=[],
+                )
 
         logger.info("Multi-agent pipeline completed session_id=%s", session_id)
         logger.info(
@@ -388,7 +422,39 @@ class BusinessIntelligenceService:
             session_id,
             response.status,
         )
-        return response
+        return PipelineExecution(
+            response=response,
+            workflow=workflow,
+            retrieval_documents=list(result.get("retrieval_documents") or []),
+        )
+
+    def _with_dashboard_model_metadata(
+        self,
+        response: DashboardResponse,
+        selected_agents: list[str] | tuple[str, ...] = (),
+    ) -> DashboardResponse:
+        """Add model provenance to old and newly generated dashboard records."""
+        if response.agentModels:
+            return response
+
+        payload = response.model_dump(mode="json")
+        if self.settings.bi_pipeline_mode == "single":
+            usage = single_dashboard_model_usage()
+            payload.update(
+                {
+                    "pipelineMode": "single",
+                    "model": usage[0]["model"],
+                    "agentModels": usage,
+                }
+            )
+        else:
+            payload.update(
+                {
+                    "pipelineMode": "multi",
+                    "agentModels": multi_dashboard_model_usage(selected_agents),
+                }
+            )
+        return DashboardResponse.model_validate(payload)
 
     def chat(self, session_id: str, query: str, user_id: str) -> ChatResponse:
         if self.settings.bi_pipeline_mode == "multi":
@@ -424,78 +490,20 @@ class BusinessIntelligenceService:
         query: str,
         user_id: str,
     ) -> ChatResponse:
-        result = self._multi_chat_graph.invoke(
-            {
-                "session_id": session_id,
-                "query": query,
-                "user_id": user_id,
-            }
-        )
-        dataset = result.get("dataset")
-        guarded_draft = result.get("guarded_draft")
-        cleaned_query = str(result.get("query") or "").strip()
-        if not isinstance(dataset, DatasetRecord):
-            raise RuntimeError("Chat session validation did not return a dataset.")
-        if not isinstance(guarded_draft, GroundedChatDraft):
-            raise RuntimeError("The multi-agent chat pipeline returned no response.")
+        dataset = self._load_dataset(session_id, user_id)
+        result = self._chat_service.answer(dataset.id, query)
 
         self.storage.save_message(
             dataset_id=dataset.id,
             role="user",
-            content=cleaned_query,
+            content=result.query,
             sources=[],
         )
         return self._save_chat_response(
             dataset.id,
-            guarded_draft.answer,
-            guarded_draft.source_ids,
+            result.draft.answer,
+            result.draft.source_ids,
         )
-
-    def _retrieve_multi_chat_documents(
-        self,
-        session_id: str,
-        query: str,
-    ) -> list[RetrievedDocument]:
-        logger.info("Chat retrieval started session_id=%s", session_id)
-        documents = self._rag_service.retrieve_for_session(
-            session_id=session_id,
-            query=query,
-            limit=DEFAULT_RETRIEVAL_LIMIT,
-        )
-        logger.info(
-            "Chat documents retrieved session_id=%s count=%s",
-            session_id,
-            len(documents),
-        )
-        return documents
-
-    def _generate_multi_chat_draft(
-        self,
-        session_id: str,
-        query: str,
-        documents: list[RetrievedDocument],
-    ) -> GroundedChatDraft:
-        return asyncio.run(
-            self._multi_chat_agent.run(
-                session_id=session_id,
-                query=query,
-                retrieved_documents=documents,
-            )
-        )
-
-    def _ground_multi_chat_draft(
-        self,
-        query: str,
-        documents: list[RetrievedDocument],
-        draft: GroundedChatDraft,
-    ) -> GroundedChatDraft:
-        guarded = self._output_guardrail.validate(
-            query=query,
-            retrieved_documents=documents,
-            draft=draft,
-        )
-        logger.info("Chat response guarded")
-        return guarded
 
     def _chat_with_single_agent(
         self,
@@ -638,39 +646,169 @@ class BusinessIntelligenceService:
             response=dashboard_response.model_dump(mode="json"),
         )
 
+    def _persist_pipeline_execution(
+        self,
+        session: DatasetRecord,
+        content: bytes,
+        execution: PipelineExecution,
+    ) -> DashboardResponse:
+        """Persist dashboard, RAG state, and dataset status exactly once."""
+        response = execution.response
+        rag_status = "failed"
+
+        if self.settings.bi_pipeline_mode == "multi":
+            workflow = dict(execution.workflow or {})
+            retrieval_failed = (
+                response.status == "failed"
+                or "retrieval_preparation"
+                in set(workflow.get("failed_agents") or [])
+            )
+            if retrieval_failed:
+                indexing_result = {
+                    "status": "failed",
+                    "document_count": len(execution.retrieval_documents or []),
+                    "indexed_count": 0,
+                    "failed_count": len(execution.retrieval_documents or []),
+                    "message": "Retrieval indexing was skipped because the workflow failed.",
+                }
+            else:
+                indexing_result = self._rag_service.index_documents(
+                    session_id=session.id,
+                    dataset_id=session.id,
+                    retrieval_documents=list(execution.retrieval_documents or []),
+                )
+
+            rag_status = (
+                "ready"
+                if indexing_result.get("status") == "success"
+                else "failed"
+            )
+            if rag_status == "failed" and response.status != "failed":
+                response = response.model_copy(
+                    update={
+                        "status": "partial",
+                        "warnings": [
+                            *response.warnings,
+                            ApiMessage(
+                                code="RAG_INDEXING_FAILED",
+                                message=(
+                                    "The dashboard was generated, but retrieval "
+                                    "indexing could not be completed."
+                                ),
+                                component="rag",
+                                recoverable=True,
+                            ),
+                        ],
+                    }
+                )
+
+            workflow.update(
+                {
+                    "session_id": session.id,
+                    "dataset_id": session.id,
+                    "workflow_status": response.status,
+                    "retrieval_indexing_result": indexing_result,
+                }
+            )
+            self._save_workflow_dashboard(session.id, response, workflow)
+        else:
+            rag_status = "ready" if self._try_index_rag(session, content) else "failed"
+            self._save_dashboard(session.id, response)
+
+        self.storage.update_dataset_status(
+            session.id,
+            status="failed" if response.status == "failed" else "ready",
+            rag_status=rag_status,
+            error_message=(
+                "Business intelligence pipeline failed."
+                if response.status == "failed"
+                else "Retrieval indexing failed."
+                if rag_status == "failed"
+                else None
+            ),
+        )
+        return response
+
+    def _save_workflow_dashboard(
+        self,
+        dataset_id: str,
+        response: DashboardResponse,
+        workflow: dict[str, Any],
+    ) -> None:
+        generic_cleaning_report = self._persistent_cleaning_report(
+            workflow.get("generic_cleaning_report")
+        )
+        prepared_dataset = self._persistent_prepared_dataset(
+            workflow.get("prepared_dataset")
+        )
+        persistent_workflow = dict(workflow)
+        persistent_workflow["generic_cleaning_report"] = generic_cleaning_report
+        persistent_workflow["prepared_dataset"] = prepared_dataset
+
+        self.storage.save_session_processing(
+            dataset_id=dataset_id,
+            workflow_status=response.status,
+            generic_cleaning_report=generic_cleaning_report,
+            prepared_dataset=prepared_dataset,
+        )
+
+        stored_response = response.model_dump(mode="json")
+        stored_response["workflow"] = {
+            key: value
+            for key, value in persistent_workflow.items()
+            if key != "dashboard_output"
+        }
+        stored_response["workflow"]["dashboard_output"] = stored_response.copy()
+        stored_response["workflow"]["dashboard_output"].pop("workflow", None)
+        self.storage.save_dashboard(
+            dataset_id=dataset_id,
+            status=response.status,
+            response=stored_response,
+        )
+
+    @staticmethod
+    def _persistent_cleaning_report(value: Any) -> dict[str, Any]:
+        report = dict(value) if isinstance(value, dict) else {}
+        report.pop("cleaned_file_path", None)
+        return report
+
+    @classmethod
+    def _persistent_prepared_dataset(cls, value: Any) -> dict[str, Any]:
+        prepared = dict(value) if isinstance(value, dict) else {}
+        prepared.pop("prepared_file_path", None)
+        prepared.pop("temporal_dataset_path", None)
+        cleaning_report = prepared.get("cleaning_report")
+        if isinstance(cleaning_report, dict):
+            prepared["cleaning_report"] = cls._persistent_cleaning_report(
+                cleaning_report
+            )
+        return prepared
+
     def _try_index_rag(
         self,
         dataset: DatasetRecord,
         content: bytes,
-    ) -> None:
+    ) -> bool:
         try:
-            self.storage.update_dataset_status(dataset.id, rag_status="indexing")
-
             from app.agents.single.business_intelligence_agent import (
                 business_intelligence_agent,
             )
-            from app.rag.rag_service import rag_service
 
             with self._temporary_agent_input(dataset, content) as agent_input:
                 profile = business_intelligence_agent.profile_for_session(agent_input)
-                rag_service.index_dataset(
+                self._rag_service.index_dataset(
                     agent_input=agent_input,
                     profile=profile,
                     force=True,
                 )
-
-            self.storage.update_dataset_status(dataset.id, rag_status="ready")
-        except Exception as error:
+            return True
+        except Exception:
             logger.warning(
                 "Recoverable RAG indexing failure session_id=%s operation=index_rag",
                 dataset.id,
                 exc_info=True,
             )
-            self.storage.update_dataset_status(
-                dataset.id,
-                rag_status="failed",
-                error_message=self._safe_error(error),
-            )
+            return False
 
     def _chat_with_agent(
         self,

@@ -7,7 +7,7 @@ from typing import Any, TypeVar
 from groq import AsyncGroq
 from pydantic import BaseModel
 
-from app.core.agent_models import AgentModelPolicy
+from app.core.config import AgentModelPolicy
 
 
 StructuredModel = TypeVar("StructuredModel", bound=BaseModel)
@@ -44,6 +44,8 @@ async def request_structured(
     temperature: float,
 ) -> StructuredModel:
     """Request one compact structured completion and validate it once."""
+    if policy.provider != "groq":
+        raise ValueError(f"No structured-output adapter is registered for {policy.provider!r}.")
     response_format: dict[str, Any]
     if policy.strict_json_schema:
         response_format = {

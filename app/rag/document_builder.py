@@ -8,14 +8,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from app.rag.config import (
-    CHUNK_OVERLAP,
-    CHUNK_SIZE,
-    MAX_COLUMNS_PER_ROW_DOCUMENT,
-    MAX_ROW_BATCH_DOCUMENTS,
-    ROWS_PER_BATCH_DOCUMENT,
-)
+from app.core.config import get_rag_config
 from app.rag.models import RagDocument
+
+
+_CHUNKING_POLICY = get_rag_config().chunking
 
 
 class DatasetDocumentBuilder:
@@ -92,7 +89,7 @@ class DatasetDocumentBuilder:
         chunks: list[RagDocument] = []
         for document in documents:
             content = document.page_content.strip()
-            if len(content) <= CHUNK_SIZE:
+            if len(content) <= _CHUNKING_POLICY.size:
                 chunks.append(document)
                 continue
 
@@ -102,7 +99,7 @@ class DatasetDocumentBuilder:
             chunk_index = 0
             for line in lines:
                 projected = current_length + len(line) + 1
-                if current and projected > CHUNK_SIZE:
+                if current and projected > _CHUNKING_POLICY.size:
                     chunks.append(
                         RagDocument(
                             page_content="\n".join(current).strip(),
@@ -414,8 +411,11 @@ class DatasetDocumentBuilder:
             return []
         columns = self._unique_keep_order(
             [*( [date_field] if date_field else [] ), *dimensions, *measures, *[str(column) for column in df.columns]]
-        )[:MAX_COLUMNS_PER_ROW_DOCUMENT]
-        max_rows = MAX_ROW_BATCH_DOCUMENTS * ROWS_PER_BATCH_DOCUMENT
+        )[:_CHUNKING_POLICY.max_columns_per_row_document]
+        max_rows = (
+            _CHUNKING_POLICY.max_row_batch_documents
+            * _CHUNKING_POLICY.rows_per_batch_document
+        )
         sample_size = min(len(df), max_rows)
         indices = (
             sorted(set(np.linspace(0, len(df) - 1, sample_size, dtype=int).tolist()))
@@ -423,8 +423,15 @@ class DatasetDocumentBuilder:
             else []
         )
         output: list[RagDocument] = []
-        for batch_start in range(0, len(indices), ROWS_PER_BATCH_DOCUMENT):
-            batch_indices = indices[batch_start : batch_start + ROWS_PER_BATCH_DOCUMENT]
+        for batch_start in range(
+            0,
+            len(indices),
+            _CHUNKING_POLICY.rows_per_batch_document,
+        ):
+            batch_indices = indices[
+                batch_start : batch_start
+                + _CHUNKING_POLICY.rows_per_batch_document
+            ]
             if not batch_indices:
                 continue
             lines = [
@@ -559,7 +566,7 @@ class DatasetDocumentBuilder:
         overlap: list[str] = []
         total = 0
         for line in reversed(lines):
-            if total + len(line) > CHUNK_OVERLAP:
+            if total + len(line) > _CHUNKING_POLICY.overlap:
                 break
             overlap.insert(0, line)
             total += len(line) + 1
