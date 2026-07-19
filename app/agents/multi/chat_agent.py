@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 import logging
-import os
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.core.config import agent_model_policy, get_rag_config
-from app.core.groq_structured import request_structured
+from app.core.llm import request_structured
 from app.core.prompts import render_agent_prompts
 from app.rag.models import RetrievedDocument
 
@@ -89,14 +88,11 @@ def _validated_source_ids(
     return output
 
 
-async def _request_groq_draft(
+async def _request_draft(
     query: str,
     context: str,
     history: list[dict[str, str]],
 ) -> GroundedChatDraft:
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY is missing.")
     prompts = render_agent_prompts(
         "multi/chat",
         payload={
@@ -106,11 +102,9 @@ async def _request_groq_draft(
         },
     )
     return await request_structured(
-        api_key=api_key,
         policy=agent_model_policy("chat"),
         response_model=GroundedChatDraft,
         schema_name="grounded_chat_draft",
-        temperature=0.1,
         messages=[
             {"role": "system", "content": prompts.system},
             {"role": "user", "content": prompts.user},
@@ -141,7 +135,7 @@ class ChatAgent:
             )
 
         try:
-            draft = await _request_groq_draft(
+            draft = await _request_draft(
                 query,
                 _compact_context(documents),
                 history or [],

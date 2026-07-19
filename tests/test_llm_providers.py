@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from pydantic import BaseModel
+
+import app.core.llm as llm_module
+from app.core.config import AgentModelPolicy
+from app.core.llm import (
+    OPENROUTER_BASE_URL,
+    ProviderConfigurationError,
+    create_chat_model,
+    request_structured,
+)
+
+
+class StructuredAnswer(BaseModel):
+    answer: str
+
+
+def _policy(provider: str) -> AgentModelPolicy:
+    return AgentModelPolicy(
+        provider=provider,  # type: ignore[arg-type]
+        model="provider/model",
+        temperature=0.2,
+        max_completion_tokens=321,
+        reasoning_effort="low",
+        strict_json_schema=True,
+    )
+
+
+def _completion(content: str = '{"answer":"ok"}') -> Any:
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+    )
+
+
+def test_groq_structured_requests_keep_the_existing_request_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class Completions:
+        async def create(self, **request: Any) -> Any:
+            captured["request"] = request
+            return _completion()
+
+    class FakeAsyncGroq:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["client"] = kwargs
+            self.chat = SimpleNamespace(completions=Completions())
+
+    monkeypatch.setenv("GROQ_API_KEY", "groq-secret")
+    monkeypatch.setattr(llm_module, "AsyncGroq", FakeAsyncGroq)
+
+    result = asyncio.run(
+        request_structured(
+            policy=_policy("groq"),
+            response_model=StructuredAnswer,
+            schema_name="structured_answer",
+            messages=[{"role": "user", "content": "Answer"}],
+        )
+    )
+
+    assert result == StructuredAnswer(answer="ok")
+    assert captured["client"] == {"api_key": "groq-secret"}
+    request = captured["request"]
+    assert request["model"] == "provider/model"
+    assert request["temperature"] == 0.2
+    assert request["max_completion_tokens"] == 321
+    assert request["reasoning_effort"] == "low"
+    assert "max_tokens" not in request
+    assert request["response_format"]["type"] == "json_schema"
+    schema = request["response_format"]["json_schema"]["schema"]
+    assert schema["required"] == ["answer"]
+    assert schema["additionalProperties"] is False
+
+
+def test_openrouter_uses_its_endpoint_and_normalized_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class Completions:
+        async def create(self, **request: Any) -> Any:
+            captured["request"] = request
+            return _completion()
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["client"] = kwargs
+            self.chat = SimpleNamespace(completions=Completions())
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setattr(llm_module, "AsyncOpenAI", FakeAsyncOpenAI)
+
+    result = asyncio.run(
+        request_structured(
+            policy=_policy("openrouter"),
+            response_model=StructuredAnswer,
+            schema_name="structured_answer",
+            messages=[{"role": "user", "content": "Answer"}],
+        )
+    )
+
+    assert result == StructuredAnswer(answer="ok")
+    assert captured["client"] == {
+        "api_key": "openrouter-secret",
+        "base_url": OPENROUTER_BASE_URL,
+        "timeout": 120,
+        "max_retries": 1,
+    }
+    request = captured["request"]
+    assert request["max_tokens"] == 321
+    assert "max_completion_tokens" not in request
+    assert request["extra_body"] == {
+        "provider": {"require_parameters": True},
+        "reasoning": {"effort": "low"},
+    }
+
+
+def test_chat_model_factory_dispatches_from_the_agent_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, dict[str, Any]] = {}
+    groq_model = object()
+    openrouter_model = object()
+
+    def fake_groq(**kwargs: Any) -> object:
+        captured["groq"] = kwargs
+        return groq_model
+
+    def fake_openrouter(**kwargs: Any) -> object:
+        captured["openrouter"] = kwargs
+        return openrouter_model
+
+    monkeypatch.setenv("GROQ_API_KEY", "groq-secret")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setattr(llm_module, "ChatGroq", fake_groq)
+    monkeypatch.setattr(llm_module, "ChatOpenAI", fake_openrouter)
+
+    assert create_chat_model(_policy("groq")) is groq_model
+    assert create_chat_model(_policy("openrouter")) is openrouter_model
+
+    assert captured["groq"]["max_tokens"] == 321
+    assert captured["groq"]["reasoning_effort"] == "low"
+    assert captured["openrouter"]["base_url"] == OPENROUTER_BASE_URL
+    assert "default_headers" not in captured["openrouter"]
+    assert captured["openrouter"]["max_completion_tokens"] == 321
+    assert captured["openrouter"]["extra_body"]["reasoning"] == {"effort": "low"}
+
+
+def test_only_the_selected_provider_credential_is_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("GROQ_API_KEY", "groq-secret")
+
+    with pytest.raises(ProviderConfigurationError, match="OPENROUTER_API_KEY"):
+        create_chat_model(_policy("openrouter"))

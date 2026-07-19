@@ -57,7 +57,34 @@ TOON bundle in `app/prompts/`; the backend validates the bundle at startup and
 serializes its structured system and user context as TOON before invocation.
 Mode and model settings are deliberately not read from `.env`.
 The `[forecasting]` table configures the TimesFM model and its limits.
-Keep `GROQ_API_KEY`, Supabase credentials, and other secrets in `.env` only.
+Keep API keys, Supabase credentials, and other secrets in `.env` only.
+
+## LLM providers
+
+Groq remains the checked-in default. Every LLM agent can independently select
+`groq` or `openrouter` in `config/agents.toml`, so the pipeline can use one
+provider throughout or mix providers by workload:
+
+```toml
+[agents.chat]
+provider = "openrouter"
+model = "openai/gpt-oss-120b"
+temperature = 0.1
+max_completion_tokens = 600
+reasoning_effort = "low"
+strict_json_schema = true
+```
+
+Use a model identifier available from the selected provider. Configure only
+the credentials needed by the active policies:
+
+```dotenv
+GROQ_API_KEY=your-groq-api-key
+OPENROUTER_API_KEY=your-openrouter-api-key
+```
+
+Changing `provider` does not change the agent prompts, response schemas,
+deterministic validation, fallback behavior, or API contracts.
 
 The multi-agent analysis flow is:
 

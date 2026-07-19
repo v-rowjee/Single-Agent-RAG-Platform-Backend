@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,15 +12,15 @@ import pandas as pd
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableLambda
-from langchain_groq import ChatGroq
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field
 
 from app.schemas.business_intelligence import (
     BusinessIntelligenceAgentInput,
     DashboardResponse,
 )
 from app.core.config import agent_model_policy
+from app.core.llm import create_chat_model
 from app.core.prompts import render_agent_prompts
 from app.rag.models import RerankedDocument, RetrievedDocument
 from app.rag.rag_service import compact_profile_for_chat, rag_service
@@ -259,7 +258,7 @@ class BusinessIntelligenceAgent:
                 return {"chat_response": response.strip()}
             except Exception:
                 logger.exception(
-                    "Groq RAG answer generation failed session_id=%s",
+                    "LLM RAG answer generation failed session_id=%s",
                     state["agent_input"].sessionId,
                 )
                 if direct_answer:
@@ -282,41 +281,10 @@ class BusinessIntelligenceAgent:
         if self._dashboard_chain is not None:
             return
 
-        api_key = os.environ.get("GROQ_API_KEY")
-        if not api_key:
-            raise ValueError("GROQ_API_KEY is missing from the environment.")
-
         dashboard_policy = agent_model_policy("single_dashboard")
         chat_policy = agent_model_policy("single_chat")
-        if dashboard_policy.provider != "groq" or chat_policy.provider != "groq":
-            raise ValueError("The single-agent workflow currently supports only Groq.")
-
-        llm = ChatGroq(
-            model=dashboard_policy.model,
-            api_key=SecretStr(api_key),
-            temperature=dashboard_policy.temperature,
-            max_tokens=dashboard_policy.max_completion_tokens,
-            timeout=120,
-            max_retries=1,
-            model_kwargs=(
-                {"reasoning_effort": dashboard_policy.reasoning_effort}
-                if dashboard_policy.reasoning_effort is not None
-                else {}
-            ),
-        )
-        chat_llm = ChatGroq(
-            model=chat_policy.model,
-            api_key=SecretStr(api_key),
-            temperature=chat_policy.temperature,
-            max_tokens=chat_policy.max_completion_tokens,
-            timeout=120,
-            max_retries=1,
-            model_kwargs=(
-                {"reasoning_effort": chat_policy.reasoning_effort}
-                if chat_policy.reasoning_effort is not None
-                else {}
-            ),
-        )
+        llm = create_chat_model(dashboard_policy)
+        chat_llm = create_chat_model(chat_policy)
 
         self._dashboard_chain = RunnableLambda(
             lambda values: self._prompt_value(

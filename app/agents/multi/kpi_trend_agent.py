@@ -1,8 +1,7 @@
-"""KPI and trend specialist.  Groq chooses definitions; pandas calculates values."""
+"""KPI and trend specialist. The LLM plans definitions; pandas calculates values."""
 from __future__ import annotations
 
 import math
-import os
 import re
 from pathlib import Path
 from typing import Any, Literal
@@ -19,7 +18,7 @@ from app.services.series import (
     selected_granularity,
 )
 from app.core.config import agent_model_policy
-from app.core.groq_structured import request_structured
+from app.core.llm import request_structured
 from app.core.prompts import render_agent_prompts
 
 MAX_KPIS = 8
@@ -132,20 +131,15 @@ def _planning_payload(prepared: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _request_groq_plan(prepared: dict[str, Any]) -> KPITrendPlan:
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
-    if not api_key:
-        raise KPITrendError("GROQ_API_KEY is missing.")
+async def _request_plan(prepared: dict[str, Any]) -> KPITrendPlan:
     prompts = render_agent_prompts(
         "multi/kpi_trend",
         payload=_planning_payload(prepared),
     )
     return await request_structured(
-        api_key=api_key,
         policy=agent_model_policy("kpi_trend"),
         response_model=KPITrendPlan,
         schema_name="kpi_trend_plan",
-        temperature=0.1,
         messages=[
             {"role": "system", "content": prompts.system},
             {"role": "user", "content": prompts.user},
@@ -177,7 +171,7 @@ def _fallback_plan(prepared: dict[str, Any], df: pd.DataFrame) -> KPITrendPlan:
     trends = []
     if primary and date:
         trends.append(TrendDefinition(id=f"trend_{_slug(primary.measure)}_{primary.granularity}", title=f"{primary.granularity.title()} {primary.measure.replace('_', ' ').title()}", measure=primary.measure, aggregation=primary.aggregation, date_column=date, granularity=primary.granularity))
-    return KPITrendPlan(kpis=kpis, trends=trends, limitations=["Deterministic planning was used because Groq planning was unavailable or invalid."])
+    return KPITrendPlan(kpis=kpis, trends=trends, limitations=["Deterministic planning was used because LLM planning was unavailable or invalid."])
 
 
 def _valid_plan(plan: KPITrendPlan, df: pd.DataFrame, prepared: dict[str, Any]) -> tuple[KPITrendPlan, list[str]]:
@@ -410,10 +404,10 @@ class KPITrendAgent:
         if df.empty: return KPITrendOutput(status="partial", limitations=["Prepared dataset contains no rows."])
         warnings: list[str] = []
         try:
-            proposed = await _request_groq_plan(prepared_dataset)
+            proposed = await _request_plan(prepared_dataset)
             plan, validation_warnings = _valid_plan(proposed, df, prepared_dataset)
             warnings.extend(validation_warnings)
-            if not plan.kpis and not plan.trends: raise KPITrendError("Groq plan has no valid definitions.")
+            if not plan.kpis and not plan.trends: raise KPITrendError("LLM plan has no valid definitions.")
         except Exception as exc:
             warnings.append(f"{exc}")
             plan = _fallback_plan(prepared_dataset, df)

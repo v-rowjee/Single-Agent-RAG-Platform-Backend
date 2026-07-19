@@ -134,7 +134,7 @@ def test_kpis_use_latest_period_and_percentage_change(
         raise RuntimeError("offline test")
 
     monkeypatch.setattr(
-        "app.agents.multi.kpi_trend_agent._request_groq_plan",
+        "app.agents.multi.kpi_trend_agent._request_plan",
         no_llm,
     )
     result = asyncio.run(KPITrendAgent().run(prepared))
@@ -257,7 +257,7 @@ def test_dashboard_has_non_temporal_charts_forecast_and_actions(
     async def no_layout(_: dict[str, Any]):
         raise RuntimeError("offline test")
 
-    monkeypatch.setattr(dashboard_module, "_request_groq_layout", no_layout)
+    monkeypatch.setattr(dashboard_module, "_request_layout", no_layout)
     result = asyncio.run(
         DashboardGenerationAgent().run(
             prepared,

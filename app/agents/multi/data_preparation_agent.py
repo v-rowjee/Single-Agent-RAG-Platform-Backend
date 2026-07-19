@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import re
 from enum import Enum
 from pathlib import Path
@@ -18,8 +17,8 @@ from app.services.series import (
     infer_time_granularity,
     temporal_period_count,
 )
-from app.core.config import agent_model_policy
-from app.core.groq_structured import request_structured
+from app.core.config import AgentProvider, agent_model_policy
+from app.core.llm import provider_display_name, request_structured
 from app.core.prompts import render_agent_prompts
 
 
@@ -177,7 +176,7 @@ class PreparationPlan(StrictModel):
 
 
 class PreparationReport(StrictModel):
-    plan_source: Literal["groq", "fallback"]
+    plan_source: AgentProvider | Literal["fallback"]
     executed_transformations: list[str] = Field(default_factory=list)
     rejected_transformations: list[str] = Field(default_factory=list)
     excluded_from_measure_analysis: dict[str, int] = Field(default_factory=dict)
@@ -642,18 +641,14 @@ def _guess_time_granularity(profile: DatasetProfile, date_column: str | None) ->
     return "day"
 
 
-# 7. Groq preparation planning
+# 7. LLM preparation planning
 
 
 def _compact_profile_payload(profile: DatasetProfile) -> dict[str, Any]:
     return profile.model_dump(mode="json", exclude_none=True)
 
 
-async def _request_groq_plan(profile: DatasetProfile) -> PreparationPlan:
-    api_key = os.environ.get("GROQ_API_KEY", "").strip()
-    if not api_key:
-        raise DataPreparationError("GROQ_API_KEY is missing from the environment.")
-
+async def _request_plan(profile: DatasetProfile) -> PreparationPlan:
     prompts = render_agent_prompts(
         "multi/data_preparation",
         supported_operations=sorted(SUPPORTED_OPERATIONS),
@@ -661,11 +656,9 @@ async def _request_groq_plan(profile: DatasetProfile) -> PreparationPlan:
         profile=_compact_profile_payload(profile),
     )
     return await request_structured(
-        api_key=api_key,
         policy=agent_model_policy("data_preparation"),
         response_model=PreparationPlan,
         schema_name="data_preparation_plan",
-        temperature=0.1,
         messages=[
             {"role": "system", "content": prompts.system},
             {"role": "user", "content": prompts.user},
@@ -673,12 +666,18 @@ async def _request_groq_plan(profile: DatasetProfile) -> PreparationPlan:
     )
 
 
-async def _plan_with_groq_or_fallback(profile: DatasetProfile) -> tuple[PreparationPlan, Literal["groq", "fallback"], list[str]]:
+async def _plan_with_provider_or_fallback(
+    profile: DatasetProfile,
+) -> tuple[PreparationPlan, AgentProvider | Literal["fallback"], list[str]]:
     warnings: list[str] = []
+    policy = agent_model_policy("data_preparation")
     try:
-        return await _request_groq_plan(profile), "groq", warnings
+        return await _request_plan(profile), policy.provider, warnings
     except Exception as error:
-        warnings.append(f"Groq preparation planning failed: {error}")
+        warnings.append(
+            f"{provider_display_name(policy.provider)} preparation planning failed: "
+            f"{error}"
+        )
         warnings.append("Deterministic fallback preparation plan was used.")
         return _fallback_plan(
             profile,
@@ -902,7 +901,7 @@ def _execute_plan(
     df: pd.DataFrame,
     plan: PreparationPlan,
     output_dir: Path,
-    plan_source: Literal["groq", "fallback"],
+    plan_source: AgentProvider | Literal["fallback"],
     validation_warnings: list[str],
     rejected_transformations: list[str],
 ) -> tuple[pd.DataFrame, str | None, PreparationReport]:
@@ -1051,7 +1050,9 @@ class DataPreparationAgent:
         )
 
         profile = _profile_dataset(df, business_description)
-        raw_plan, plan_source, planning_warnings = await _plan_with_groq_or_fallback(profile)
+        raw_plan, plan_source, planning_warnings = (
+            await _plan_with_provider_or_fallback(profile)
+        )
 
         try:
             plan, validation_warnings, rejected = _validate_plan(raw_plan, profile)
@@ -1064,7 +1065,11 @@ class DataPreparationAgent:
         if plan_source == "fallback":
             logger.info("Data preparation using fallback plan session_id=%s", session_id)
         else:
-            logger.info("Data preparation using Groq plan session_id=%s", session_id)
+            logger.info(
+                "Data preparation using %s plan session_id=%s",
+                provider_display_name(plan_source),
+                session_id,
+            )
 
         prepared, temporal_path, preparation_report = _execute_plan(
             df=df,

@@ -1,7 +1,6 @@
 """Validated dashboard assembly from authoritative specialist outputs."""
 from __future__ import annotations
 
-import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +18,7 @@ from app.services.series import (
     value_format_for_measure,
 )
 from app.core.config import agent_model_policy
-from app.core.groq_structured import request_structured
+from app.core.llm import request_structured
 from app.core.prompts import render_agent_prompts
 from app.schemas.business_intelligence import DashboardResponse
 
@@ -157,19 +156,14 @@ def _chart_candidates(
     }
 
 
-async def _request_groq_layout(
+async def _request_layout(
     payload: dict[str, Any],
 ) -> DashboardLayoutPlan:
-    key = os.getenv("GROQ_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("GROQ_API_KEY is missing.")
     prompts = render_agent_prompts("multi/dashboard_generation", payload=payload)
     return await request_structured(
-        api_key=key,
         policy=agent_model_policy("dashboard_generation"),
         response_model=DashboardLayoutPlan,
         schema_name="dashboard_layout_plan",
-        temperature=0.2,
         messages=[
             {"role": "system", "content": prompts.system},
             {"role": "user", "content": prompts.user},
@@ -1250,7 +1244,7 @@ class DashboardGenerationAgent:
             "chart_candidates": _chart_candidates(prepared, df),
         }
         try:
-            plan = await _request_groq_layout(payload)
+            plan = await _request_layout(payload)
         except Exception as exc:
             plan = fallback
             warning = f"Deterministic dashboard layout was used: {exc}"

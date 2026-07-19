@@ -105,6 +105,21 @@ def test_invalid_agent_provider_and_model_are_rejected(tmp_path: Path) -> None:
         load_runtime_config(config_path)
 
 
+def test_openrouter_can_be_selected_per_agent(tmp_path: Path) -> None:
+    content = CONFIG_PATH.read_text(encoding="utf-8").replace(
+        'provider = "groq"',
+        'provider = "openrouter"',
+        1,
+    )
+    config_path = tmp_path / "agents.toml"
+    config_path.write_text(content, encoding="utf-8")
+
+    config = load_runtime_config(config_path)
+
+    assert config.agents["data_preparation"].provider == "openrouter"
+    assert config.agents["kpi_trend"].provider == "groq"
+
+
 def test_prompt_bundles_validate_and_render_structured_toon() -> None:
     expected_bundles = {
         "multi/anomaly_detection.toon",

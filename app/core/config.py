@@ -7,13 +7,14 @@ import tomllib
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, cast
 
 from dotenv import load_dotenv
 
 PipelineMode = Literal["single", "multi"]
+AgentProvider = Literal["groq", "openrouter"]
 ReasoningEffort = Literal["none", "low", "medium", "high"] | None
-SUPPORTED_PROVIDERS = frozenset({"groq"})
+SUPPORTED_PROVIDERS: frozenset[AgentProvider] = frozenset({"groq", "openrouter"})
 REQUIRED_AGENT_KEYS = frozenset(
     {
         "data_preparation",
@@ -40,7 +41,7 @@ class RuntimeConfigurationError(ValueError):
 
 @dataclass(frozen=True)
 class AgentModelPolicy:
-    provider: str
+    provider: AgentProvider
     model: str
     temperature: float
     max_completion_tokens: int
@@ -172,7 +173,7 @@ def _agent_policy(name: str, values: Any) -> AgentModelPolicy:
         )
 
     return AgentModelPolicy(
-        provider=provider,
+        provider=cast(AgentProvider, provider),
         model=_text(table.get("model"), f"agents.{name}.model"),
         temperature=float(
             _number(table.get("temperature"), f"agents.{name}.temperature")
