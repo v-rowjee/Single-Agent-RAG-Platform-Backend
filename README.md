@@ -11,6 +11,11 @@ Copy `.env.sample` to `.env` and set the Supabase service-role key. Apply
 recreates application data tables, creates a profile for each Supabase Auth
 account, and leaves the Supabase-managed `auth.users` records intact.
 
+For an existing single-dataset installation, apply
+`scripts/migrate_multi_dataset_sessions.sql` instead. It retains existing
+records and stored files, marks those legacy workspaces as reset-required, and
+lets each owner remove them through Start Over before uploading a new batch.
+
 For an existing database created with an earlier version, apply
 `scripts/migrate_atomic_rag_index.sql` once. It installs the transactional
 vector-index replacement function without deleting existing application data.
@@ -19,6 +24,12 @@ All `/api/upload`, `/api/dashboard/{session_id}`, `/api/chat`, and
 `/api/chat/{session_id}/history` requests require an `Authorization: Bearer
 <Supabase access JWT>` header. The backend validates the JWT and returns data
 only when the session belongs to its authenticated user.
+
+`POST /api/upload` accepts one to five repeated multipart `files` fields.
+Different schemas are prepared independently and synthesized into one
+session-scoped dashboard and retrieval index. `GET /api/dataset` returns the
+workspace plus its `datasets[]`; previews use
+`GET /api/dataset/preview?dataset_id=<uuid>&page=1&page_size=50`.
 
 ## Pipeline mode
 

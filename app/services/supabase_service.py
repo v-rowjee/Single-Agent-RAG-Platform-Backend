@@ -22,6 +22,19 @@ class SupabaseUnavailableError(Exception):
 
 
 @dataclass(frozen=True)
+class AnalysisSessionRecord:
+    id: str
+    user_id: str
+    description: str | None
+    status: str
+    rag_status: str
+    error_message: str | None
+    requires_reset: bool = False
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass(frozen=True)
 class DatasetRecord:
     id: str
     user_id: str
@@ -34,6 +47,7 @@ class DatasetRecord:
     status: str
     rag_status: str
     error_message: str | None
+    session_id: str | None = None
     row_count: int | None = None
     column_count: int | None = None
     created_at: str | None = None
@@ -135,6 +149,7 @@ class SupabaseService:
         description: str | None,
         row_count: int,
         column_count: int,
+        session_id: str | None = None,
     ) -> DatasetRecord:
         payload: JsonDict = {
             "id": dataset_id,
@@ -151,6 +166,8 @@ class SupabaseService:
             "row_count": row_count,
             "column_count": column_count,
         }
+        if session_id is not None:
+            payload["session_id"] = session_id
         table = self.client.table("datasets")
         try:
             response = table.insert(payload).execute()
@@ -176,6 +193,102 @@ class SupabaseService:
             raise SupabaseUnavailableError("Dataset insert returned no row.")
         return self._dataset(rows[0])
 
+    def create_session(
+        self,
+        session_id: str,
+        user_id: str,
+        description: str | None,
+        *,
+        requires_reset: bool = False,
+    ) -> AnalysisSessionRecord:
+        response = (
+            self.client.table("analysis_sessions")
+            .insert(
+                {
+                    "id": session_id,
+                    "user_id": user_id,
+                    "description": description,
+                    "status": "processing",
+                    "rag_status": "pending",
+                    "error_message": None,
+                    "requires_reset": requires_reset,
+                }
+            )
+            .execute()
+        )
+        rows = list(response.data or [])
+        if not rows:
+            raise SupabaseUnavailableError("Analysis-session insert returned no row.")
+        return self._session(rows[0])
+
+    def get_session(
+        self,
+        session_id: str,
+        user_id: str,
+    ) -> AnalysisSessionRecord | None:
+        response = (
+            self.client.table("analysis_sessions")
+            .select("*")
+            .eq("id", session_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        rows = list(response.data or [])
+        return self._session(rows[0]) if rows else None
+
+    def get_active_session(self, user_id: str) -> AnalysisSessionRecord | None:
+        response = (
+            self.client.table("analysis_sessions")
+            .select("*")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        rows = list(response.data or [])
+        return self._session(rows[0]) if rows else None
+
+    def get_session_datasets(
+        self,
+        session_id: str,
+        user_id: str,
+    ) -> list[DatasetRecord]:
+        response = (
+            self.client.table("datasets")
+            .select("*")
+            .eq("session_id", session_id)
+            .eq("user_id", user_id)
+            .order("created_at")
+            .execute()
+        )
+        return [self._dataset(row) for row in list(response.data or [])]
+
+    def delete_session(self, session_id: str, user_id: str) -> None:
+        self.client.table("analysis_sessions").delete().eq("id", session_id).eq(
+            "user_id",
+            user_id,
+        ).execute()
+
+    def update_session_status(
+        self,
+        session_id: str,
+        status: DatasetStatus | None = None,
+        rag_status: RagStatus | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        payload: JsonDict = {}
+        if status is not None:
+            payload["status"] = status
+        if rag_status is not None:
+            payload["rag_status"] = rag_status
+        if error_message is not None or status != "failed":
+            payload["error_message"] = error_message
+        if payload:
+            self.client.table("analysis_sessions").update(payload).eq(
+                "id",
+                session_id,
+            ).execute()
+
     def get_dataset(self, dataset_id: str, user_id: str) -> DatasetRecord | None:
         response = (
             self.client.table("datasets")
@@ -189,6 +302,10 @@ class SupabaseService:
         return self._dataset(rows[0]) if rows else None
 
     def get_active_dataset(self, user_id: str) -> DatasetRecord | None:
+        session = self.get_active_session(user_id)
+        if session is not None:
+            datasets = self.get_session_datasets(session.id, user_id)
+            return datasets[0] if datasets else None
         response = (
             self.client.table("datasets")
             .select("*")
@@ -230,14 +347,14 @@ class SupabaseService:
         response: JsonDict,
     ) -> DashboardRecord:
         payload: JsonDict = {
-            "dataset_id": dataset_id,
+            "session_id": dataset_id,
             "status": status,
             "response": response,
             "generated_at": self._now(),
         }
         result = (
             self.client.table("dashboards")
-            .upsert(payload, on_conflict="dataset_id")
+            .upsert(payload, on_conflict="session_id")
             .execute()
         )
         rows = list(result.data or [])
@@ -252,7 +369,7 @@ class SupabaseService:
         response = (
             self.client.table("dashboards")
             .select("*")
-            .eq("dataset_id", dataset_id)
+            .eq("session_id", dataset_id)
             .limit(1)
             .execute()
         )
@@ -267,7 +384,7 @@ class SupabaseService:
         sources: list[str] | None = None,
     ) -> MessageRecord:
         payload: JsonDict = {
-            "dataset_id": dataset_id,
+            "session_id": dataset_id,
             "role": role,
             "content": content,
             "sources": sources or [],
@@ -286,7 +403,7 @@ class SupabaseService:
         response = (
             self.client.table("messages")
             .select("*")
-            .eq("dataset_id", dataset_id)
+            .eq("session_id", dataset_id)
             .order("created_at", desc=True)
             .limit(limit)
             .execute()
@@ -302,14 +419,14 @@ class SupabaseService:
         prepared_dataset: JsonDict,
     ) -> SessionProcessingRecord:
         payload: JsonDict = {
-            "dataset_id": dataset_id,
+            "session_id": dataset_id,
             "workflow_status": workflow_status,
             "generic_cleaning_report": generic_cleaning_report,
             "prepared_dataset": prepared_dataset,
         }
         result = (
             self.client.table("session_processing")
-            .upsert(payload, on_conflict="dataset_id")
+            .upsert(payload, on_conflict="session_id")
             .execute()
         )
         rows = list(result.data or [])
@@ -329,7 +446,7 @@ class SupabaseService:
         response = (
             self.client.table("session_processing")
             .select("*")
-            .eq("dataset_id", dataset_id)
+            .eq("session_id", dataset_id)
             .limit(1)
             .execute()
         )
@@ -387,6 +504,25 @@ class SupabaseService:
             raise SupabaseUnavailableError(
                 "Atomic document replacement returned an invalid row count."
             ) from exc
+
+    def replace_session_document_chunks(
+        self,
+        session_id: str,
+        chunks: list[JsonDict],
+    ) -> int:
+        response = self.client.rpc(
+            "replace_session_document_chunks",
+            {
+                "p_session_id": session_id,
+                "p_chunks": chunks,
+            },
+        ).execute()
+        value = response.data
+        if isinstance(value, list) and len(value) == 1:
+            value = value[0]
+        if isinstance(value, dict):
+            value = value.get("replace_session_document_chunks")
+        return int(value)
 
     def _replace_document_chunks_compat(
         self,
@@ -462,6 +598,24 @@ class SupabaseService:
         ).execute()
         return [dict(row) for row in list(response.data or [])]
 
+    def match_session_document_chunks(
+        self,
+        session_id: str,
+        query_embedding: list[float],
+        match_count: int = 12,
+        match_threshold: float = 0.2,
+    ) -> list[JsonDict]:
+        response = self.client.rpc(
+            "match_session_document_chunks",
+            {
+                "p_session_id": session_id,
+                "p_query_embedding": query_embedding,
+                "p_match_count": match_count,
+                "p_match_threshold": match_threshold,
+            },
+        ).execute()
+        return [dict(row) for row in list(response.data or [])]
+
     @staticmethod
     def _dataset(row: JsonDict) -> DatasetRecord:
         return DatasetRecord(
@@ -480,6 +634,11 @@ class SupabaseService:
             error_message=(
                 str(row["error_message"])
                 if row.get("error_message") is not None
+                else None
+            ),
+            session_id=(
+                str(row["session_id"])
+                if row.get("session_id") is not None
                 else None
             ),
             row_count=(
@@ -501,11 +660,35 @@ class SupabaseService:
         )
 
     @staticmethod
+    def _session(row: JsonDict) -> AnalysisSessionRecord:
+        return AnalysisSessionRecord(
+            id=str(row["id"]),
+            user_id=str(row["user_id"]),
+            description=(
+                str(row["description"]) if row.get("description") is not None else None
+            ),
+            status=str(row["status"]),
+            rag_status=str(row["rag_status"]),
+            error_message=(
+                str(row["error_message"])
+                if row.get("error_message") is not None
+                else None
+            ),
+            requires_reset=bool(row.get("requires_reset", False)),
+            created_at=(
+                str(row["created_at"]) if row.get("created_at") is not None else None
+            ),
+            updated_at=(
+                str(row["updated_at"]) if row.get("updated_at") is not None else None
+            ),
+        )
+
+    @staticmethod
     def _dashboard(row: JsonDict) -> DashboardRecord:
         response = row.get("response")
         return DashboardRecord(
             id=str(row["id"]),
-            dataset_id=str(row["dataset_id"]),
+            dataset_id=str(row.get("session_id") or row.get("dataset_id")),
             status=str(row["status"]),
             response=dict(response) if isinstance(response, dict) else {},
             generated_at=(
@@ -523,7 +706,7 @@ class SupabaseService:
         sources = row.get("sources")
         return MessageRecord(
             id=str(row["id"]),
-            dataset_id=str(row["dataset_id"]),
+            dataset_id=str(row.get("session_id") or row.get("dataset_id")),
             role=str(row["role"]),
             content=str(row["content"]),
             sources=[
@@ -541,7 +724,7 @@ class SupabaseService:
         generic_cleaning_report = row.get("generic_cleaning_report")
         prepared_dataset = row.get("prepared_dataset")
         return SessionProcessingRecord(
-            dataset_id=str(row["dataset_id"]),
+            dataset_id=str(row.get("session_id") or row.get("dataset_id")),
             workflow_status=str(row["workflow_status"]),
             generic_cleaning_report=(
                 dict(generic_cleaning_report)

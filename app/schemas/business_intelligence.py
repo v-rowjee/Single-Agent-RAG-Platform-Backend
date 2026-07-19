@@ -21,6 +21,7 @@ Granularity = Literal["day", "week", "month", "quarter", "year"]
 
 class BusinessIntelligenceAgentInput(BaseModel):
     sessionId: str
+    datasetId: str | None = None
     filePath: str
     fileName: str
     description: str | None = None
@@ -180,6 +181,7 @@ class DatasetQuality(BaseModel):
 
 
 class DatasetSummary(BaseModel):
+    datasetId: str = ""
     fileName: str
     rowCount: int = Field(ge=0)
     columnCount: int = Field(ge=0)
@@ -248,9 +250,24 @@ class Dashboard(BaseModel):
         min_length=3,
         max_length=5,
     )
-    datasetSummary: DatasetSummary
+    datasetSummaries: list[DatasetSummary] = Field(min_length=1)
     sections: list[Section]
     layout: DashboardLayout
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_dataset_summaries(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        payload = dict(value)
+        if "datasetSummaries" not in payload and "datasetSummary" in payload:
+            payload["datasetSummaries"] = [payload.pop("datasetSummary")]
+        return payload
+
+    @property
+    def datasetSummary(self) -> DatasetSummary:
+        """Compatibility accessor for code that still reads the first summary."""
+        return self.datasetSummaries[0]
 
 
 class ApiMessage(BaseModel):
@@ -316,16 +333,22 @@ class DashboardResponse(BaseModel):
         return self
 
 
-class ActiveDatasetResponse(BaseModel):
-    sessionId: str = Field(min_length=1)
+class DatasetMetadata(BaseModel):
+    datasetId: str = Field(min_length=1)
     fileName: str = Field(min_length=1)
     fileSize: int = Field(ge=0)
     uploadedAt: str
     rowCount: int = Field(ge=0)
     columnCount: int = Field(ge=0)
+
+
+class ActiveDatasetResponse(BaseModel):
+    sessionId: str = Field(min_length=1)
     analysisStatus: Literal["processing", "ready", "failed"]
     ragStatus: Literal["pending", "indexing", "ready", "failed"]
     originalPrompt: str | None = None
+    requiresReset: bool = False
+    datasets: list[DatasetMetadata] = Field(min_length=1, max_length=5)
 
 
 class DatasetPreviewResponse(BaseModel):

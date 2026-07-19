@@ -37,15 +37,20 @@ class ChatHistoryResponse(BaseModel):
 
 @router.post("/upload")
 async def upload_file(
-    file: UploadFile = File(...),
+    files: list[UploadFile] | None = File(default=None),
+    file: UploadFile | None = File(default=None),
     description: str | None = Form(default=None),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     try:
+        uploaded_files = list(files or [])
+        if file is not None:
+            uploaded_files.append(file)
         return await business_intelligence_service.create_analysis(
-            file=file,
+            files=uploaded_files,
             description=description,
             user_id=current_user.id,
+            legacy_contract=not files and file is not None,
         )
 
     except InvalidUploadError as error:
@@ -68,15 +73,13 @@ async def upload_file(
         ) from error
 
 
-@router.get("/dataset", response_model=ActiveDatasetResponse)
+@router.get("/dataset")
 def get_active_dataset(
     current_user: CurrentUser = Depends(get_current_user),
-) -> ActiveDatasetResponse:
+) -> dict[str, Any]:
     try:
-        return ActiveDatasetResponse(
-            **business_intelligence_service.get_active_dataset_details(
-                current_user.id,
-            )
+        return business_intelligence_service.get_active_dataset_details(
+            current_user.id,
         )
     except SessionNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
@@ -91,6 +94,7 @@ def get_active_dataset(
 
 @router.get("/dataset/preview", response_model=DatasetPreviewResponse)
 def get_dataset_preview(
+    dataset_id: str | None = Query(default=None, min_length=1),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=50),
     current_user: CurrentUser = Depends(get_current_user),
@@ -99,6 +103,7 @@ def get_dataset_preview(
         return DatasetPreviewResponse(
             **business_intelligence_service.get_dataset_preview(
                 current_user.id,
+                dataset_id,
                 page,
                 page_size,
             )
@@ -135,12 +140,23 @@ async def get_dashboard(
     current_user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     try:
-        return (
+        payload = (
             await business_intelligence_service.get_dashboard(
                 session_id,
                 current_user.id,
             )
         ).model_dump(mode="json")
+        dashboard = payload.get("dashboard")
+        if (
+            business_intelligence_service.uses_legacy_contract(session_id)
+            and isinstance(dashboard, dict)
+            and isinstance(dashboard.get("datasetSummaries"), list)
+            and dashboard["datasetSummaries"]
+        ):
+            legacy_summary = dict(dashboard["datasetSummaries"][0])
+            legacy_summary.pop("datasetId", None)
+            dashboard["datasetSummary"] = legacy_summary
+        return payload
 
     except SessionNotFoundError as error:
         raise HTTPException(

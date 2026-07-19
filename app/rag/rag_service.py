@@ -80,31 +80,15 @@ class RagService:
                     vector_size=384,
                 )
 
-            df = load_dataframe(agent_input.filePath)
-            documents = self._builder.build(
-                df=df,
+            retrieval_documents = self.build_dataset_documents(
+                agent_input=agent_input,
                 profile=profile,
-                session_id=agent_input.sessionId,
-                file_name=agent_input.fileName,
+                workspace_session_id=agent_input.sessionId,
             )
             result = self.index_documents(
                 session_id=agent_input.sessionId,
-                dataset_id=agent_input.sessionId,
-                retrieval_documents=[
-                    {
-                        "id": str(
-                            document.metadata.get("source_id")
-                            or f"document_{index}"
-                        ),
-                        "content": document.page_content,
-                        "document_type": str(
-                            document.metadata.get("document_type")
-                            or "dataset_overview"
-                        ),
-                        "metadata": dict(document.metadata),
-                    }
-                    for index, document in enumerate(documents)
-                ],
+                dataset_id=agent_input.datasetId or agent_input.sessionId,
+                retrieval_documents=retrieval_documents,
             )
             if result["status"] != "success":
                 raise RuntimeError(str(result.get("message") or "RAG indexing failed."))
@@ -113,10 +97,50 @@ class RagService:
             return IndexStatus(
                 session_id=agent_input.sessionId,
                 collection_name="document_chunks",
-                document_count=len(documents),
-                chunk_count=int(result.get("chunk_count") or len(documents)),
+                document_count=len(retrieval_documents),
+                chunk_count=int(
+                    result.get("chunk_count") or len(retrieval_documents)
+                ),
                 vector_size=int(result.get("vector_size") or 0),
             )
+
+    def build_dataset_documents(
+        self,
+        agent_input: BusinessIntelligenceAgentInput,
+        profile: dict[str, Any],
+        workspace_session_id: str,
+    ) -> list[dict[str, Any]]:
+        dataset_id = agent_input.datasetId or agent_input.sessionId
+        documents = self._builder.build(
+            df=load_dataframe(agent_input.filePath),
+            profile=profile,
+            session_id=workspace_session_id,
+            file_name=agent_input.fileName,
+        )
+        output: list[dict[str, Any]] = []
+        for index, document in enumerate(documents):
+            metadata = dict(document.metadata)
+            source_id = str(
+                metadata.get("source_id") or f"document_{index}"
+            )
+            metadata.update(
+                {
+                    "session_id": workspace_session_id,
+                    "dataset_id": dataset_id,
+                    "file_name": agent_input.fileName,
+                }
+            )
+            output.append(
+                {
+                    "id": f"{dataset_id}:{source_id}",
+                    "content": document.page_content,
+                    "document_type": str(
+                        metadata.get("document_type") or "dataset_overview"
+                    ),
+                    "metadata": metadata,
+                }
+            )
+        return output
 
     def index_documents(
         self,
@@ -147,7 +171,12 @@ class RagService:
             )
 
             if not chunked_documents:
-                self.storage.replace_document_chunks(dataset_id, [])
+                replace = getattr(
+                    self.storage,
+                    "replace_session_document_chunks",
+                    self.storage.replace_document_chunks,
+                )
+                replace(session_id, [])
                 return {
                     "status": "success",
                     "document_count": 0,
@@ -174,10 +203,13 @@ class RagService:
                 source_ids = document.get("source_ids")
                 if not isinstance(source_ids, list):
                     source_ids = metadata.get("source_ids")
+                source_dataset_id = str(
+                    metadata.get("dataset_id") or dataset_id
+                )
                 metadata.update(
                     {
                         "session_id": session_id,
-                        "dataset_id": dataset_id,
+                        "dataset_id": source_dataset_id,
                         "source_ids": list(source_ids or []),
                         "title": str(
                             document.get("title")
@@ -190,7 +222,8 @@ class RagService:
                 metadata["chunk_index"] = chunk_index
                 rows.append(
                     {
-                        "dataset_id": dataset_id,
+                        "session_id": session_id,
+                        "dataset_id": source_dataset_id,
                         "source_id": source_id,
                         "document_type": str(
                             document.get("document_type")
@@ -204,7 +237,12 @@ class RagService:
                     }
                 )
 
-            replaced_count = self.storage.replace_document_chunks(dataset_id, rows)
+            replace = getattr(
+                self.storage,
+                "replace_session_document_chunks",
+                self.storage.replace_document_chunks,
+            )
+            replaced_count = replace(session_id, rows)
             if replaced_count != len(rows):
                 raise ValueError(
                     "Atomic retrieval replacement returned an unexpected row count."
@@ -306,12 +344,25 @@ class RagService:
                 session_id,
                 session_id,
             )
-            rows = self.storage.match_document_chunks(
-                dataset_id=session_id,
-                query_embedding=[float(value) for value in query_vector],
-                match_count=limit,
-                match_threshold=_RAG_CONFIG.retrieval.match_threshold,
+            match_session = getattr(
+                self.storage,
+                "match_session_document_chunks",
+                None,
             )
+            if callable(match_session):
+                rows = match_session(
+                    session_id=session_id,
+                    query_embedding=[float(value) for value in query_vector],
+                    match_count=limit,
+                    match_threshold=_RAG_CONFIG.retrieval.match_threshold,
+                )
+            else:
+                rows = self.storage.match_document_chunks(
+                    dataset_id=session_id,
+                    query_embedding=[float(value) for value in query_vector],
+                    match_count=limit,
+                    match_threshold=_RAG_CONFIG.retrieval.match_threshold,
+                )
             documents = self._dedupe_retrieved(
                 [
                     RetrievedDocument(
@@ -510,17 +561,15 @@ class RagService:
         )
         if row.get("dataset_id") is not None:
             metadata.setdefault("dataset_id", str(row["dataset_id"]))
+        if row.get("session_id") is not None:
+            metadata.setdefault("session_id", str(row["session_id"]))
         return {str(key): value for key, value in metadata.items()}
 
     @staticmethod
     def _matches_session(document: RetrievedDocument, session_id: str) -> bool:
         metadata = document.metadata
         indexed_session_id = str(metadata.get("session_id") or "").strip()
-        indexed_dataset_id = str(metadata.get("dataset_id") or "").strip()
-        return (
-            (not indexed_session_id or indexed_session_id == session_id)
-            and (not indexed_dataset_id or indexed_dataset_id == session_id)
-        )
+        return not indexed_session_id or indexed_session_id == session_id
 
 
 class DeterministicAnalytics:
