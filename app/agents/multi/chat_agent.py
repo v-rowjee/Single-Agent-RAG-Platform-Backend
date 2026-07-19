@@ -61,6 +61,7 @@ def _compact_context(documents: list[RetrievedDocument]) -> str:
             continue
         header = (
             f"Document ID: {source_ids[0] if source_ids else 'unknown'}\n"
+            f"Dataset: {metadata.get('file_name') or 'active workspace'}\n"
             f"Type: {metadata.get('document_type') or 'unknown'}\n"
             f"Title: {metadata.get('title') or source_ids[0] if source_ids else 'Business intelligence evidence'}\n"
             f"Source IDs: {', '.join(source_ids) or 'not available'}\n"

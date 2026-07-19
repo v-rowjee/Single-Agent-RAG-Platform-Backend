@@ -30,6 +30,13 @@ Different schemas are prepared independently and synthesized into one
 session-scoped dashboard and retrieval index. `GET /api/dataset` returns the
 workspace plus its `datasets[]`; previews use
 `GET /api/dataset/preview?dataset_id=<uuid>&page=1&page_size=50`.
+Additional files can be appended with `POST /api/dataset` using the same
+repeated `files` fields, up to five total datasets. Remove one with
+`DELETE /api/dataset/{dataset_id}`. Both operations rebuild the dashboard and
+retrieval index, and clear chat history that was grounded in the previous file
+set. Removing the last dataset deletes the workspace.
+Chat questions use every dataset in the active workspace by default; naming a
+file explicitly narrows the answer to that dataset.
 
 ## Pipeline mode
 

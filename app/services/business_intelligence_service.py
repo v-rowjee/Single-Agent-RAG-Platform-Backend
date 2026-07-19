@@ -278,6 +278,258 @@ class BusinessIntelligenceService:
             result["fileName"] = datasets[0].file_name
         return result
 
+    async def add_datasets(
+        self,
+        files: list[UploadFile] | UploadFile,
+        user_id: str,
+    ) -> dict[str, Any]:
+        session, existing_datasets = self._active_workspace(user_id)
+        if session.requires_reset:
+            raise InvalidUploadError(
+                "This legacy workspace must be reset before datasets can be added."
+            )
+        if session.status == "processing":
+            raise InvalidUploadError(
+                "Workspace analysis is already in progress. Try again when it has finished."
+            )
+
+        uploaded_files = (
+            [files]
+            if hasattr(files, "read") and not isinstance(files, (list, tuple))
+            else list(files)
+        )
+        available_spaces = MAX_UPLOAD_FILES - len(existing_datasets)
+        if available_spaces <= 0:
+            raise InvalidUploadError(
+                f"A workspace can contain up to {MAX_UPLOAD_FILES} datasets."
+            )
+        if not 1 <= len(uploaded_files) <= available_spaces:
+            raise InvalidUploadError(
+                f"Upload between 1 and {available_spaces} more "
+                f"{'file' if available_spaces == 1 else 'files'}."
+            )
+
+        inspected: list[dict[str, Any]] = []
+        names = {dataset.file_name.casefold() for dataset in existing_datasets}
+        hashes = {dataset.file_hash for dataset in existing_datasets}
+        for file in uploaded_files:
+            original_name = Path(file.filename or "").name
+            file_name = self._sanitize_file_name(original_name)
+            mime_type = (file.content_type or "").strip()
+            extension = Path(file_name).suffix.lower()
+            self._validate_upload_metadata(file_name, mime_type, extension)
+
+            normalized_name = file_name.casefold()
+            if normalized_name in names:
+                raise InvalidUploadError(
+                    f"A dataset named '{file_name}' already exists in this workspace."
+                )
+
+            content = await file.read()
+            if not content:
+                raise InvalidUploadError(f"'{file_name}' is empty.")
+            if len(content) > MAX_UPLOAD_BYTES:
+                raise InvalidUploadError(
+                    f"'{file_name}' is larger than the 25 MiB limit."
+                )
+
+            file_hash = hashlib.sha256(content).hexdigest()
+            if file_hash in hashes:
+                raise InvalidUploadError(
+                    f"'{file_name}' duplicates an existing workspace dataset."
+                )
+
+            inspected.append(
+                {
+                    "file_name": file_name,
+                    "mime_type": mime_type,
+                    "content": content,
+                    "file_hash": file_hash,
+                    "dataset_info": self._inspect_file(file_name, content),
+                }
+            )
+            names.add(normalized_name)
+            hashes.add(file_hash)
+
+        existing_contents = [
+            self.storage.download_file(dataset.storage_path)
+            for dataset in existing_datasets
+        ]
+        added_datasets: list[DatasetRecord] = []
+        uploaded_paths: list[str] = []
+        try:
+            for item in inspected:
+                dataset_id = str(uuid4())
+                storage_path = (
+                    f"{user_id}/{session.id}/{dataset_id}/{item['file_name']}"
+                )
+                dataset = self.storage.create_dataset(
+                    dataset_id=dataset_id,
+                    session_id=session.id,
+                    user_id=user_id,
+                    file_name=item["file_name"],
+                    storage_path=storage_path,
+                    mime_type=item["mime_type"],
+                    file_size=len(item["content"]),
+                    file_hash=item["file_hash"],
+                    description=session.description,
+                    row_count=int(item["dataset_info"]["rowCount"]),
+                    column_count=int(item["dataset_info"]["columnCount"]),
+                )
+                added_datasets.append(dataset)
+                self.storage.upload_file(
+                    storage_path=storage_path,
+                    content=item["content"],
+                    mime_type=item["mime_type"],
+                )
+                uploaded_paths.append(storage_path)
+        except Exception as error:
+            for storage_path in reversed(uploaded_paths):
+                try:
+                    self.storage.delete_file(storage_path)
+                except Exception:
+                    logger.exception(
+                        "Unable to roll back uploaded object path=%s",
+                        storage_path,
+                    )
+            for dataset in added_datasets:
+                self.storage.delete_dataset(dataset.id, user_id)
+            if self._is_duplicate_dataset_error(error):
+                raise InvalidUploadError(
+                    "One of these datasets already exists in the workspace."
+                ) from error
+            raise
+
+        all_datasets = [*existing_datasets, *added_datasets]
+        all_contents = [
+            *existing_contents,
+            *(item["content"] for item in inspected),
+        ]
+        self._prepare_workspace_reanalysis(session, all_datasets)
+        try:
+            await self._run_workspace_pipeline(
+                session=session,
+                datasets=all_datasets,
+                contents=all_contents,
+            )
+        except Exception as error:
+            self._mark_workspace_reanalysis_failed(session, all_datasets, error)
+            raise
+
+        return {
+            "status": "success",
+            "sessionId": session.id,
+            "datasetIds": [dataset.id for dataset in added_datasets],
+            "message": "Datasets added and workspace analysis rebuilt successfully.",
+        }
+
+    async def remove_dataset(self, dataset_id: str, user_id: str) -> None:
+        session, datasets = self._active_workspace(user_id)
+        if session.requires_reset:
+            raise InvalidUploadError(
+                "This legacy workspace must be reset before datasets can be removed."
+            )
+        if session.status == "processing":
+            raise InvalidUploadError(
+                "Workspace analysis is already in progress. Try again when it has finished."
+            )
+
+        target = next(
+            (dataset for dataset in datasets if dataset.id == dataset_id),
+            None,
+        )
+        if target is None:
+            raise SessionNotFoundError(
+                f"Dataset '{dataset_id}' was not found in the active workspace."
+            )
+        if len(datasets) == 1:
+            self.reset_active_dataset(user_id)
+            return
+
+        remaining_datasets = [
+            dataset for dataset in datasets if dataset.id != target.id
+        ]
+        remaining_contents = [
+            self.storage.download_file(dataset.storage_path)
+            for dataset in remaining_datasets
+        ]
+        self.storage.delete_dataset(target.id, user_id)
+        try:
+            self.storage.delete_file(target.storage_path)
+        except Exception:
+            logger.exception(
+                "Dataset metadata was removed but its stored object could not be "
+                "deleted path=%s",
+                target.storage_path,
+            )
+
+        self._prepare_workspace_reanalysis(session, remaining_datasets)
+        try:
+            await self._run_workspace_pipeline(
+                session=session,
+                datasets=remaining_datasets,
+                contents=remaining_contents,
+            )
+        except Exception as error:
+            self._mark_workspace_reanalysis_failed(
+                session,
+                remaining_datasets,
+                error,
+            )
+            raise
+
+    def _prepare_workspace_reanalysis(
+        self,
+        session: AnalysisSessionRecord,
+        datasets: list[DatasetRecord],
+    ) -> None:
+        clear_analysis = getattr(self.storage, "clear_session_analysis", None)
+        if callable(clear_analysis):
+            clear_analysis(session.id)
+
+        update_session = getattr(self.storage, "update_session_status", None)
+        if callable(update_session):
+            update_session(
+                session.id,
+                status="processing",
+                rag_status="pending",
+                error_message=None,
+            )
+        update_dataset = getattr(self.storage, "update_dataset_status", None)
+        if callable(update_dataset):
+            for dataset in datasets:
+                update_dataset(
+                    dataset.id,
+                    status="processing",
+                    rag_status="pending",
+                    error_message=None,
+                )
+
+    def _mark_workspace_reanalysis_failed(
+        self,
+        session: AnalysisSessionRecord,
+        datasets: list[DatasetRecord],
+        error: Exception,
+    ) -> None:
+        message = self._safe_error(error)
+        update_session = getattr(self.storage, "update_session_status", None)
+        if callable(update_session):
+            update_session(
+                session.id,
+                status="failed",
+                rag_status="failed",
+                error_message=message,
+            )
+        update_dataset = getattr(self.storage, "update_dataset_status", None)
+        if callable(update_dataset):
+            for dataset in datasets:
+                update_dataset(
+                    dataset.id,
+                    status="failed",
+                    rag_status="failed",
+                    error_message=message,
+                )
+
     def get_active_dataset(self, user_id: str) -> DatasetRecord:
         _, datasets = self._active_workspace(user_id)
         return datasets[0]
@@ -939,44 +1191,35 @@ class BusinessIntelligenceService:
     ) -> ChatResponse:
         session, datasets = self._load_workspace(session_id, user_id)
         history = self._chat_history(session.id)
-        selected, ambiguous = self._select_chat_datasets(query, datasets)
-        if ambiguous:
-            file_names = ", ".join(f"`{dataset.file_name}`" for dataset in ambiguous)
-            cleaned_query = query.strip()
-            self.storage.save_message(
-                dataset_id=session.id,
-                role="user",
-                content=cleaned_query,
-                sources=[],
-            )
-            return self._save_chat_response(
-                session.id,
-                (
-                    "**Answer:** This calculation could apply to more than one "
-                    f"dataset ({file_names}). Name the dataset or field you want "
-                    "me to calculate so I do not combine incompatible tables.\n\n"
-                    "**Grounding:** The active workspace contains multiple "
-                    "matching dataset schemas."
-                ),
-                [],
-            )
+        selected, _ = self._select_chat_datasets(query, datasets)
+        scoped_datasets = [selected] if selected is not None else datasets
+        calculated_response = self._workspace_calculation_response(
+            query,
+            scoped_datasets,
+        )
 
         retrieval_query = (
             f"In dataset `{selected.file_name}`, {query}"
             if selected is not None
             else query
         )
-        result = self._chat_service.answer(
-            session.id,
-            retrieval_query,
-            history=history,
-        )
-
         self.storage.save_message(
             dataset_id=session.id,
             role="user",
             content=query.strip(),
             sources=[],
+        )
+        if calculated_response is not None:
+            return self._save_chat_response(
+                session.id,
+                calculated_response,
+                [dataset.id for dataset in scoped_datasets],
+            )
+
+        result = self._chat_service.answer(
+            session.id,
+            retrieval_query,
+            history=history,
         )
         return self._save_chat_response(
             session.id,
@@ -1000,38 +1243,127 @@ class BusinessIntelligenceService:
         ]
         if len(explicitly_named) == 1:
             return explicitly_named[0], []
+        return None, []
 
-        calculation_terms = (
-            "total",
-            "sum",
-            "average",
-            "avg",
-            "minimum",
-            "maximum",
-            "highest",
-            "lowest",
-            "how many",
-            "count",
-        )
-        if not any(term in normalized_query for term in calculation_terms):
-            return None, []
+    def _workspace_calculation_response(
+        self,
+        query: str,
+        datasets: list[DatasetRecord],
+    ) -> str | None:
+        """Calculate broad numeric questions over the complete dataset scope."""
+        if not datasets:
+            return None
 
-        matching: list[DatasetRecord] = []
-        for dataset in datasets:
-            info = self._inspect_file(
-                dataset.file_name,
-                self.storage.download_file(dataset.storage_path),
-            )
-            fields = [
-                str(field).casefold()
-                for field in [*info["measures"], *info["dimensions"]]
+        try:
+            frames: list[pd.DataFrame] = []
+            canonical_columns: dict[str, str] = {}
+            for dataset in datasets:
+                content = self.storage.download_file(dataset.storage_path)
+                suffix = Path(dataset.file_name).suffix.lower()
+                if suffix == ".csv":
+                    frame = pd.read_csv(io.BytesIO(content), low_memory=False)
+                elif suffix == ".xlsx":
+                    frame = pd.read_excel(io.BytesIO(content))
+                else:
+                    continue
+
+                rename: dict[Any, str] = {}
+                occupied = {str(column) for column in frame.columns}
+                for column in frame.columns:
+                    column_name = str(column)
+                    normalized = re.sub(
+                        r"[^a-z0-9]+",
+                        "_",
+                        column_name.casefold(),
+                    ).strip("_")
+                    canonical = canonical_columns.setdefault(
+                        normalized or column_name.casefold(),
+                        column_name,
+                    )
+                    if canonical == column_name or canonical in occupied:
+                        continue
+                    rename[column] = canonical
+                if rename:
+                    frame = frame.rename(columns=rename)
+                frame["__source_dataset__"] = dataset.file_name
+                frames.append(frame)
+
+            if not frames:
+                return None
+            combined = pd.concat(frames, ignore_index=True, sort=False)
+            if combined.empty:
+                return None
+
+            numeric_columns = [
+                str(column)
+                for column in combined.columns
+                if column != "__source_dataset__"
+                and pd.to_numeric(combined[column], errors="coerce").notna().any()
             ]
-            if any(field in normalized_query for field in fields):
-                matching.append(dataset)
+            dimensions = [
+                str(column)
+                for column in combined.columns
+                if str(column) not in numeric_columns
+            ]
+            date_field = next(
+                (
+                    str(column)
+                    for column in combined.columns
+                    if any(
+                        term in str(column).casefold()
+                        for term in ("date", "time", "year", "month", "period")
+                    )
+                ),
+                None,
+            )
+            profile = {
+                "summary": {
+                    "measures": numeric_columns,
+                    "dimensions": dimensions,
+                    "timeField": date_field,
+                }
+            }
+            query_type = rag_service.route_query(query, profile)
+            if query_type not in {
+                "calculation",
+                "comparison",
+                "forecast",
+                "mixed",
+            }:
+                return None
 
-        if len(matching) == 1:
-            return matching[0], []
-        return None, matching or datasets
+            with tempfile.TemporaryDirectory(
+                prefix="bi_workspace_chat_",
+            ) as directory:
+                combined_path = Path(directory) / "all_uploaded_datasets.csv"
+                combined.to_csv(combined_path, index=False)
+                agent_input = BusinessIntelligenceAgentInput(
+                    sessionId=datasets[0].session_id or datasets[0].id,
+                    datasetId=datasets[0].session_id or datasets[0].id,
+                    filePath=str(combined_path),
+                    fileName="all uploaded datasets",
+                    description=datasets[0].description,
+                )
+                evidence = rag_service.calculate_evidence(
+                    agent_input=agent_input,
+                    query=query,
+                    query_type=query_type,
+                    profile=profile,
+                )
+            if evidence is None or not evidence.direct_answer:
+                return None
+
+            file_names = ", ".join(f"`{dataset.file_name}`" for dataset in datasets)
+            return (
+                f"{evidence.direct_answer.rstrip()} "
+                f"Dataset scope: {file_names}."
+            )
+        except Exception:
+            logger.exception(
+                "Workspace chat calculation failed datasets=%s",
+                [dataset.id for dataset in datasets],
+            )
+            return None
 
     def _chat_with_single_agent(
         self,

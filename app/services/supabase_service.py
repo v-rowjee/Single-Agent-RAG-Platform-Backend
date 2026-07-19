@@ -269,6 +269,19 @@ class SupabaseService:
             user_id,
         ).execute()
 
+    def clear_session_analysis(self, session_id: str) -> None:
+        """Remove outputs that become stale when workspace files change."""
+        for table_name in (
+            "messages",
+            "document_chunks",
+            "session_processing",
+            "dashboards",
+        ):
+            self.client.table(table_name).delete().eq(
+                "session_id",
+                session_id,
+            ).execute()
+
     def update_session_status(
         self,
         session_id: str,

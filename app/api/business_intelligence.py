@@ -92,6 +92,50 @@ def get_active_dataset(
         ) from error
 
 
+@router.post("/dataset")
+async def add_datasets(
+    files: list[UploadFile] = File(...),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    try:
+        return await business_intelligence_service.add_datasets(
+            files=files,
+            user_id=current_user.id,
+        )
+    except SessionNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except InvalidUploadError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except Exception as error:
+        print(f"Unexpected error while adding datasets: {error}")
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while adding the datasets.",
+        ) from error
+
+
+@router.delete("/dataset/{dataset_id}", status_code=204)
+async def remove_dataset(
+    dataset_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> None:
+    try:
+        await business_intelligence_service.remove_dataset(
+            dataset_id=dataset_id,
+            user_id=current_user.id,
+        )
+    except SessionNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except InvalidUploadError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except Exception as error:
+        print(f"Unexpected error while removing a dataset: {error}")
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while removing the dataset.",
+        ) from error
+
+
 @router.get("/dataset/preview", response_model=DatasetPreviewResponse)
 def get_dataset_preview(
     dataset_id: str | None = Query(default=None, min_length=1),

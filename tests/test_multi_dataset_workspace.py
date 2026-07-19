@@ -106,10 +106,30 @@ class WorkspaceStorage:
         self.dashboard = None
         self.processing = None
 
+    def delete_dataset(self, dataset_id: str, user_id: str) -> None:
+        dataset = self.datasets.get(dataset_id)
+        if dataset is not None and dataset.user_id == user_id:
+            self.datasets.pop(dataset_id)
+
+    def clear_session_analysis(self, session_id: str) -> None:
+        self.dashboard = None
+        self.processing = None
+
     def update_session_status(self, session_id: str, **values: Any) -> None:
         session = self.sessions[session_id]
         self.sessions[session_id] = replace(
             session,
+            **{
+                key: value
+                for key, value in values.items()
+                if key in {"status", "rag_status", "error_message"}
+            },
+        )
+
+    def update_dataset_status(self, dataset_id: str, **values: Any) -> None:
+        dataset = self.datasets[dataset_id]
+        self.datasets[dataset_id] = replace(
+            dataset,
             **{
                 key: value
                 for key, value in values.items()
@@ -247,17 +267,29 @@ def test_mixed_schema_batch_creates_one_workspace_and_uses_every_dataset() -> No
         "What is the total revenue?",
         datasets,
     )
-    assert selected is not None and selected.file_name == "sales.csv"
+    assert selected is None
     assert ambiguous == []
     selected, ambiguous = service._select_chat_datasets(
         "What is the total?",
         datasets,
     )
     assert selected is None
-    assert {dataset.file_name for dataset in ambiguous} == {
-        "sales.csv",
-        "inventory.csv",
-    }
+    assert ambiguous == []
+    selected, ambiguous = service._select_chat_datasets(
+        "What is the total revenue in sales.csv?",
+        datasets,
+    )
+    assert selected is not None and selected.file_name == "sales.csv"
+    assert ambiguous == []
+
+    calculation = service._workspace_calculation_response(
+        "What is the total revenue?",
+        datasets,
+    )
+    assert calculation is not None
+    assert "**100.00**" in calculation
+    assert "sales.csv" in calculation
+    assert "inventory.csv" in calculation
 
     service.reset_active_dataset(USER_ID)
     assert storage.sessions == {}
@@ -284,6 +316,129 @@ def test_batch_validation_rejects_duplicate_content_before_persistence() -> None
             )
         )
 
+    assert storage.sessions == {}
+    assert storage.datasets == {}
+    assert storage.files == {}
+
+
+def test_workspace_calculation_combines_matching_fields_from_every_dataset() -> None:
+    storage = WorkspaceStorage()
+    service = BusinessIntelligenceService(
+        storage=storage,  # type: ignore[arg-type]
+        settings=Settings("", "", bi_pipeline_mode="multi"),
+    )
+    session = storage.create_session(
+        session_id="workspace-session",
+        user_id=USER_ID,
+        description=None,
+    )
+    datasets: list[DatasetRecord] = []
+    for index, (file_name, content) in enumerate(
+        (
+            ("sme_gym_sales_2015_2025-1.csv", b"region,Revenue\nNorth,100\n"),
+            ("sme_gym_sales_2015_2025-2.csv", b"region,revenue\nSouth,200\n"),
+        ),
+        start=1,
+    ):
+        storage_path = f"{USER_ID}/{session.id}/dataset-{index}/{file_name}"
+        datasets.append(
+            storage.create_dataset(
+                dataset_id=f"dataset-{index}",
+                session_id=session.id,
+                user_id=USER_ID,
+                file_name=file_name,
+                storage_path=storage_path,
+                mime_type="text/csv",
+                file_size=len(content),
+                file_hash=f"hash-{index}",
+                description=None,
+                row_count=1,
+                column_count=2,
+            )
+        )
+        storage.upload_file(storage_path, content, "text/csv")
+
+    calculation = service._workspace_calculation_response(
+        "What was the total revenue?",
+        datasets,
+    )
+
+    assert calculation is not None
+    assert "**300.00**" in calculation
+    assert "sme_gym_sales_2015_2025-1.csv" in calculation
+    assert "sme_gym_sales_2015_2025-2.csv" in calculation
+
+
+def test_active_workspace_can_add_and_remove_individual_datasets() -> None:
+    storage = WorkspaceStorage()
+    service = BusinessIntelligenceService(
+        storage=storage,  # type: ignore[arg-type]
+        settings=Settings("", "", bi_pipeline_mode="multi"),
+        rag=WorkspaceRag(),
+    )
+    analyzed: list[str] = []
+
+    async def run_dataset(
+        self: BusinessIntelligenceService,
+        dataset: DatasetRecord,
+        content: bytes | None = None,
+        workspace_session_id: str | None = None,
+    ) -> PipelineExecution:
+        analyzed.append(dataset.file_name)
+        response = DashboardResponse.model_validate(
+            self._build_placeholder_dashboard(
+                dataset,
+                self._inspect_file(dataset.file_name, content or b""),
+            )
+        )
+        return PipelineExecution(
+            response=response,
+            workflow={"dataset_id": dataset.id},
+            retrieval_documents=[],
+        )
+
+    service._run_multi_agent_pipeline = MethodType(run_dataset, service)
+    initial = asyncio.run(
+        service.create_analysis(
+            [upload("sales.csv", b"region,revenue\nNorth,100\n")],
+            user_id=USER_ID,
+        )
+    )
+    analyzed.clear()
+
+    added = asyncio.run(
+        service.add_datasets(
+            [upload("inventory.csv", b"sku,stock\nA-1,8\n")],
+            user_id=USER_ID,
+        )
+    )
+
+    assert added["sessionId"] == initial["sessionId"]
+    assert len(added["datasetIds"]) == 1
+    assert analyzed == ["sales.csv", "inventory.csv"]
+    assert {
+        item["fileName"]
+        for item in service.get_active_dataset_details(USER_ID)["datasets"]
+    } == {"sales.csv", "inventory.csv"}
+
+    with pytest.raises(InvalidUploadError, match="already exists"):
+        asyncio.run(
+            service.add_datasets(
+                [upload("SALES.CSV", b"region,revenue\nSouth,200\n")],
+                user_id=USER_ID,
+            )
+        )
+
+    analyzed.clear()
+    asyncio.run(service.remove_dataset(initial["datasetIds"][0], USER_ID))
+    assert analyzed == ["inventory.csv"]
+    details = service.get_active_dataset_details(USER_ID)
+    assert [item["fileName"] for item in details["datasets"]] == [
+        "inventory.csv"
+    ]
+    assert len(storage.files) == 1
+
+    asyncio.run(service.remove_dataset(added["datasetIds"][0], USER_ID))
     assert storage.sessions == {}
     assert storage.datasets == {}
     assert storage.files == {}
