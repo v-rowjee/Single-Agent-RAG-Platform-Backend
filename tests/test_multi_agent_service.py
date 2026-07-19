@@ -120,7 +120,8 @@ def test_multi_upload_uses_service_owned_persistence_and_never_single_agent(
     assert len(multi_calls) == 1
     assert storage.saved_dashboards == 1
     assert storage.saved_processing == 1
-    assert len(storage.status_updates) == 1
+    assert len(storage.status_updates) == 2
+    assert storage.status_updates[0]["rag_status"] == "indexing"
     assert storage.status_updates[-1]["status"] == "ready"
     assert storage.status_updates[-1]["rag_status"] == "ready"
 

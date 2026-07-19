@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any, Literal
 
+import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
+
+from app.rag.document_builder import DatasetDocumentBuilder
 
 MAX_RETRIEVAL_DOCUMENTS = 50
 MAX_DOCUMENT_LENGTH = 1500
@@ -16,7 +20,7 @@ class StrictModel(BaseModel):
 
 class RetrievalDocument(StrictModel):
     id: str = Field(min_length=1)
-    document_type: Literal["dataset_summary", "kpi", "trend", "anomaly", "forecast", "insight", "recommendation", "limitation"]
+    document_type: Literal["dataset_summary", "kpi", "trend", "anomaly", "forecast", "insight", "recommendation", "limitation", "row_batch"]
     title: str = Field(min_length=1)
     content: str
     source_ids: list[str] = Field(default_factory=list)
@@ -50,6 +54,57 @@ def _add(documents: list[RetrievalDocument], **values: Any) -> None:
     if len(documents) < MAX_RETRIEVAL_DOCUMENTS:
         values["content"] = _short(str(values.get("content") or ""))
         documents.append(RetrievalDocument(**values))
+
+
+def _raw_row_documents(
+    prepared: dict[str, Any],
+) -> tuple[list[RetrievalDocument], list[str]]:
+    prepared_path = Path(str(prepared.get("prepared_file_path") or ""))
+    if not prepared_path.is_file():
+        return [], ["Prepared rows were unavailable for retrieval indexing."]
+
+    try:
+        dataframe = pd.read_csv(prepared_path, low_memory=False)
+        builder = DatasetDocumentBuilder()
+        raw_documents = builder.build_row_documents(
+            df=dataframe,
+            session_id=str(prepared.get("session_id") or "prepared_dataset"),
+            file_name=str(prepared.get("file_name") or prepared_path.name),
+            measures=[str(value) for value in prepared.get("primary_measures") or []],
+            dimensions=[
+                str(value) for value in prepared.get("dimension_candidates") or []
+            ],
+            date_field=(
+                str(prepared["date_column"])
+                if prepared.get("date_column")
+                else None
+            ),
+        )
+    except Exception as exc:
+        return [], [f"Prepared rows could not be indexed: {exc}"]
+
+    output: list[RetrievalDocument] = []
+    for index, document in enumerate(raw_documents):
+        metadata = dict(document.metadata)
+        source_id = str(metadata.get("source_id") or f"row_batch_{index}")
+        row_start = metadata.get("row_start")
+        row_end = metadata.get("row_end")
+        title = (
+            f"Prepared rows {row_start} to {row_end}"
+            if row_start is not None and row_end is not None
+            else f"Prepared row batch {index + 1}"
+        )
+        output.append(
+            RetrievalDocument(
+                id=source_id,
+                document_type="row_batch",
+                title=title,
+                content=document.page_content,
+                source_ids=[source_id],
+                metadata={**metadata, "title": title},
+            )
+        )
+    return output, []
 
 
 class RetrievalPreparationAgent:
@@ -86,6 +141,9 @@ class RetrievalPreparationAgent:
         if limitations:
             _add(documents, id="limitations", document_type="limitation", title="Analysis limitations", content=" ".join(str(value) for value in limitations), source_ids=["dataset_summary"], metadata={"count": len(limitations)})
         warnings = list(dict.fromkeys([*(prepared.get("warnings") or []), *(kpi.get("warnings") or []), *(anomaly.get("warnings") or []), *(forecast.get("warnings") or []), *(synthesis.get("warnings") or [])]))
+        row_documents, row_warnings = _raw_row_documents(prepared)
+        documents.extend(row_documents)
+        warnings = list(dict.fromkeys([*warnings, *row_warnings]))
         return RetrievalPreparationOutput(status="complete" if documents else "partial", documents=documents, limitations=[str(value) for value in limitations], warnings=[str(value) for value in warnings])
 
 

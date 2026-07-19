@@ -19,7 +19,11 @@ from app.rag.rag_service import rag_service
 
 
 logger = logging.getLogger(__name__)
-_CHAT_SEARCH_LIMIT = get_rag_config().retrieval.chat_search_limit
+_RAG_CONFIG = get_rag_config()
+_VECTOR_SEARCH_LIMIT = _RAG_CONFIG.retrieval.vector_search_limit
+_CHAT_SEARCH_LIMIT = _RAG_CONFIG.retrieval.chat_search_limit
+_MAX_HISTORY_MESSAGES = 6
+_MAX_HISTORY_CHARACTERS = 2_000
 
 BLOCKED_CHAT_ANSWER = (
     "I cannot follow requests to reveal secrets or override the analysis "
@@ -92,6 +96,37 @@ def _numbers(text: str) -> set[str]:
     }
 
 
+def _safe_history(history: list[dict[str, str]]) -> list[dict[str, str]]:
+    output: list[dict[str, str]] = []
+    used_characters = 0
+    for message in history[-_MAX_HISTORY_MESSAGES:]:
+        role = str(message.get("role") or "").strip()
+        content = str(message.get("content") or "").strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        if role == "user" and any(pattern.search(content) for pattern in _BLOCKED_PATTERNS):
+            continue
+        remaining = _MAX_HISTORY_CHARACTERS - used_characters
+        if remaining <= 0:
+            break
+        content = content[:remaining]
+        output.append({"role": role, "content": content})
+        used_characters += len(content)
+    return output
+
+
+def _retrieval_query(query: str, history: list[dict[str, str]]) -> str:
+    if not history:
+        return query
+    history_text = "\n".join(
+        f"{message['role']}: {message['content']}" for message in history
+    )
+    return (
+        f"Current question: {query}\n"
+        f"Recent conversation context:\n{history_text}"
+    )
+
+
 def _ground_draft(
     query: str,
     documents: list[RetrievedDocument],
@@ -138,7 +173,12 @@ class ChatService:
         self._rag = rag or rag_service
         self._agent = agent or chat_agent
 
-    def answer(self, session_id: str, query: str) -> ChatResult:
+    def answer(
+        self,
+        session_id: str,
+        query: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> ChatResult:
         """Run the multi-agent chat sequence without a graph wrapper."""
         cleaned_query = str(query or "").strip()
         if not cleaned_query:
@@ -154,17 +194,22 @@ class ChatService:
                 ),
             )
 
-        documents = self._rag.retrieve(
+        safe_history = _safe_history(history or [])
+        contextual_query = _retrieval_query(cleaned_query, safe_history)
+        candidates = self._rag.retrieve(
             session_id=session_id,
-            query=cleaned_query,
-            limit=_CHAT_SEARCH_LIMIT,
+            query=contextual_query,
+            limit=_VECTOR_SEARCH_LIMIT,
         )
+        reranked = self._rag.rerank(contextual_query, candidates)
+        documents = (reranked or candidates)[:_CHAT_SEARCH_LIMIT]
         try:
             draft = asyncio.run(
                 self._agent.run(
                     session_id=session_id,
                     query=cleaned_query,
                     retrieved_documents=documents,
+                    history=safe_history,
                 )
             )
         except Exception:

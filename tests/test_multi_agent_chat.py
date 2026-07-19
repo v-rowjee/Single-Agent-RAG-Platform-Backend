@@ -76,6 +76,7 @@ class DummyRag:
     def __init__(self, documents: list[RetrievedDocument]) -> None:
         self.documents = documents
         self.calls: list[tuple[str, str, int]] = []
+        self.rerank_calls: list[tuple[str, list[str]]] = []
 
     def retrieve(
         self,
@@ -86,19 +87,37 @@ class DummyRag:
         self.calls.append((session_id, query, limit))
         return self.documents
 
+    def rerank(
+        self,
+        query: str,
+        documents: list[RetrievedDocument],
+    ) -> list[RetrievedDocument]:
+        self.rerank_calls.append(
+            (
+                query,
+                [str(document.metadata.get("source_id")) for document in documents],
+            )
+        )
+        return list(reversed(documents))
+
 
 @dataclass
 class DummyChatAgent:
     draft: GroundedChatDraft
     calls: int = 0
+    histories: list[list[dict[str, str]]] | None = None
 
     async def run(
         self,
         session_id: str,
         query: str,
         retrieved_documents: list[RetrievedDocument],
+        history: list[dict[str, str]] | None = None,
     ) -> GroundedChatDraft:
         self.calls += 1
+        if self.histories is None:
+            self.histories = []
+        self.histories.append(history or [])
         if not retrieved_documents:
             return GroundedChatDraft(
                 answer=INSUFFICIENT_CONTEXT_ANSWER,
@@ -150,10 +169,56 @@ def test_multi_chat_is_session_scoped_grounded_and_persisted() -> None:
 
     assert response.answer == "The revenue KPI is 120."
     assert response.grounding == "Retrieved dataset sources: `kpi_revenue`."
-    assert rag.calls == [(SESSION_ID, "What is the revenue KPI?", 6)]
+    assert rag.calls == [(SESSION_ID, "What is the revenue KPI?", 12)]
+    assert rag.rerank_calls == [
+        ("What is the revenue KPI?", ["kpi_revenue"])
+    ]
     assert agent.calls == 1
     assert [message.role for message in storage.messages] == ["user", "assistant"]
     assert storage.messages[-1].sources == ["kpi_revenue"]
+
+
+def test_multi_chat_uses_recent_history_for_follow_up_retrieval() -> None:
+    documents = [
+        RetrievedDocument(
+            page_content="North revenue is 120.",
+            metadata={"source_id": "north_revenue"},
+            score=0.9,
+        )
+    ]
+    service, storage, rag, agent = _service(
+        documents,
+        GroundedChatDraft(
+            answer="It is 120.",
+            source_ids=["north_revenue"],
+            insufficient_context=False,
+        ),
+    )
+    storage.save_message(
+        SESSION_ID,
+        "user",
+        "What is North revenue?",
+        [],
+    )
+    storage.save_message(
+        SESSION_ID,
+        "assistant",
+        "North revenue is 120.",
+        ["north_revenue"],
+    )
+
+    response = service.chat(SESSION_ID, "How much is it?", USER_ID)
+
+    assert response.answer == "It is 120."
+    retrieval_query = rag.calls[0][1]
+    assert "Current question: How much is it?" in retrieval_query
+    assert "What is North revenue?" in retrieval_query
+    assert agent.histories == [
+        [
+            {"role": "user", "content": "What is North revenue?"},
+            {"role": "assistant", "content": "North revenue is 120."},
+        ]
+    ]
 
 
 def test_multi_chat_blocks_prompt_injection_before_retrieval() -> None:

@@ -203,6 +203,7 @@ class BusinessIntelligenceService:
             "rowCount": row_count,
             "columnCount": column_count,
             "analysisStatus": dataset.status,
+            "ragStatus": dataset.rag_status,
             "originalPrompt": dataset.description,
         }
 
@@ -491,7 +492,8 @@ class BusinessIntelligenceService:
         user_id: str,
     ) -> ChatResponse:
         dataset = self._load_dataset(session_id, user_id)
-        result = self._chat_service.answer(dataset.id, query)
+        history = self._chat_history(dataset.id)
+        result = self._chat_service.answer(dataset.id, query, history=history)
 
         self.storage.save_message(
             dataset_id=dataset.id,
@@ -655,6 +657,7 @@ class BusinessIntelligenceService:
         """Persist dashboard, RAG state, and dataset status exactly once."""
         response = execution.response
         rag_status = "failed"
+        self.storage.update_dataset_status(session.id, rag_status="indexing")
 
         if self.settings.bi_pipeline_mode == "multi":
             workflow = dict(execution.workflow or {})
@@ -744,6 +747,7 @@ class BusinessIntelligenceService:
         persistent_workflow = dict(workflow)
         persistent_workflow["generic_cleaning_report"] = generic_cleaning_report
         persistent_workflow["prepared_dataset"] = prepared_dataset
+        persistent_workflow.pop("retrieval_documents", None)
 
         self.storage.save_session_processing(
             dataset_id=dataset_id,

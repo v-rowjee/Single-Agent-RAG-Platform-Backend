@@ -477,6 +477,7 @@ def test_active_dataset_details_preview_second_upload_and_reset(full_flow) -> No
         "rowCount": 2,
         "columnCount": 2,
         "analysisStatus": "ready",
+        "ragStatus": "ready",
         "originalPrompt": "Quarterly sales analysis",
     }
 

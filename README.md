@@ -11,6 +11,10 @@ Copy `.env.sample` to `.env` and set the Supabase service-role key. Apply
 recreates application data tables, creates a profile for each Supabase Auth
 account, and leaves the Supabase-managed `auth.users` records intact.
 
+For an existing database created with an earlier version, apply
+`scripts/migrate_atomic_rag_index.sql` once. It installs the transactional
+vector-index replacement function without deleting existing application data.
+
 All `/api/upload`, `/api/dashboard/{session_id}`, `/api/chat`, and
 `/api/chat/{session_id}/history` requests require an `Authorization: Bearer
 <Supabase access JWT>` header. The backend validates the JWT and returns data
@@ -64,9 +68,16 @@ preparation, dashboard, or persistence failures produce a failed result.
 Multi-agent chat uses a separate pipeline:
 
 ```text
-Session Validation -> Input Guardrail -> Session-Filtered Retrieval
-                   -> Chat Agent -> Output Grounding Guardrail -> Chat Response
+Session Validation -> Input Guardrail -> History-Aware Session Retrieval
+                   -> Cross-Encoder Reranking -> Chat Agent
+                   -> Output Grounding Guardrail -> Chat Response
 ```
+
+Both pipeline modes use the same configured chunker and transactional Supabase
+index replacement. Multi-agent retrieval combines compact analytical findings
+with bounded prepared-row batches so detailed lookups are not limited to
+dashboard summaries. Recent conversation history is used to resolve follow-up
+references, but only retrieved documents are accepted as factual evidence.
 
 ## Tests
 

@@ -6,7 +6,7 @@ import os
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app.core.config import agent_model_policy
+from app.core.config import agent_model_policy, get_rag_config
 from app.core.groq_structured import request_structured
 from app.core.prompts import render_agent_prompts
 from app.rag.models import RetrievedDocument
@@ -14,9 +14,10 @@ from app.rag.models import RetrievedDocument
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIEVED_DOCUMENTS = 6
-MAX_CONTEXT_CHARACTERS = 12_000
-MAX_DOCUMENT_CHARACTERS = 2_500
+_RAG_CONFIG = get_rag_config()
+MAX_RETRIEVED_DOCUMENTS = _RAG_CONFIG.retrieval.chat_search_limit
+MAX_CONTEXT_CHARACTERS = _RAG_CONFIG.retrieval.max_context_chars
+MAX_DOCUMENT_CHARACTERS = _RAG_CONFIG.chunking.size
 INSUFFICIENT_CONTEXT_ANSWER = (
     "The available analysis does not contain enough information to answer that "
     "question."
@@ -87,13 +88,21 @@ def _validated_source_ids(
     return output
 
 
-async def _request_groq_draft(query: str, context: str) -> GroundedChatDraft:
+async def _request_groq_draft(
+    query: str,
+    context: str,
+    history: list[dict[str, str]],
+) -> GroundedChatDraft:
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GROQ_API_KEY is missing.")
     prompts = render_agent_prompts(
         "multi/chat",
-        payload={"query": query, "documents": context},
+        payload={
+            "query": query,
+            "conversation_history": history,
+            "documents": context,
+        },
     )
     return await request_structured(
         api_key=api_key,
@@ -114,6 +123,7 @@ class ChatAgent:
         session_id: str,
         query: str,
         retrieved_documents: list[RetrievedDocument],
+        history: list[dict[str, str]] | None = None,
     ) -> GroundedChatDraft:
         documents = retrieved_documents[:MAX_RETRIEVED_DOCUMENTS]
         logger.info(
@@ -130,7 +140,11 @@ class ChatAgent:
             )
 
         try:
-            draft = await _request_groq_draft(query, _compact_context(documents))
+            draft = await _request_groq_draft(
+                query,
+                _compact_context(documents),
+                history or [],
+            )
             validated = draft.model_copy(
                 update={"source_ids": _validated_source_ids(draft, documents)}
             )

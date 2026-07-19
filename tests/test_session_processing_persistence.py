@@ -62,6 +62,12 @@ def test_persistence_stores_processing_metadata_without_temporary_paths() -> Non
                     "cleaned_file_path": "C:/temp/processing/generic_cleaned_dataset.csv"
                 },
             },
+            "retrieval_documents": [
+                {
+                    "id": "row_batch_0_2",
+                    "content": "Large raw retrieval payload",
+                }
+            ],
         },
     )
 
@@ -79,6 +85,7 @@ def test_persistence_stores_processing_metadata_without_temporary_paths() -> Non
     assert "prepared_file_path" not in workflow["prepared_dataset"]
     assert "temporal_dataset_path" not in workflow["prepared_dataset"]
     assert "cleaned_file_path" not in workflow["generic_cleaning_report"]
+    assert "retrieval_documents" not in workflow
 
 
 class WorkspaceGraph:

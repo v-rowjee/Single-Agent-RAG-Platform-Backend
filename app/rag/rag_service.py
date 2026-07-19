@@ -14,7 +14,7 @@ import pandas as pd
 from app.core.config import get_rag_config
 from app.rag.document_builder import DatasetDocumentBuilder
 from app.rag.embedding_service import get_embedding_service
-from app.rag.models import CalculatedEvidence, IndexStatus, QueryType, RerankedDocument, RetrievedDocument
+from app.rag.models import CalculatedEvidence, IndexStatus, QueryType, RagDocument, RerankedDocument, RetrievedDocument
 from app.rag.reranker import get_reranker
 from app.schemas.business_intelligence import BusinessIntelligenceAgentInput
 from app.services.supabase_service import SupabaseService, supabase_service
@@ -114,7 +114,7 @@ class RagService:
                 session_id=agent_input.sessionId,
                 collection_name="document_chunks",
                 document_count=len(documents),
-                chunk_count=len(documents),
+                chunk_count=int(result.get("chunk_count") or len(documents)),
                 vector_size=int(result.get("vector_size") or 0),
             )
 
@@ -137,35 +137,37 @@ class RagService:
             ):
                 raise ValueError("Retrieval documents require id and content.")
 
+            chunked_documents = self._chunk_retrieval_documents(retrieval_documents)
+            chunk_count = len(chunked_documents)
             logger.info(
-                "Retrieval replacement started session_id=%s document_count=%s",
+                "Retrieval replacement started session_id=%s document_count=%s chunk_count=%s",
                 session_id,
                 document_count,
-            )
-            self.storage.delete_document_chunks(dataset_id)
-            logger.info(
-                "Existing session documents deleted session_id=%s",
-                session_id,
+                chunk_count,
             )
 
-            if not retrieval_documents:
+            if not chunked_documents:
+                self.storage.replace_document_chunks(dataset_id, [])
                 return {
                     "status": "success",
                     "document_count": 0,
+                    "chunk_count": 0,
                     "indexed_count": 0,
                     "failed_count": 0,
                     "vector_size": 0,
                 }
 
             embeddings = get_embedding_service().embed_documents(
-                [str(document["content"]) for document in retrieval_documents]
+                [str(document["content"]) for document in chunked_documents]
             )
-            if len(embeddings) != document_count:
+            if len(embeddings) != chunk_count:
                 raise ValueError("Document and embedding counts do not match.")
+            if any(len(embedding) != 384 for embedding in embeddings):
+                raise ValueError("The embedding model must return 384-dimensional vectors.")
 
             rows: list[dict[str, object]] = []
             for index, (document, embedding) in enumerate(
-                zip(retrieval_documents, embeddings)
+                zip(chunked_documents, embeddings)
             ):
                 metadata = dict(document.get("metadata") or {})
                 source_id = str(document["id"])
@@ -184,7 +186,7 @@ class RagService:
                         ),
                     }
                 )
-                chunk_index = int(metadata.get("chunk_index", index))
+                chunk_index = int(metadata.get("chunk_index", 0))
                 metadata["chunk_index"] = chunk_index
                 rows.append(
                     {
@@ -202,7 +204,11 @@ class RagService:
                     }
                 )
 
-            self.storage.insert_document_chunks(rows, batch_size=50)
+            replaced_count = self.storage.replace_document_chunks(dataset_id, rows)
+            if replaced_count != len(rows):
+                raise ValueError(
+                    "Atomic retrieval replacement returned an unexpected row count."
+                )
             logger.info(
                 "New documents indexed session_id=%s indexed_count=%s",
                 session_id,
@@ -211,6 +217,7 @@ class RagService:
             return {
                 "status": "success",
                 "document_count": document_count,
+                "chunk_count": chunk_count,
                 "indexed_count": len(rows),
                 "failed_count": 0,
                 "vector_size": len(embeddings[0]) if embeddings else 0,
@@ -224,11 +231,48 @@ class RagService:
             return {
                 "status": "failed",
                 "document_count": document_count,
+                "chunk_count": 0,
                 "indexed_count": 0,
                 "failed_count": document_count,
                 "vector_size": 0,
                 "message": str(exc),
             }
+
+    def _chunk_retrieval_documents(
+        self,
+        retrieval_documents: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        for document in retrieval_documents:
+            source_id = str(document["id"])
+            document_type = str(
+                document.get("document_type")
+                or (document.get("metadata") or {}).get("document_type")
+                or "dataset_overview"
+            )
+            metadata = {
+                **dict(document.get("metadata") or {}),
+                "source_id": source_id,
+                "document_type": document_type,
+            }
+            for chunk in self._builder.chunk_documents(
+                [
+                    RagDocument(
+                        page_content=str(document["content"]),
+                        metadata=metadata,
+                    )
+                ]
+            ):
+                output.append(
+                    {
+                        **document,
+                        "id": source_id,
+                        "content": chunk.page_content,
+                        "document_type": document_type,
+                        "metadata": dict(chunk.metadata),
+                    }
+                )
+        return output
 
     def ensure_index(
         self,

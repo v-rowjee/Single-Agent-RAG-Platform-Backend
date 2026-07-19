@@ -324,6 +324,7 @@ class ActiveDatasetResponse(BaseModel):
     rowCount: int = Field(ge=0)
     columnCount: int = Field(ge=0)
     analysisStatus: Literal["processing", "ready", "failed"]
+    ragStatus: Literal["pending", "indexing", "ready", "failed"]
     originalPrompt: str | None = None
 
 
