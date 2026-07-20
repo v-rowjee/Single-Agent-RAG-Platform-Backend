@@ -4,9 +4,10 @@ dimensions = 384
 batch_size = 8
 
 [reranking]
-model = "Qwen/Qwen3-Reranker-0.6B"
+model = "BAAI/bge-reranker-v2-m3"
 batch_size = 4
 limit = 6
+max_length = 1024
 
 [retrieval]
 vector_search_limit = 20
