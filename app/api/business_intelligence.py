@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from app.core.auth import CurrentUser, get_current_user
 from app.schemas.business_intelligence import (
     ActiveDatasetResponse,
+    AgentModelUsage,
     ChatRequest,
     ChatResponse,
     DatasetPreviewResponse,
@@ -37,6 +38,7 @@ class ChatMessage(BaseModel):
     content: str
     grounded: bool = False
     createdAt: str
+    agentMetadata: AgentModelUsage | None = None
 
 
 class ChatHistoryResponse(BaseModel):
@@ -229,6 +231,30 @@ async def get_dashboard(
         raise HTTPException(
             status_code=500,
             detail="An unexpected error occurred while loading the dashboard.",
+        ) from error
+
+
+@router.post("/dashboard/{session_id}/rag/rebuild", status_code=202)
+def rebuild_dashboard_retrieval(
+    session_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> dict[str, str]:
+    try:
+        business_intelligence_service.rebuild_dashboard_retrieval(
+            session_id,
+            current_user.id,
+            background_tasks,
+        )
+        return {"status": "indexing", "message": "Retrieval index rebuild started."}
+    except SessionNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while rebuilding retrieval.",
         ) from error
 
 

@@ -18,6 +18,7 @@ from fastapi import BackgroundTasks, UploadFile
 
 from app.core.config import Settings, get_settings
 from app.core.model_usage import (
+    chat_model_usage,
     multi_dashboard_model_usage,
     single_dashboard_model_usage,
 )
@@ -29,6 +30,9 @@ from app.schemas.business_intelligence import (
 )
 from app.orchestration.business_intelligence_graph import (
     business_intelligence_graph,
+)
+from app.agents.multi.retrieval_preparation_agent import (
+    dashboard_retrieval_documents,
 )
 from app.rag.rag_service import rag_service
 from app.services.chat_service import ChatService
@@ -714,6 +718,55 @@ class BusinessIntelligenceService:
             background_tasks=background_tasks,
         )
 
+    def rebuild_dashboard_retrieval(
+        self,
+        session_id: str,
+        user_id: str,
+        background_tasks: BackgroundTasks,
+    ) -> None:
+        """Replace a session's retrieval index with evidence from its saved dashboard."""
+        session, datasets = self._load_workspace(session_id, user_id)
+        dashboard_record = self.storage.get_dashboard(session.id)
+        if dashboard_record is None:
+            raise ValueError("Generate the dashboard before rebuilding retrieval.")
+        response = DashboardResponse.model_validate(dashboard_record.response)
+        documents = [
+            document.model_dump(mode="json")
+            for document in dashboard_retrieval_documents(
+                response.model_dump(mode="json")
+            )
+        ]
+        if not documents:
+            raise ValueError("The saved dashboard contains no retrieval evidence.")
+
+        workflow = {
+            "session_id": session.id,
+            "dataset_ids": [dataset.id for dataset in datasets],
+            "workflow_status": response.status,
+            "retrieval_indexing_result": {
+                "status": "indexing",
+                "document_count": len(documents),
+                "indexed_count": 0,
+                "failed_count": 0,
+                "message": "Dashboard retrieval indexing is running in the background.",
+            },
+        }
+        self._save_workflow_dashboard(session.id, response, workflow)
+        update_session = getattr(self.storage, "update_session_status", None)
+        if callable(update_session):
+            update_session(session.id, status="ready", rag_status="indexing", error_message=None)
+        else:
+            for dataset in datasets:
+                self.storage.update_dataset_status(dataset.id, status="ready", rag_status="indexing", error_message=None)
+        background_tasks.add_task(
+            self._complete_workspace_indexing,
+            session=session,
+            datasets=datasets,
+            retrieval_documents=documents,
+            response=response,
+            workflow=workflow,
+        )
+
     async def _run_workspace_pipeline(
         self,
         session: AnalysisSessionRecord,
@@ -1148,11 +1201,8 @@ class BusinessIntelligenceService:
         selected_agents: list[str] | tuple[str, ...] = (),
     ) -> DashboardResponse:
         """Add model provenance to old and newly generated dashboard records."""
-        if response.agentModels:
-            return response
-
         payload = response.model_dump(mode="json")
-        if self.settings.bi_pipeline_mode == "single":
+        if not response.agentModels and self.settings.bi_pipeline_mode == "single":
             usage = single_dashboard_model_usage()
             payload.update(
                 {
@@ -1161,13 +1211,15 @@ class BusinessIntelligenceService:
                     "agentModels": usage,
                 }
             )
-        else:
+        elif not response.agentModels:
             payload.update(
                 {
                     "pipelineMode": "multi",
                     "agentModels": multi_dashboard_model_usage(selected_agents),
                 }
             )
+        if response.chatAgent is None:
+            payload["chatAgent"] = chat_model_usage(self.settings.bi_pipeline_mode)
         return DashboardResponse.model_validate(payload)
 
     def chat(self, session_id: str, query: str, user_id: str) -> ChatResponse:
@@ -1445,7 +1497,11 @@ class BusinessIntelligenceService:
             content=f"**Answer:** {answer}\n\n**Grounding:** {grounding}",
             sources=source_ids,
         )
-        return ChatResponse(answer=answer, grounding=grounding)
+        return ChatResponse(
+            answer=answer,
+            grounding=grounding,
+            agentMetadata=self._chat_model_metadata(),
+        )
 
     @staticmethod
     def _split_chat_response(
@@ -2500,12 +2556,12 @@ class BusinessIntelligenceService:
                 f"Analysis session '{session_id}' was not found."
             ) from error
 
-    @staticmethod
     def _chat_message(
+        self,
         message: MessageRecord,
         grounded: bool | None = None,
     ) -> dict[str, Any]:
-        return {
+        payload = {
             "id": message.id,
             "role": message.role,
             "content": message.content,
@@ -2516,6 +2572,12 @@ class BusinessIntelligenceService:
             ),
             "createdAt": message.created_at,
         }
+        if message.role == "assistant":
+            payload["agentMetadata"] = self._chat_model_metadata()
+        return payload
+
+    def _chat_model_metadata(self) -> dict[str, str]:
+        return chat_model_usage(self.settings.bi_pipeline_mode)
 
     @staticmethod
     def _safe_error(error: Exception) -> str:

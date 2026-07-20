@@ -23,14 +23,37 @@ from app.core.prompts import (
 )
 
 
-def test_checked_in_configuration_is_multi_agent_and_groq_only() -> None:
+def test_checked_in_configuration_uses_the_aligned_agent_models() -> None:
     config = load_runtime_config()
 
     assert config.pipeline_mode == "multi"
-    assert {policy.provider for policy in config.agents.values()} == {"groq"}
-    assert config.agents["data_preparation"].model == "openai/gpt-oss-20b"
-    assert config.agents["insight_synthesis"].model == "openai/gpt-oss-120b"
+    assert {
+        name: (policy.provider, policy.model)
+        for name, policy in config.agents.items()
+        if not name.startswith("single_")
+    } == {
+        "data_preparation": ("groq", "openai/gpt-oss-20b"),
+        "orchestrator": ("groq", "groq/compound"),
+        "kpi_trend": ("groq", "openai/gpt-oss-120b"),
+        "anomaly_detection": (
+            "openrouter",
+            "nvidia/nemotron-3-super-120b-a12b:free",
+        ),
+        "dashboard_generation": (
+            "openrouter",
+            "poolside/laguna-xs-2.1:free",
+        ),
+        "insight_synthesis": (
+            "openrouter",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+        ),
+        "chat": ("groq", "openai/gpt-oss-120b"),
+    }
     assert config.forecasting.model == "google/timesfm-2.5-200m-pytorch"
+    assert config.agents["chat"].timeout_seconds == 25
+    assert config.agents["anomaly_detection"].supports_response_format is True
+    assert config.agents["insight_synthesis"].supports_response_format is False
+    assert config.agents["dashboard_generation"].supports_response_format is False
 
 
 def test_environment_does_not_override_versioned_agent_configuration(monkeypatch) -> None:
@@ -50,12 +73,13 @@ def test_checked_in_rag_configuration() -> None:
     assert config.embedding.model == "BAAI/bge-small-en-v1.5"
     assert config.embedding.dimensions == 384
     assert config.embedding.batch_size == 8
-    assert config.reranking.model == "Qwen/Qwen3-Reranker-0.6B"
-    assert config.reranking.batch_size == 4
-    assert config.reranking.limit == 6
-    assert config.retrieval.vector_search_limit == 20
-    assert config.retrieval.chat_search_limit == 6
-    assert config.retrieval.match_threshold == 0.1
+    assert config.reranking.model == "BAAI/bge-reranker-v2-m3"
+    assert config.reranking.batch_size == 8
+    assert config.reranking.limit == 4
+    assert config.reranking.max_length == 384
+    assert config.retrieval.vector_search_limit == 8
+    assert config.retrieval.chat_search_limit == 4
+    assert config.retrieval.match_threshold == 0.25
     assert config.chunking.size == 800
     assert config.chunking.overlap == 100
 
@@ -72,7 +96,7 @@ def test_invalid_rag_configuration_is_rejected(tmp_path: Path) -> None:
         load_rag_config(config_path)
 
     config_path.write_text(
-        content.replace("match_threshold = 0.1", "match_threshold = 1.2"),
+        content.replace("match_threshold = 0.25", "match_threshold = 1.2"),
         encoding="utf-8",
     )
     with pytest.raises(RuntimeConfigurationError, match="retrieval.match_threshold"):
@@ -86,7 +110,10 @@ def test_invalid_rag_configuration_is_rejected(tmp_path: Path) -> None:
         load_rag_config(config_path)
 
     config_path.write_text(
-        content.replace("batch_size = 4", "batch_size = 0"),
+        content.replace(
+            "model = \"BAAI/bge-reranker-v2-m3\"\nbatch_size = 8",
+            "model = \"BAAI/bge-reranker-v2-m3\"\nbatch_size = 0",
+        ),
         encoding="utf-8",
     )
     with pytest.raises(RuntimeConfigurationError, match="reranking.batch_size"):
@@ -145,6 +172,7 @@ def test_prompt_bundles_validate_and_render_structured_toon() -> None:
         "multi/data_preparation.toon",
         "multi/insight_synthesis.toon",
         "multi/kpi_trend.toon",
+        "multi/orchestrator.toon",
         "single/business_intelligence.toon",
     }
     actual_bundles = {

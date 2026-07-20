@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,6 +10,7 @@ from app.agents.multi.chat_agent import (
     GroundedChatDraft,
     INSUFFICIENT_CONTEXT_ANSWER,
 )
+import app.services.chat_service as chat_service_module
 from app.core.config import Settings
 from app.rag.models import RetrievedDocument
 from app.services.business_intelligence_service import (
@@ -127,6 +129,18 @@ class DummyChatAgent:
         return self.draft
 
 
+class SlowChatAgent:
+    async def run(
+        self,
+        session_id: str,
+        query: str,
+        retrieved_documents: list[RetrievedDocument],
+        history: list[dict[str, str]] | None = None,
+    ) -> GroundedChatDraft:
+        await asyncio.Event().wait()
+        raise AssertionError("The timeout should cancel the chat agent.")
+
+
 def _service(
     documents: list[RetrievedDocument],
     draft: GroundedChatDraft,
@@ -169,6 +183,9 @@ def test_multi_chat_is_session_scoped_grounded_and_persisted() -> None:
 
     assert response.answer == "The revenue KPI is 120."
     assert response.grounding == "Retrieved dataset sources: `kpi_revenue`."
+    assert response.agentMetadata.agent == "Chat assistant"
+    assert response.agentMetadata.provider == "groq"
+    assert response.agentMetadata.model == "openai/gpt-oss-120b"
     assert rag.calls == [(SESSION_ID, "What is the revenue KPI?", 20)]
     assert rag.rerank_calls == [
         ("What is the revenue KPI?", ["kpi_revenue"])
@@ -288,6 +305,43 @@ def test_multi_chat_returns_insufficient_context_for_empty_retrieval() -> None:
     assert response.grounding == "No supporting dataset evidence was available."
     assert len(rag.calls) == 1
     assert agent.calls == 1
+    assert [message.role for message in storage.messages] == ["user", "assistant"]
+
+
+def test_multi_chat_returns_retrieved_recommendations_when_generation_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    documents = [
+        RetrievedDocument(
+            page_content="Review discounting on low-margin orders before expanding campaigns.",
+            metadata={
+                "source_id": "recommendation_protect_margin",
+                "document_type": "recommendation",
+                "title": "Protect margin",
+            },
+            score=0.9,
+        )
+    ]
+    storage = ChatStorage()
+    service = BusinessIntelligenceService(
+        storage=storage,  # type: ignore[arg-type]
+        settings=Settings("", "", bi_pipeline_mode="multi"),
+        rag=DummyRag(documents),
+        multi_chat_agent=SlowChatAgent(),
+    )
+    monkeypatch.setattr(chat_service_module, "_CHAT_AGENT_TIMEOUT_SECONDS", 0.01)
+
+    response = service.chat(
+        SESSION_ID,
+        "What business recommendation can you make?",
+        USER_ID,
+    )
+
+    assert "detailed recommendation timed out" in response.answer
+    assert "Protect margin" in response.answer
+    assert response.grounding == (
+        "Retrieved dataset sources: `recommendation_protect_margin`."
+    )
     assert [message.role for message in storage.messages] == ["user", "assistant"]
 
 

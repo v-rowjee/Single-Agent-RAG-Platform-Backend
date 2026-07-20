@@ -373,11 +373,21 @@ def test_single_agent_api_full_flow_uses_only_deterministic_fakes(full_flow) -> 
     assert first_chat.json() == {
         "answer": "Revenue totals 30 across North and South.",
         "grounding": "The uploaded sales dataset.",
+        "agentMetadata": {
+            "agent": "Chat assistant",
+            "provider": "groq",
+            "model": "openai/gpt-oss-120b",
+        },
     }
     assert second_chat.status_code == 200
     assert second_chat.json() == {
         "answer": "North contributes 10 and South contributes 20.",
         "grounding": "The prior revenue result and the regional rows.",
+        "agentMetadata": {
+            "agent": "Chat assistant",
+            "provider": "groq",
+            "model": "openai/gpt-oss-120b",
+        },
     }
     assert agent.chat_calls[0]["history"] == []
     assert agent.chat_calls[1]["history"] == [
@@ -409,6 +419,11 @@ def test_single_agent_api_full_flow_uses_only_deterministic_fakes(full_flow) -> 
         False,
         True,
     ]
+    assert history.json()["messages"][1]["agentMetadata"] == {
+        "agent": "Chat assistant",
+        "provider": "groq",
+        "model": "openai/gpt-oss-120b",
+    }
 
 
 def test_analysis_routes_reject_requests_without_a_bearer_token() -> None:

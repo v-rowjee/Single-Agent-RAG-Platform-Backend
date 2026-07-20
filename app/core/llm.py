@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from abc import ABC, abstractmethod
 from copy import deepcopy
+from json import JSONDecoder
 from typing import Any, TypeVar
 
 from groq import AsyncGroq
@@ -12,7 +13,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
 from openai import AsyncOpenAI
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel, SecretStr, ValidationError
 
 from app.core.config import AgentModelPolicy, AgentProvider
 
@@ -48,7 +49,7 @@ class _ProviderAdapter(ABC):
         self,
         *,
         policy: AgentModelPolicy,
-        response_format: dict[str, Any],
+        response_format: dict[str, Any] | None,
         messages: list[dict[str, str]],
     ) -> Any:
         """Create one provider-native structured chat completion."""
@@ -74,16 +75,17 @@ class _GroqAdapter(_ProviderAdapter):
         self,
         *,
         policy: AgentModelPolicy,
-        response_format: dict[str, Any],
+        response_format: dict[str, Any] | None,
         messages: list[dict[str, str]],
     ) -> Any:
         request: dict[str, Any] = {
             "model": policy.model,
             "temperature": policy.temperature,
             "max_completion_tokens": policy.max_completion_tokens,
-            "response_format": response_format,
             "messages": messages,
         }
+        if response_format is not None:
+            request["response_format"] = response_format
         if policy.reasoning_effort is not None:
             request["reasoning_effort"] = policy.reasoning_effort
         return await AsyncGroq(api_key=self.api_key()).chat.completions.create(
@@ -119,7 +121,7 @@ class _OpenRouterAdapter(_ProviderAdapter):
         self,
         *,
         policy: AgentModelPolicy,
-        response_format: dict[str, Any],
+        response_format: dict[str, Any] | None,
         messages: list[dict[str, str]],
     ) -> Any:
         client = AsyncOpenAI(
@@ -128,13 +130,17 @@ class _OpenRouterAdapter(_ProviderAdapter):
             timeout=120,
             max_retries=1,
         )
+        request: dict[str, Any] = {
+            "model": policy.model,
+            "temperature": policy.temperature,
+            "max_tokens": policy.max_completion_tokens,
+            "messages": messages,
+            "extra_body": _openrouter_extra_body(policy),
+        }
+        if response_format is not None:
+            request["response_format"] = response_format
         return await client.chat.completions.create(
-            model=policy.model,
-            temperature=policy.temperature,
-            max_tokens=policy.max_completion_tokens,
-            response_format=response_format,
-            messages=messages,  # type: ignore[arg-type]
-            extra_body=_openrouter_extra_body(policy),
+            **request,
         )
 
 
@@ -197,7 +203,7 @@ async def request_structured(
 ) -> StructuredModel:
     """Request and validate one structured completion from the selected provider."""
     if policy.strict_json_schema:
-        response_format: dict[str, Any] = {
+        response_format: dict[str, Any] | None = {
             "type": "json_schema",
             "json_schema": {
                 "name": schema_name,
@@ -205,14 +211,27 @@ async def request_structured(
                 "schema": _strict_schema(response_model),
             },
         }
-    else:
+    elif policy.supports_response_format:
         response_format = {"type": "json_object"}
+    else:
+        response_format = None
 
     response = await _provider(policy).create_structured_completion(
         policy=policy,
         response_format=response_format,
         messages=messages,
     )
-    return response_model.model_validate_json(
-        response.choices[0].message.content or "{}"
-    )
+    content = response.choices[0].message.content or "{}"
+    try:
+        return response_model.model_validate_json(content)
+    except ValidationError as original_error:
+        decoder = JSONDecoder()
+        for index, character in enumerate(content):
+            if character != "{":
+                continue
+            try:
+                value, _ = decoder.raw_decode(content[index:])
+                return response_model.model_validate(value)
+            except (ValueError, ValidationError):
+                continue
+        raise original_error

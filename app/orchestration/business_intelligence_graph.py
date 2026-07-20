@@ -329,11 +329,8 @@ def build_business_intelligence_graph(
     graph.add_edge("forecasting", "specialist_join")
     graph.add_edge("specialist_join", "insight_synthesis")
     graph.add_edge("insight_synthesis", "dashboard_generation")
-    graph.add_edge("insight_synthesis", "retrieval_preparation")
-    graph.add_edge(
-        ["dashboard_generation", "retrieval_preparation"],
-        "output_join",
-    )
+    graph.add_edge("dashboard_generation", "retrieval_preparation")
+    graph.add_edge("retrieval_preparation", "output_join")
     graph.add_edge("output_join", END)
     return graph.compile()
 

@@ -50,27 +50,36 @@ and reasoning effort for one LLM invocation. Each LLM agent has one versioned
 TOON bundle in `app/prompts/`; the backend validates the bundle at startup and
 serializes its structured system and user context as TOON before invocation.
 Mode and model settings are deliberately not read from `.env`.
+The multi-agent chat response has a 25-second generation limit. If it expires,
+the API returns already-retrieved recommendation evidence when available.
 The `[forecasting]` table configures the TimesFM model and its limits.
 Keep API keys, Supabase credentials, and other secrets in `.env` only.
 
-## LLM providers
+## Model alignment
 
-Groq remains the checked-in default. Every LLM agent can independently select
-`groq` or `openrouter` in `config/agents.toml`, so the pipeline can use one
-provider throughout or mix providers by workload:
+The checked-in multi-agent workflow mixes providers by workload:
 
-```toml
-[agents.chat]
-provider = "openrouter"
-model = "openai/gpt-oss-120b"
-temperature = 0.1
-max_completion_tokens = 600
-reasoning_effort = "low"
-strict_json_schema = true
-```
+| Step / agent | Model | Provider |
+| --- | --- | --- |
+| Data preparation | `openai/gpt-oss-20b` | Groq |
+| Orchestrator | `groq/compound` | Groq |
+| KPI and trend analysis | `openai/gpt-oss-120b` | Groq |
+| Anomaly detection | `nvidia/nemotron-3-super-120b-a12b:free` | OpenRouter |
+| Forecasting | `google/timesfm-2.5-200m-pytorch` | Self-hosted |
+| Insight synthesis | `nvidia/nemotron-3-ultra-550b-a55b:free` | OpenRouter |
+| Dashboard generation | `poolside/laguna-xs-2.1:free` | OpenRouter |
+| Retrieval embedding | `BAAI/bge-small-en-v1.5` | Self-hosted |
+| Retrieval reranking | `BAAI/bge-reranker-v2-m3` | Self-hosted |
+| Chat | `openai/gpt-oss-120b` | Groq |
 
-Use a model identifier available from the selected provider. Configure only
-the credentials needed by the active policies:
+Generic cleaning, specialist join, and Supabase persistence are non-LLM
+steps. Forecast output is passed directly to insight synthesis, so the optional
+forecast-narration call is not instantiated. If a separate narration node is
+introduced later, it should use `openai/gpt-oss-20b` through Groq.
+
+Every LLM agent independently selects `groq` or `openrouter` in
+`config/agents.toml`. Use a model identifier available from the selected
+provider. Configure only the credentials needed by the active policies:
 
 ```dotenv
 GROQ_API_KEY=your-groq-api-key
@@ -83,7 +92,7 @@ deterministic validation, fallback behavior, or API contracts.
 The multi-agent analysis flow is:
 
 ```text
-Upload -> Generic Cleaning -> Data Preparation -> Orchestrator
+Upload -> Generic Cleaning -> Data Preparation -> Compound Orchestrator
        -> capability-gated KPI/Trend, Anomaly, and Forecast specialists
        -> Specialist Join -> Insight Synthesis
        -> Dashboard Generation ----\
@@ -100,19 +109,19 @@ files are validated when the API starts, so invalid settings fail early with a
 configuration error.
 
 The embedding model is `BAAI/bge-small-en-v1.5` and the second-stage reranker is
-`Qwen/Qwen3-Reranker-0.6B`. Both are loaded lazily through Sentence Transformers,
+`BAAI/bge-reranker-v2-m3`. Both are loaded lazily through Sentence Transformers,
 download their weights on first use, and let PyTorch select CUDA when available
 or fall back to CPU. BGE-small produces normalized 384-dimensional vectors.
 Short retrieval queries receive BGE's recommended English query instruction,
-while indexed documents remain unprefixed. The reranker applies Qwen's built-in
-query-document relevance prompt to the vector search candidates.
+while indexed documents remain unprefixed.
+The reranker scores query-document pairs from the vector search candidates.
 
 The fresh-project schema creates `document_chunks` and its vector-search
 function with `vector(384)`, matching the BGE-small embedding output. Projects
-created with the former 1024-dimensional Qwen schema must stop the API and run
-`scripts/migrate_qwen_to_bge_small.sql` once in the Supabase SQL editor before
-restarting. The migration preserves uploaded files but clears derived dashboards
-and vectors so the next dashboard request rebuilds them consistently.
+that applied the 1024-dimensional Voyage migration must stop the API and run
+`scripts/rollback_voyage_4_nano_to_bge_small.sql` once in the Supabase SQL editor
+before restarting. The rollback preserves uploaded files but clears derived
+dashboards and vectors so the next dashboard request rebuilds them consistently.
 
 Dashboard generation and retrieval preparation must both report completion or
 failure before the graph's output join runs. The top-level business intelligence

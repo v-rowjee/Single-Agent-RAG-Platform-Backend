@@ -9,6 +9,25 @@ import pytest
 from app.orchestration.business_intelligence_graph import (
     build_business_intelligence_graph,
 )
+from app.agents.multi.orchestrator_agent import OrchestrationPlan
+
+
+def test_orchestration_plan_accepts_compound_keyed_decisions() -> None:
+    plan = OrchestrationPlan.model_validate(
+        {
+            "selected_agents": ["kpi_trend", "forecasting"],
+            "decisions": {
+                "kpi_trend": "The dataset supports KPI and trend analysis.",
+                "forecasting": "The dataset has a usable time series.",
+            },
+        }
+    )
+
+    assert [decision.agent for decision in plan.decisions] == [
+        "kpi_trend",
+        "forecasting",
+    ]
+    assert all(decision.selected for decision in plan.decisions)
 
 
 def _node(
@@ -116,7 +135,7 @@ def test_capability_routing_and_joins_execute_once(
     if specialist_positions:
         assert max(specialist_positions) < events.index("specialist_join")
     assert events.index("specialist_join") < events.index("insight_synthesis")
-    assert events.index("dashboard_generation") < events.index("output_join")
+    assert events.index("dashboard_generation") < events.index("retrieval_preparation")
     assert events.index("retrieval_preparation") < events.index("output_join")
 
 

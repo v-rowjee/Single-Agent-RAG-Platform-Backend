@@ -21,14 +21,20 @@ class StructuredAnswer(BaseModel):
     answer: str
 
 
-def _policy(provider: str) -> AgentModelPolicy:
+def _policy(
+    provider: str,
+    *,
+    strict_json_schema: bool = True,
+    supports_response_format: bool = True,
+) -> AgentModelPolicy:
     return AgentModelPolicy(
         provider=provider,  # type: ignore[arg-type]
         model="provider/model",
         temperature=0.2,
         max_completion_tokens=321,
         reasoning_effort="low",
-        strict_json_schema=True,
+        strict_json_schema=strict_json_schema,
+        supports_response_format=supports_response_format,
     )
 
 
@@ -120,6 +126,41 @@ def test_openrouter_uses_its_endpoint_and_normalized_reasoning(
         "provider": {"require_parameters": True},
         "reasoning": {"effort": "low"},
     }
+
+
+def test_prompt_only_structured_request_omits_unsupported_response_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class Completions:
+        async def create(self, **request: Any) -> Any:
+            captured["request"] = request
+            return _completion('Result:\n```json\n{"answer":"ok"}\n```')
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            self.chat = SimpleNamespace(completions=Completions())
+
+    policy = _policy(
+        "openrouter",
+        strict_json_schema=False,
+        supports_response_format=False,
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setattr(llm_module, "AsyncOpenAI", FakeAsyncOpenAI)
+
+    result = asyncio.run(
+        request_structured(
+            policy=policy,
+            response_model=StructuredAnswer,
+            schema_name="structured_answer",
+            messages=[{"role": "user", "content": "Return JSON only"}],
+        )
+    )
+
+    assert result == StructuredAnswer(answer="ok")
+    assert "response_format" not in captured["request"]
 
 
 def test_chat_model_factory_dispatches_from_the_agent_policy(

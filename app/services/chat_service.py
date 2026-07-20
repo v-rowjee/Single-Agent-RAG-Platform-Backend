@@ -13,7 +13,7 @@ from app.agents.multi.chat_agent import (
     INSUFFICIENT_CONTEXT_ANSWER,
     chat_agent,
 )
-from app.core.config import get_rag_config
+from app.core.config import agent_model_policy, get_rag_config
 from app.rag.models import RetrievedDocument
 from app.rag.rag_service import rag_service
 
@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 _RAG_CONFIG = get_rag_config()
 _VECTOR_SEARCH_LIMIT = _RAG_CONFIG.retrieval.vector_search_limit
 _CHAT_SEARCH_LIMIT = _RAG_CONFIG.retrieval.chat_search_limit
+_CHAT_AGENT_TIMEOUT_SECONDS = agent_model_policy("chat").timeout_seconds
 _MAX_HISTORY_MESSAGES = 6
 _MAX_HISTORY_CHARACTERS = 2_000
 
@@ -32,6 +33,10 @@ BLOCKED_CHAT_ANSWER = (
 )
 CHAT_FAILURE_ANSWER = (
     "The analysis assistant could not answer this question at the moment."
+)
+CHAT_TIMEOUT_ANSWER = (
+    "The detailed response took longer than expected. Please try asking about "
+    "a specific product, period, or trend."
 )
 CAUSAL_TERMS = ("caused", "cause", "because", "responsible", "driver")
 CAUSAL_FALLBACK = (
@@ -168,6 +173,46 @@ def _ground_draft(
     return draft.model_copy(update={"source_ids": source_ids})
 
 
+def _timeout_fallback(documents: list[RetrievedDocument]) -> GroundedChatDraft:
+    """Return retrieved recommendations when model generation exceeds its budget."""
+    recommendations = [
+        document
+        for document in documents
+        if document.metadata.get("document_type") == "recommendation"
+        and document.page_content.strip()
+    ][:3]
+    if not recommendations:
+        return GroundedChatDraft(
+            answer=CHAT_TIMEOUT_ANSWER,
+            source_ids=[],
+            insufficient_context=True,
+        )
+
+    actions = []
+    source_ids: list[str] = []
+    for document in recommendations:
+        title = str(document.metadata.get("title") or "Recommended action").strip()
+        actions.append(f"- {title}: {document.page_content.strip()}")
+        for source_id in _source_ids(document):
+            if source_id not in source_ids:
+                source_ids.append(source_id)
+
+    if not source_ids:
+        return GroundedChatDraft(
+            answer=CHAT_TIMEOUT_ANSWER,
+            source_ids=[],
+            insufficient_context=True,
+        )
+    return GroundedChatDraft(
+        answer=(
+            "The detailed recommendation timed out, so here are the existing "
+            "dataset-grounded actions:\n" + "\n".join(actions)
+        ),
+        source_ids=source_ids,
+        insufficient_context=False,
+    )
+
+
 class ChatService:
     def __init__(self, rag: Any | None = None, agent: Any | None = None) -> None:
         self._rag = rag or rag_service
@@ -205,13 +250,23 @@ class ChatService:
         documents = (reranked or candidates)[:_CHAT_SEARCH_LIMIT]
         try:
             draft = asyncio.run(
-                self._agent.run(
-                    session_id=session_id,
-                    query=cleaned_query,
-                    retrieved_documents=documents,
-                    history=safe_history,
+                asyncio.wait_for(
+                    self._agent.run(
+                        session_id=session_id,
+                        query=cleaned_query,
+                        retrieved_documents=documents,
+                        history=safe_history,
+                    ),
+                    timeout=_CHAT_AGENT_TIMEOUT_SECONDS,
                 )
             )
+        except TimeoutError:
+            logger.warning(
+                "Chat agent timed out session_id=%s timeout_seconds=%s",
+                session_id,
+                _CHAT_AGENT_TIMEOUT_SECONDS,
+            )
+            draft = _timeout_fallback(documents)
         except Exception:
             logger.exception("Chat agent failed session_id=%s", session_id)
             draft = GroundedChatDraft(

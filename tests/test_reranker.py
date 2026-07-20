@@ -20,8 +20,9 @@ class FakeCrossEncoder:
     scores = [0.2, 0.9, -0.4]
     error: Exception | None = None
 
-    def __init__(self, model_name: str) -> None:
+    def __init__(self, model_name: str, **options: object) -> None:
         self.model_name = model_name
+        self.options = options
         self.calls: list[
             tuple[list[tuple[str, str]], dict[str, object]]
         ] = []
@@ -68,17 +69,17 @@ def _documents() -> list[RetrievedDocument]:
     ]
 
 
-def test_qwen_reranker_lazily_scores_and_orders_documents(monkeypatch) -> None:
+def test_bge_reranker_lazily_scores_and_orders_documents(monkeypatch) -> None:
     _install_fake_cross_encoder(monkeypatch)
-    reranker = SentenceTransformerReranker(
-        model_name="Qwen/Qwen3-Reranker-0.6B"
-    )
+    reranker = SentenceTransformerReranker()
 
     ranked = reranker.rerank("What is profit?", _documents(), limit=2)
 
     assert len(FakeCrossEncoder.instances) == 1
     model = FakeCrossEncoder.instances[0]
-    assert model.model_name == "Qwen/Qwen3-Reranker-0.6B"
+    assert model.model_name == "BAAI/bge-reranker-v2-m3"
+    assert model.options["max_length"] == 384
+    assert "activation_fn" in model.options
     assert model.calls == [
         (
             [
@@ -87,7 +88,7 @@ def test_qwen_reranker_lazily_scores_and_orders_documents(monkeypatch) -> None:
                 ("What is profit?", "The office is in London."),
             ],
             {
-                "batch_size": 4,
+                    "batch_size": 8,
                 "show_progress_bar": False,
                 "convert_to_numpy": True,
             },
@@ -100,7 +101,7 @@ def test_qwen_reranker_lazily_scores_and_orders_documents(monkeypatch) -> None:
     assert [item.reranker_score for item in ranked] == [0.9, 0.2]
 
 
-def test_qwen_reranker_preserves_vector_order_on_failure(monkeypatch) -> None:
+def test_bge_reranker_preserves_vector_order_on_failure(monkeypatch) -> None:
     _install_fake_cross_encoder(monkeypatch)
     FakeCrossEncoder.error = RuntimeError("reranker unavailable")
     reranker = SentenceTransformerReranker()
@@ -114,7 +115,7 @@ def test_qwen_reranker_preserves_vector_order_on_failure(monkeypatch) -> None:
     assert all(item.reranker_score is None for item in ranked)
 
 
-def test_qwen_reranker_does_not_load_model_without_documents(monkeypatch) -> None:
+def test_bge_reranker_does_not_load_model_without_documents(monkeypatch) -> None:
     _install_fake_cross_encoder(monkeypatch)
     reranker = SentenceTransformerReranker()
 

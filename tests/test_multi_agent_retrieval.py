@@ -219,3 +219,37 @@ def test_multi_retrieval_preparation_includes_prepared_row_evidence(
     assert "TX-001" in "\n".join(document.content for document in row_documents)
     assert "TX-002" in "\n".join(document.content for document in row_documents)
 
+
+def test_multi_retrieval_preparation_indexes_dashboard_recommendations() -> None:
+    result = asyncio.run(
+        RetrievalPreparationAgent().run(
+            prepared_dataset={},
+            kpi_trend_output=None,
+            anomaly_output=None,
+            forecasting_output=None,
+            synthesis_output={},
+            dashboard_output={
+                "dashboard": {
+                    "recommendedActions": [
+                        {
+                            "id": "protect_margin",
+                            "title": "Protect margin",
+                            "description": "Review discounting in the South region.",
+                            "priority": "high",
+                            "sourceIds": ["anomaly_margin"],
+                        }
+                    ]
+                }
+            },
+        )
+    )
+
+    recommendation = next(
+        document
+        for document in result.documents
+        if document.id == "recommendation_protect_margin"
+    )
+    assert recommendation.document_type == "recommendation"
+    assert "Review discounting" in recommendation.content
+    assert recommendation.source_ids == ["anomaly_margin"]
+

@@ -56,6 +56,63 @@ def _add(documents: list[RetrievalDocument], **values: Any) -> None:
         documents.append(RetrievalDocument(**values))
 
 
+def dashboard_retrieval_documents(
+    dashboard_output: dict[str, Any] | None,
+) -> list[RetrievalDocument]:
+    """Turn the saved dashboard into authoritative chat evidence.
+
+    The dashboard can add fallback recommended actions after synthesis, so it is
+    the final source of truth for the recommendations shown to the user.
+    """
+    payload = dashboard_output if isinstance(dashboard_output, dict) else {}
+    dashboard = payload.get("dashboard", payload)
+    if not isinstance(dashboard, dict):
+        return []
+
+    documents: list[RetrievalDocument] = []
+    summary = str(dashboard.get("executiveSummary") or "").strip()
+    if summary:
+        _add(
+            documents,
+            id="dashboard_executive_summary",
+            document_type="insight",
+            title="Dashboard executive summary",
+            content=summary,
+            source_ids=["dashboard_executive_summary"],
+            metadata={"source": "dashboard"},
+        )
+    for item in dashboard.get("kpis", []):
+        if isinstance(item, dict) and item.get("id"):
+            _add(
+                documents,
+                id=_document_id("kpi", item["id"]),
+                document_type="kpi",
+                title=str(item.get("title") or item["id"]),
+                content=(
+                    f"{item.get('title') or item['id']}: {item.get('value')}. "
+                    f"{(item.get('indicator') or {}).get('text') or ''}"
+                ).strip(),
+                source_ids=[str(item["id"])],
+                metadata={"source": "dashboard", "raw_value": item.get("rawValue")},
+            )
+    for item in dashboard.get("recommendedActions", []):
+        if isinstance(item, dict) and item.get("id"):
+            source_ids = [str(source_id) for source_id in item.get("sourceIds") or []]
+            _add(
+                documents,
+                id=_document_id("recommendation", item["id"]),
+                document_type="recommendation",
+                title=str(item.get("title") or item["id"]),
+                content=(
+                    f"Recommended action ({item.get('priority') or 'medium'} priority): "
+                    f"{item.get('title') or item['id']}. {item.get('description') or ''}"
+                ).strip(),
+                source_ids=source_ids,
+                metadata={"source": "dashboard", "priority": item.get("priority")},
+            )
+    return documents
+
+
 def _raw_row_documents(
     prepared: dict[str, Any],
 ) -> tuple[list[RetrievalDocument], list[str]]:
@@ -108,7 +165,7 @@ def _raw_row_documents(
 
 
 class RetrievalPreparationAgent:
-    async def run(self, prepared_dataset: dict[str, Any], kpi_trend_output: dict[str, Any] | None, anomaly_output: dict[str, Any] | None, forecasting_output: dict[str, Any] | None, synthesis_output: dict[str, Any]) -> RetrievalPreparationOutput:
+    async def run(self, prepared_dataset: dict[str, Any], kpi_trend_output: dict[str, Any] | None, anomaly_output: dict[str, Any] | None, forecasting_output: dict[str, Any] | None, synthesis_output: dict[str, Any], dashboard_output: dict[str, Any] | None = None) -> RetrievalPreparationOutput:
         prepared = prepared_dataset if isinstance(prepared_dataset, dict) else {}
         kpi, anomaly, forecast = kpi_trend_output or {}, anomaly_output or {}, forecasting_output or {}
         synthesis = synthesis_output if isinstance(synthesis_output, dict) else {}
@@ -137,6 +194,11 @@ class RetrievalPreparationAgent:
             if item.get("id"):
                 source_ids = [str(ref.get("source_id")) for ref in item.get("evidence", []) if ref.get("source_id")]
                 _add(documents, id=_document_id("recommendation", item["id"]), document_type="recommendation", title=str(item.get("title") or item["id"]), content=str(item.get("description") or ""), source_ids=source_ids, metadata={"priority": item.get("priority")})
+        existing_ids = {document.id for document in documents}
+        for document in dashboard_retrieval_documents(dashboard_output):
+            if document.id not in existing_ids:
+                _add(documents, **document.model_dump(mode="json"))
+                existing_ids.add(document.id)
         limitations = list(dict.fromkeys([*(prepared.get("limitations") or []), *(kpi.get("limitations") or []), *(anomaly.get("limitations") or []), *(forecast.get("limitations") or []), *(synthesis.get("limitations") or [])]))
         if limitations:
             _add(documents, id="limitations", document_type="limitation", title="Analysis limitations", content=" ".join(str(value) for value in limitations), source_ids=["dataset_summary"], metadata={"count": len(limitations)})
@@ -151,5 +213,5 @@ retrieval_preparation_agent = RetrievalPreparationAgent()
 
 
 async def retrieval_preparation_node(state: dict[str, Any]) -> dict[str, Any]:
-    result = await retrieval_preparation_agent.run(state.get("prepared_dataset", {}), state.get("kpi_trend_output"), state.get("anomaly_output"), state.get("forecasting_output"), state.get("synthesis_output", {}))
+    result = await retrieval_preparation_agent.run(state.get("prepared_dataset", {}), state.get("kpi_trend_output"), state.get("anomaly_output"), state.get("forecasting_output"), state.get("synthesis_output", {}), state.get("dashboard_output"))
     return {"retrieval_documents": result.documents_as_dicts(), "retrieval_output": result.model_dump(mode="json"), "completed_agents": ["retrieval_preparation"]}

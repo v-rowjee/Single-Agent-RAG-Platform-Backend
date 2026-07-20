@@ -14,58 +14,65 @@ max_completion_tokens = 800
 reasoning_effort = "low"
 strict_json_schema = true
 
+[agents.orchestrator]
+provider = "groq"
+model = "groq/compound"
+temperature = 0.0
+max_completion_tokens = 500
+strict_json_schema = false
+
 [agents.kpi_trend]
 provider = "groq"
-model = "openai/gpt-oss-20b"
+model = "openai/gpt-oss-120b"
 temperature = 0.1
 max_completion_tokens = 600
 reasoning_effort = "low"
 strict_json_schema = true
 
 [agents.anomaly_detection]
-provider = "groq"
-model = "openai/gpt-oss-20b"
+provider = "openrouter"
+model = "nvidia/nemotron-3-super-120b-a12b:free"
 temperature = 0.1
 max_completion_tokens = 600
-reasoning_effort = "low"
-strict_json_schema = true
+strict_json_schema = false
 
 [agents.dashboard_generation]
-provider = "groq"
-model = "openai/gpt-oss-20b"
+provider = "openrouter"
+model = "poolside/laguna-xs-2.1:free"
 temperature = 0.2
 max_completion_tokens = 500
-reasoning_effort = "low"
-strict_json_schema = true
+strict_json_schema = false
+supports_response_format = false
 
 [agents.insight_synthesis]
-provider = "groq"
-model = "openai/gpt-oss-120b"
+provider = "openrouter"
+model = "nvidia/nemotron-3-ultra-550b-a55b:free"
 temperature = 0.2
 max_completion_tokens = 1000
-reasoning_effort = "low"
-strict_json_schema = true
+strict_json_schema = false
+supports_response_format = false
 
 [agents.chat]
 provider = "groq"
 model = "openai/gpt-oss-120b"
 temperature = 0.1
 max_completion_tokens = 600
-reasoning_effort = "low"
-strict_json_schema = true
+timeout_seconds = 15
+reasoning_effort = "none"
+strict_json_schema = false
+supports_response_format = false
 
 [agents.single_dashboard]
-provider = "groq"
-model = "openai/gpt-oss-120b"
+provider = "openrouter"
+model = "nvidia/nemotron-3-ultra-550b-a55b:free"
 temperature = 0.0
 max_completion_tokens = 1000
-reasoning_effort = "low"
 strict_json_schema = false
+supports_response_format = false
 
 [agents.single_chat]
 provider = "groq"
 model = "openai/gpt-oss-120b"
 temperature = 0.0
 max_completion_tokens = 220
-reasoning_effort = "low"
 strict_json_schema = false

@@ -5,19 +5,19 @@ batch_size = 8
 
 [reranking]
 model = "BAAI/bge-reranker-v2-m3"
-batch_size = 4
-limit = 6
-max_length = 1024
+batch_size = 8
+limit = 4
+max_length = 384
 
 [retrieval]
-vector_search_limit = 20
-chat_search_limit = 6
-match_threshold = 0.1
-max_context_chars = 7000
+vector_search_limit = 8
+chat_search_limit = 4
+match_threshold = 0.25
+max_context_chars = 4000
 
 [chunking]
 size = 800
 overlap = 100
 max_row_batch_documents = 24
-rows_per_batch_document = 25
+rows_per_batch_document = 8
 max_columns_per_row_document = 12

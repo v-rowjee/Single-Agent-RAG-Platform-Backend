@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.core.config import agent_model_policy
+from app.core.llm import request_structured
+from app.core.prompts import render_agent_prompts
 
 MIN_TREND_PERIODS = 2
 MIN_FORECAST_PERIODS = 4
@@ -42,6 +47,39 @@ class AgentDecision(StrictModel):
 class OrchestrationPlan(StrictModel):
     selected_agents: list[AgentName] = Field(default_factory=list)
     decisions: list[AgentDecision] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_keyed_decisions(cls, value: Any) -> Any:
+        """Accept Compound's occasional ``{agent: reason}`` decision format."""
+        if not isinstance(value, dict) or not isinstance(value.get("decisions"), dict):
+            return value
+
+        payload = dict(value)
+        selected = {
+            str(agent)
+            for agent in payload.get("selected_agents") or []
+            if isinstance(agent, str)
+        }
+        decisions: list[dict[str, Any]] = []
+        for agent in AGENT_ORDER:
+            raw_decision = payload["decisions"].get(agent)
+            if raw_decision is None:
+                continue
+            if isinstance(raw_decision, dict):
+                decisions.append({"agent": agent, **raw_decision})
+            else:
+                reason = str(raw_decision).strip()
+                if reason:
+                    decisions.append(
+                        {
+                            "agent": agent,
+                            "selected": agent in selected,
+                            "reason": reason,
+                        }
+                    )
+        payload["decisions"] = decisions
+        return payload
 
     @field_validator("selected_agents")
     @classmethod
@@ -185,7 +223,88 @@ def _fallback_plan(
     )
 
 
+Planner: TypeAlias = Callable[
+    [dict[str, bool], set[AgentName]],
+    Awaitable[OrchestrationPlan],
+]
+
+
+async def _request_plan(
+    capabilities: dict[str, bool],
+    supported_agents: set[AgentName],
+) -> OrchestrationPlan:
+    prompts = render_agent_prompts(
+        "multi/orchestrator",
+        payload={
+            "capabilities": capabilities,
+            "eligible_agents": [
+                agent for agent in AGENT_ORDER if agent in supported_agents
+            ],
+        },
+    )
+    return await request_structured(
+        policy=agent_model_policy("orchestrator"),
+        response_model=OrchestrationPlan,
+        schema_name="orchestration_plan",
+        messages=[
+            {"role": "system", "content": prompts.system},
+            {"role": "user", "content": prompts.user},
+        ],
+    )
+
+
+def _capability_gated_plan(
+    proposed: OrchestrationPlan,
+    supported_agents: set[AgentName],
+) -> OrchestrationPlan:
+    """Keep Compound's routing decision inside deterministic capability gates."""
+    proposed_selected = set(proposed.selected_agents)
+    proposed_decisions = {
+        decision.agent: decision for decision in proposed.decisions
+    }
+    selected_agents = [
+        agent
+        for agent in AGENT_ORDER
+        if agent in supported_agents and agent in proposed_selected
+    ]
+    decisions: list[AgentDecision] = []
+
+    for agent in AGENT_ORDER:
+        selected = agent in selected_agents
+        proposed_decision = proposed_decisions.get(agent)
+
+        if agent not in supported_agents:
+            reason = (
+                "Not selected because the dataset does not support this analysis."
+            )
+        elif proposed_decision is not None:
+            reason = proposed_decision.reason
+        elif selected:
+            reason = "Selected by the orchestrator from the eligible specialists."
+        else:
+            reason = (
+                "Not selected because the orchestrator found no additional value "
+                "for this dataset."
+            )
+
+        decisions.append(
+            AgentDecision(
+                agent=agent,
+                selected=selected,
+                reason=reason,
+            )
+        )
+
+    return OrchestrationPlan(
+        selected_agents=selected_agents,
+        decisions=decisions,
+    )
+
+
 class OrchestratorAgent:
+    def __init__(self, planner: Planner | None = _request_plan) -> None:
+        self._planner = planner
+
     async def run(
         self,
         prepared_dataset: dict[str, Any],
@@ -203,8 +322,20 @@ class OrchestratorAgent:
             capabilities,
         )
 
-        result = _fallback_plan(supported_agents)
-        logger.info("Deterministic capability routing completed.")
+        if self._planner is None or not supported_agents:
+            result = _fallback_plan(supported_agents)
+            logger.info("Deterministic capability routing completed.")
+        else:
+            try:
+                proposed = await self._planner(capabilities, supported_agents)
+                result = _capability_gated_plan(proposed, supported_agents)
+                logger.info("Compound orchestration completed.")
+            except Exception as exc:
+                logger.warning(
+                    "Compound orchestration failed; using capability routing: %s",
+                    exc,
+                )
+                result = _fallback_plan(supported_agents)
 
         logger.info(
             "Selected specialist agents: %s",

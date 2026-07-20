@@ -18,6 +18,7 @@ SUPPORTED_PROVIDERS: frozenset[AgentProvider] = frozenset({"groq", "openrouter"}
 REQUIRED_AGENT_KEYS = frozenset(
     {
         "data_preparation",
+        "orchestrator",
         "kpi_trend",
         "anomaly_detection",
         "dashboard_generation",
@@ -45,8 +46,10 @@ class AgentModelPolicy:
     model: str
     temperature: float
     max_completion_tokens: int
+    timeout_seconds: int = 120
     reasoning_effort: ReasoningEffort = None
     strict_json_schema: bool = False
+    supports_response_format: bool = True
 
 
 @dataclass(frozen=True)
@@ -75,6 +78,7 @@ class RerankingPolicy:
     model: str
     batch_size: int
     limit: int
+    max_length: int
 
 
 @dataclass(frozen=True)
@@ -173,6 +177,16 @@ def _agent_policy(name: str, values: Any) -> AgentModelPolicy:
         raise RuntimeConfigurationError(
             f"agents.{name}.strict_json_schema must be true or false."
         )
+    supports_response_format = table.get("supports_response_format", True)
+    if not isinstance(supports_response_format, bool):
+        raise RuntimeConfigurationError(
+            f"agents.{name}.supports_response_format must be true or false."
+        )
+    if strict_json_schema and not supports_response_format:
+        raise RuntimeConfigurationError(
+            f"agents.{name} cannot enable strict_json_schema when "
+            "supports_response_format is false."
+        )
 
     return AgentModelPolicy(
         provider=cast(AgentProvider, provider),
@@ -187,8 +201,13 @@ def _agent_policy(name: str, values: Any) -> AgentModelPolicy:
                 integer=True,
             )
         ),
+        timeout_seconds=_positive_integer(
+            table.get("timeout_seconds", 120),
+            f"agents.{name}.timeout_seconds",
+        ),
         reasoning_effort=reasoning,
         strict_json_schema=strict_json_schema,
+        supports_response_format=supports_response_format,
     )
 
 
@@ -303,6 +322,10 @@ def load_rag_config(path: Path = RAG_CONFIG_PATH) -> RagConfiguration:
                 "reranking.batch_size",
             ),
             limit=rerank_limit,
+            max_length=_positive_integer(
+                reranking.get("max_length"),
+                "reranking.max_length",
+            ),
         ),
         retrieval=RetrievalPolicy(
             vector_search_limit=vector_search_limit,

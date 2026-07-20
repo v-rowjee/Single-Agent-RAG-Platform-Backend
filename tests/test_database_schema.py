@@ -5,7 +5,7 @@ DATABASE_SCHEMA_PATH = Path(__file__).resolve().parents[1] / "scripts" / "db.sql
 MIGRATION_PATH = (
     Path(__file__).resolve().parents[1]
     / "scripts"
-    / "migrate_qwen_to_bge_small.sql"
+    / "rollback_voyage_4_nano_to_bge_small.sql"
 )
 
 
@@ -29,7 +29,7 @@ def test_database_schema_is_a_non_destructive_fresh_project_bootstrap() -> None:
     assert "create or replace function" not in schema
 
 
-def test_bge_migration_preserves_uploaded_datasets_and_rebuilds_derived_data() -> None:
+def test_voyage_rollback_preserves_uploaded_datasets_and_rebuilds_derived_data() -> None:
     migration = MIGRATION_PATH.read_text(encoding="utf-8").casefold()
 
     assert "alter column embedding type extensions.vector(384)" in migration

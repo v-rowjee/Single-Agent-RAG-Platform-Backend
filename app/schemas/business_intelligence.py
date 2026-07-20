@@ -294,6 +294,7 @@ class DashboardResponse(BaseModel):
     pipelineMode: Literal["single", "multi"] | None = None
     model: str | None = None
     agentModels: list[AgentModelUsage] = Field(default_factory=list)
+    chatAgent: AgentModelUsage | None = None
 
     @model_validator(mode="after")
     def validate_dashboard_response(self) -> "DashboardResponse":
@@ -368,3 +369,4 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str = Field(min_length=1)
     grounding: str = Field(min_length=1)
+    agentMetadata: AgentModelUsage

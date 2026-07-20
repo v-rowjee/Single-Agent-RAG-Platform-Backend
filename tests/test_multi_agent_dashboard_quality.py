@@ -18,7 +18,11 @@ from app.agents.multi.dashboard_generation_agent import DashboardGenerationAgent
 from app.agents.multi.forecasting_agent import ForecastingAgent
 from app.agents.multi.insight_synthesis_agent import _fallback as synthesis_fallback
 from app.agents.multi.kpi_trend_agent import KPITrendAgent
-from app.agents.multi.orchestrator_agent import OrchestratorAgent
+from app.agents.multi.orchestrator_agent import (
+    AgentDecision,
+    OrchestrationPlan,
+    OrchestratorAgent,
+)
 from app.core.config import configured_agent_models
 
 
@@ -328,11 +332,66 @@ def test_deterministic_routing_and_active_model_defaults() -> None:
             "has_temporal_data": True,
         },
     }
-    plan = asyncio.run(OrchestratorAgent().run(prepared))
+    plan = asyncio.run(OrchestratorAgent(planner=None).run(prepared))
 
     assert plan.selected_agents == ["kpi_trend", "anomaly_detection", "forecasting"]
-    assert set(configured_agent_models().values()) <= {
-        "openai/gpt-oss-20b",
-        "openai/gpt-oss-120b",
-        "qwen/qwen3.6-27b",
+    assert configured_agent_models() == {
+        "data_preparation": "openai/gpt-oss-20b",
+        "orchestrator": "groq/compound",
+        "kpi_trend": "openai/gpt-oss-120b",
+        "anomaly_detection": "nvidia/nemotron-3-super-120b-a12b:free",
+        "dashboard_generation": "poolside/laguna-xs-2.1:free",
+        "insight_synthesis": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "chat": "openai/gpt-oss-120b",
+        "single_dashboard": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "single_chat": "qwen/qwen3.6-27b",
     }
+
+
+def test_compound_plan_remains_inside_deterministic_capability_gates() -> None:
+    prepared = {
+        "date_column": "transaction_date",
+        "primary_measures": ["net_revenue_gbp"],
+        "time_series_candidates": [],
+        "temporal_profile": {"unique_periods": 2},
+        "capability_flags": {
+            "supports_kpis": True,
+            "supports_trends": True,
+            "supports_anomalies": False,
+            "supports_forecasting": False,
+            "has_temporal_data": True,
+        },
+    }
+
+    async def propose(
+        capabilities: dict[str, bool],
+        eligible_agents: set[str],
+    ) -> OrchestrationPlan:
+        assert capabilities["supports_kpis"] is True
+        assert eligible_agents == {"kpi_trend"}
+        return OrchestrationPlan(
+            selected_agents=["kpi_trend", "anomaly_detection"],
+            decisions=[
+                AgentDecision(
+                    agent="kpi_trend",
+                    selected=True,
+                    reason="KPI analysis is relevant.",
+                ),
+                AgentDecision(
+                    agent="anomaly_detection",
+                    selected=True,
+                    reason="Requested despite missing capability.",
+                ),
+            ],
+        )
+
+    plan = asyncio.run(OrchestratorAgent(planner=propose).run(prepared))
+
+    assert plan.selected_agents == ["kpi_trend"]
+    anomaly = next(
+        decision
+        for decision in plan.decisions
+        if decision.agent == "anomaly_detection"
+    )
+    assert anomaly.selected is False
+    assert "does not support" in anomaly.reason
