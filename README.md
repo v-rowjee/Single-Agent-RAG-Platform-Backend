@@ -6,19 +6,13 @@
 uvicorn app.main:app --reload
 ```
 
-Copy `.env.sample` to `.env` and set the Supabase service-role key. Apply
-`scripts/db.sql` in the Supabase SQL editor before starting the API. The script
-recreates application data tables, creates a profile for each Supabase Auth
-account, and leaves the Supabase-managed `auth.users` records intact.
-
-For an existing single-dataset installation, apply
-`scripts/migrate_multi_dataset_sessions.sql` instead. It retains existing
-records and stored files, marks those legacy workspaces as reset-required, and
-lets each owner remove them through Start Over before uploading a new batch.
-
-For an existing database created with an earlier version, apply
-`scripts/migrate_atomic_rag_index.sql` once. It installs the transactional
-vector-index replacement function without deleting existing application data.
+Copy `.env.sample` to `.env` and set the Supabase service-role key. In a new
+Supabase project, create a private Storage bucket named `uploads`, then apply
+`scripts/db.sql` once in the SQL editor before starting the API. The script is a
+non-destructive first-time bootstrap: it creates the application tables,
+profiles existing Supabase Auth accounts, and never drops or migrates objects.
+If the application schema already exists, use a dedicated migration instead of
+rerunning this bootstrap.
 
 All `/api/upload`, `/api/dashboard/{session_id}`, `/api/chat`, and
 `/api/chat/{session_id}/history` requests require an `Authorization: Bearer
@@ -94,8 +88,10 @@ Upload -> Generic Cleaning -> Data Preparation -> Orchestrator
        -> Specialist Join -> Insight Synthesis
        -> Dashboard Generation ----\
        -> Retrieval Preparation -----> Output Join
-                                      -> Service-owned Retrieval Indexing
-                                      -> Service-owned Persistence -> END
+                                      -> Dashboard/Workflow Persistence
+                                      -> API Response
+                                      -> Background Retrieval Indexing
+                                      -> Final RAG Status/Persistence -> END
 ```
 
 RAG model assignments, embedding and reranking limits, retrieval thresholds,
@@ -103,12 +99,29 @@ and document chunking settings live in `config/rag.toml`. Both checked-in TOML
 files are validated when the API starts, so invalid settings fail early with a
 configuration error.
 
+The embedding model is `BAAI/bge-small-en-v1.5` and the second-stage reranker is
+`Qwen/Qwen3-Reranker-0.6B`. Both are loaded lazily through Sentence Transformers,
+download their weights on first use, and let PyTorch select CUDA when available
+or fall back to CPU. BGE-small produces normalized 384-dimensional vectors.
+Short retrieval queries receive BGE's recommended English query instruction,
+while indexed documents remain unprefixed. The reranker applies Qwen's built-in
+query-document relevance prompt to the vector search candidates.
+
+The fresh-project schema creates `document_chunks` and its vector-search
+function with `vector(384)`, matching the BGE-small embedding output. Projects
+created with the former 1024-dimensional Qwen schema must stop the API and run
+`scripts/migrate_qwen_to_bge_small.sql` once in the Supabase SQL editor before
+restarting. The migration preserves uploaded files but clears derived dashboards
+and vectors so the next dashboard request rebuilds them consistently.
+
 Dashboard generation and retrieval preparation must both report completion or
 failure before the graph's output join runs. The top-level business intelligence
-service then owns retrieval indexing, dashboard/workflow persistence, and the
-final dataset status update for both pipeline modes. Optional specialist and
-retrieval failures produce a partial dashboard with warnings; cleaning,
-preparation, dashboard, or persistence failures produce a failed result.
+service persists and returns the usable dashboard before starting the expensive
+embedding/index replacement as a response background task. The workspace reports
+`ragStatus: indexing` until that task records `ready` or `failed`; chat and
+dataset mutations wait for indexing to finish. Optional specialist and retrieval
+failures produce a partial dashboard with warnings; cleaning, preparation,
+dashboard, or persistence failures produce a failed result.
 
 Multi-agent chat uses a separate pipeline:
 

@@ -38,7 +38,10 @@ class TimesFMService:
         except ImportError as exc:
             raise TimesFMServiceError("TimesFM is not installed; install timesfm[torch] to enable forecasting.") from exc
         try:
-            model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(TIMESFM_MODEL_ID)
+            model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
+                TIMESFM_MODEL_ID,
+                torch_compile=False,
+            )
             model.compile(timesfm.ForecastConfig(max_context=MAX_CONTEXT, max_horizon=MAX_HORIZON, normalize_inputs=True, use_continuous_quantile_head=True, force_flip_invariance=True, infer_is_positive=True, fix_quantile_crossing=True))
         except Exception as exc:
             raise TimesFMServiceError(f"TimesFM model could not be loaded: {exc}") from exc

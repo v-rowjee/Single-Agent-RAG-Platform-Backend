@@ -62,7 +62,7 @@ class RagService:
                 collection_name="document_chunks",
                 document_count=0,
                 chunk_count=0,
-                vector_size=384,
+                vector_size=_RAG_CONFIG.embedding.dimensions,
             )
 
         lock = self._lock_for_session(agent_input.sessionId)
@@ -77,7 +77,7 @@ class RagService:
                     collection_name="document_chunks",
                     document_count=0,
                     chunk_count=0,
-                    vector_size=384,
+                    vector_size=_RAG_CONFIG.embedding.dimensions,
                 )
 
             retrieval_documents = self.build_dataset_documents(
@@ -191,8 +191,12 @@ class RagService:
             )
             if len(embeddings) != chunk_count:
                 raise ValueError("Document and embedding counts do not match.")
-            if any(len(embedding) != 384 for embedding in embeddings):
-                raise ValueError("The embedding model must return 384-dimensional vectors.")
+            expected_dimensions = _RAG_CONFIG.embedding.dimensions
+            if any(len(embedding) != expected_dimensions for embedding in embeddings):
+                raise ValueError(
+                    "The embedding model must return "
+                    f"{expected_dimensions}-dimensional vectors."
+                )
 
             rows: list[dict[str, object]] = []
             for index, (document, embedding) in enumerate(
@@ -339,6 +343,12 @@ class RagService:
 
         try:
             query_vector = get_embedding_service().embed_query(query)
+            expected_dimensions = _RAG_CONFIG.embedding.dimensions
+            if len(query_vector) != expected_dimensions:
+                raise ValueError(
+                    "The embedding model must return "
+                    f"{expected_dimensions}-dimensional vectors."
+                )
             logger.info(
                 "RAG session filter applied session_id=%s dataset_id=%s",
                 session_id,

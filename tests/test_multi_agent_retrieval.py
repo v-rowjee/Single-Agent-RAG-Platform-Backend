@@ -17,6 +17,11 @@ class FakeEmbeddingService:
         return [[0.1] * 384 for _ in texts]
 
 
+class InvalidEmbeddingService(FakeEmbeddingService):
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [[0.1] * 1024 for _ in texts]
+
+
 class LeakyStorage:
     def match_document_chunks(
         self,
@@ -90,6 +95,7 @@ def test_index_documents_is_the_shared_session_scoped_indexer(monkeypatch) -> No
 
     assert result["status"] == "success"
     assert result["indexed_count"] == 1
+    assert result["vector_size"] == 384
     assert storage.replaced_dataset_id == "session"
     assert storage.rows[0]["source_id"] == "revenue_kpi"
     assert storage.rows[0]["dataset_id"] == "session"
@@ -131,6 +137,31 @@ def test_index_documents_applies_shared_hard_chunk_limits(monkeypatch) -> None:
     assert all(len(str(row["content"])) <= 800 for row in storage.rows)
     assert [row["chunk_index"] for row in storage.rows] == list(
         range(len(storage.rows))
+    )
+
+
+def test_index_documents_rejects_wrong_embedding_dimensions(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.rag.rag_service.get_embedding_service",
+        lambda: InvalidEmbeddingService(),
+    )
+    service = RagService(storage=IndexStorage())  # type: ignore[arg-type]
+
+    result = service.index_documents(
+        session_id="session",
+        dataset_id="session",
+        retrieval_documents=[
+            {
+                "id": "revenue_kpi",
+                "content": "Revenue is 120.",
+                "document_type": "kpi",
+            }
+        ],
+    )
+
+    assert result["status"] == "failed"
+    assert result["message"] == (
+        "The embedding model must return 384-dimensional vectors."
     )
 
 

@@ -1,6 +1,15 @@
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+)
 from pydantic import BaseModel
 
 from app.core.auth import CurrentUser, get_current_user
@@ -37,6 +46,7 @@ class ChatHistoryResponse(BaseModel):
 
 @router.post("/upload")
 async def upload_file(
+    background_tasks: BackgroundTasks,
     files: list[UploadFile] | None = File(default=None),
     file: UploadFile | None = File(default=None),
     description: str | None = Form(default=None),
@@ -51,6 +61,7 @@ async def upload_file(
             description=description,
             user_id=current_user.id,
             legacy_contract=not files and file is not None,
+            background_tasks=background_tasks,
         )
 
     except InvalidUploadError as error:
@@ -94,6 +105,7 @@ def get_active_dataset(
 
 @router.post("/dataset")
 async def add_datasets(
+    background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
@@ -101,6 +113,7 @@ async def add_datasets(
         return await business_intelligence_service.add_datasets(
             files=files,
             user_id=current_user.id,
+            background_tasks=background_tasks,
         )
     except SessionNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
@@ -117,12 +130,14 @@ async def add_datasets(
 @router.delete("/dataset/{dataset_id}", status_code=204)
 async def remove_dataset(
     dataset_id: str,
+    background_tasks: BackgroundTasks,
     current_user: CurrentUser = Depends(get_current_user),
 ) -> None:
     try:
         await business_intelligence_service.remove_dataset(
             dataset_id=dataset_id,
             user_id=current_user.id,
+            background_tasks=background_tasks,
         )
     except SessionNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
@@ -181,6 +196,7 @@ def reset_dataset(
 @router.get("/dashboard/{session_id}")
 async def get_dashboard(
     session_id: str,
+    background_tasks: BackgroundTasks,
     current_user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     try:
@@ -188,6 +204,7 @@ async def get_dashboard(
             await business_intelligence_service.get_dashboard(
                 session_id,
                 current_user.id,
+                background_tasks=background_tasks,
             )
         ).model_dump(mode="json")
         dashboard = payload.get("dashboard")

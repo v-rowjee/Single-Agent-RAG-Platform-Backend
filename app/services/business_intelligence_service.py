@@ -14,7 +14,7 @@ from typing import Any, Iterator, Literal
 from uuid import UUID, uuid4
 
 import pandas as pd
-from fastapi import UploadFile
+from fastapi import BackgroundTasks, UploadFile
 
 from app.core.config import Settings, get_settings
 from app.core.model_usage import (
@@ -101,6 +101,7 @@ class BusinessIntelligenceService:
         user_id: str,
         description: str | None = None,
         legacy_contract: bool = False,
+        background_tasks: BackgroundTasks | None = None,
     ) -> dict[str, Any]:
         if not user_id:
             raise ValueError("An authenticated user is required.")
@@ -239,6 +240,7 @@ class BusinessIntelligenceService:
                 session=session,
                 datasets=datasets,
                 contents=[item["content"] for item in inspected],
+                background_tasks=background_tasks,
             )
             if legacy_contract:
                 self._legacy_contract_sessions.add(session_id)
@@ -282,15 +284,17 @@ class BusinessIntelligenceService:
         self,
         files: list[UploadFile] | UploadFile,
         user_id: str,
+        background_tasks: BackgroundTasks | None = None,
     ) -> dict[str, Any]:
         session, existing_datasets = self._active_workspace(user_id)
         if session.requires_reset:
             raise InvalidUploadError(
                 "This legacy workspace must be reset before datasets can be added."
             )
-        if session.status == "processing":
+        if session.status == "processing" or session.rag_status == "indexing":
             raise InvalidUploadError(
-                "Workspace analysis is already in progress. Try again when it has finished."
+                "Workspace analysis or retrieval indexing is already in progress. "
+                "Try again when it has finished."
             )
 
         uploaded_files = (
@@ -411,6 +415,7 @@ class BusinessIntelligenceService:
                 session=session,
                 datasets=all_datasets,
                 contents=all_contents,
+                background_tasks=background_tasks,
             )
         except Exception as error:
             self._mark_workspace_reanalysis_failed(session, all_datasets, error)
@@ -423,15 +428,21 @@ class BusinessIntelligenceService:
             "message": "Datasets added and workspace analysis rebuilt successfully.",
         }
 
-    async def remove_dataset(self, dataset_id: str, user_id: str) -> None:
+    async def remove_dataset(
+        self,
+        dataset_id: str,
+        user_id: str,
+        background_tasks: BackgroundTasks | None = None,
+    ) -> None:
         session, datasets = self._active_workspace(user_id)
         if session.requires_reset:
             raise InvalidUploadError(
                 "This legacy workspace must be reset before datasets can be removed."
             )
-        if session.status == "processing":
+        if session.status == "processing" or session.rag_status == "indexing":
             raise InvalidUploadError(
-                "Workspace analysis is already in progress. Try again when it has finished."
+                "Workspace analysis or retrieval indexing is already in progress. "
+                "Try again when it has finished."
             )
 
         target = next(
@@ -469,6 +480,7 @@ class BusinessIntelligenceService:
                 session=session,
                 datasets=remaining_datasets,
                 contents=remaining_contents,
+                background_tasks=background_tasks,
             )
         except Exception as error:
             self._mark_workspace_reanalysis_failed(
@@ -667,7 +679,12 @@ class BusinessIntelligenceService:
                 self.storage.delete_dataset(dataset.id, user_id)
         self._legacy_contract_sessions.discard(session.id)
 
-    async def get_dashboard(self, session_id: str, user_id: str) -> DashboardResponse:
+    async def get_dashboard(
+        self,
+        session_id: str,
+        user_id: str,
+        background_tasks: BackgroundTasks | None = None,
+    ) -> DashboardResponse:
         session, datasets = self._load_workspace(session_id, user_id)
         if session.requires_reset:
             raise SessionNotFoundError(
@@ -690,13 +707,19 @@ class BusinessIntelligenceService:
             self.storage.download_file(dataset.storage_path)
             for dataset in datasets
         ]
-        return await self._run_workspace_pipeline(session, datasets, contents)
+        return await self._run_workspace_pipeline(
+            session,
+            datasets,
+            contents,
+            background_tasks=background_tasks,
+        )
 
     async def _run_workspace_pipeline(
         self,
         session: AnalysisSessionRecord,
         datasets: list[DatasetRecord],
         contents: list[bytes],
+        background_tasks: BackgroundTasks | None = None,
     ) -> DashboardResponse:
         if len(datasets) != len(contents) or not datasets:
             raise ValueError("Every workspace dataset requires source content.")
@@ -729,6 +752,7 @@ class BusinessIntelligenceService:
             datasets=datasets,
             contents=contents,
             execution=combined,
+            background_tasks=background_tasks,
         )
 
     def _combine_workspace_executions(
@@ -1152,6 +1176,16 @@ class BusinessIntelligenceService:
             raise SessionNotFoundError(
                 "This legacy workspace must be reset before chat is available."
             )
+        if session.rag_status == "indexing":
+            raise ValueError(
+                "The analysis is ready, but its retrieval index is still being "
+                "prepared. Try chat again shortly."
+            )
+        if session.rag_status != "ready":
+            raise ValueError(
+                "The retrieval index is unavailable. Rebuild the workspace before "
+                "using chat."
+            )
         if (
             self.settings.bi_pipeline_mode == "multi"
             or len(datasets) > 1
@@ -1568,6 +1602,7 @@ class BusinessIntelligenceService:
         datasets: list[DatasetRecord],
         contents: list[bytes],
         execution: PipelineExecution,
+        background_tasks: BackgroundTasks | None = None,
     ) -> DashboardResponse:
         response = execution.response
         update_session = getattr(self.storage, "update_session_status", None)
@@ -1604,6 +1639,54 @@ class BusinessIntelligenceService:
                 datasets,
                 contents,
             )
+
+        if background_tasks is not None and response.status != "failed":
+            pending_result = {
+                "status": "indexing",
+                "document_count": len(retrieval_documents),
+                "indexed_count": 0,
+                "failed_count": 0,
+                "message": "Retrieval indexing is running in the background.",
+            }
+            workflow = dict(execution.workflow or {})
+            workflow.update(
+                {
+                    "session_id": session.id,
+                    "dataset_ids": [dataset.id for dataset in datasets],
+                    "workflow_status": response.status,
+                    "retrieval_indexing_result": pending_result,
+                }
+            )
+
+            # Persist the usable dashboard before the expensive embedding model
+            # starts. The HTTP response can now complete while Starlette runs the
+            # synchronous indexer in its background thread pool.
+            self._save_workflow_dashboard(session.id, response, workflow)
+            if callable(update_session):
+                update_session(
+                    session.id,
+                    status="ready",
+                    rag_status="indexing",
+                    error_message=None,
+                )
+            else:
+                for dataset in datasets:
+                    self.storage.update_dataset_status(
+                        dataset.id,
+                        status="ready",
+                        rag_status="indexing",
+                        error_message=None,
+                    )
+
+            background_tasks.add_task(
+                self._complete_workspace_indexing,
+                session=session,
+                datasets=datasets,
+                retrieval_documents=retrieval_documents,
+                response=response,
+                workflow=workflow,
+            )
+            return response
 
         if response.status == "failed":
             indexing_result = {
@@ -1679,6 +1762,104 @@ class BusinessIntelligenceService:
                     ),
                 )
         return response
+
+    def _complete_workspace_indexing(
+        self,
+        *,
+        session: AnalysisSessionRecord,
+        datasets: list[DatasetRecord],
+        retrieval_documents: list[dict[str, Any]],
+        response: DashboardResponse,
+        workflow: dict[str, Any],
+    ) -> None:
+        """Finish retrieval indexing after the dashboard response is available."""
+        try:
+            indexing_result = self._rag_service.index_documents(
+                session_id=session.id,
+                dataset_id=session.id,
+                retrieval_documents=retrieval_documents,
+            )
+        except Exception as error:
+            logger.exception(
+                "Background retrieval indexing crashed session_id=%s",
+                session.id,
+            )
+            indexing_result = {
+                "status": "failed",
+                "document_count": len(retrieval_documents),
+                "indexed_count": 0,
+                "failed_count": len(retrieval_documents),
+                "message": self._safe_error(error),
+            }
+
+        rag_status = (
+            "ready" if indexing_result.get("status") == "success" else "failed"
+        )
+        completed_response = response
+        if rag_status == "failed":
+            completed_response = response.model_copy(
+                update={
+                    "status": "partial",
+                    "warnings": [
+                        *response.warnings,
+                        ApiMessage(
+                            code="RAG_INDEXING_FAILED",
+                            message=(
+                                "The dashboard was generated, but workspace "
+                                "retrieval indexing could not be completed."
+                            ),
+                            component="rag",
+                            recoverable=True,
+                        ),
+                    ],
+                }
+            )
+
+        completed_workflow = dict(workflow)
+        completed_workflow.update(
+            {
+                "workflow_status": completed_response.status,
+                "retrieval_indexing_result": indexing_result,
+            }
+        )
+
+        try:
+            self._save_workflow_dashboard(
+                session.id,
+                completed_response,
+                completed_workflow,
+            )
+        except Exception:
+            logger.exception(
+                "Unable to persist background indexing result session_id=%s",
+                session.id,
+            )
+
+        error_message = (
+            "Retrieval indexing failed." if rag_status == "failed" else None
+        )
+        update_session = getattr(self.storage, "update_session_status", None)
+        try:
+            if callable(update_session):
+                update_session(
+                    session.id,
+                    status="ready",
+                    rag_status=rag_status,
+                    error_message=error_message,
+                )
+            else:
+                for dataset in datasets:
+                    self.storage.update_dataset_status(
+                        dataset.id,
+                        status="ready",
+                        rag_status=rag_status,
+                        error_message=error_message,
+                    )
+        except Exception:
+            logger.exception(
+                "Unable to persist background indexing status session_id=%s",
+                session.id,
+            )
 
     def _single_workspace_documents(
         self,

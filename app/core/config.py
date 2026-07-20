@@ -66,12 +66,14 @@ class RuntimeConfiguration:
 @dataclass(frozen=True)
 class EmbeddingPolicy:
     model: str
+    dimensions: int
     batch_size: int
 
 
 @dataclass(frozen=True)
 class RerankingPolicy:
     model: str
+    batch_size: int
     limit: int
 
 
@@ -285,6 +287,10 @@ def load_rag_config(path: Path = RAG_CONFIG_PATH) -> RagConfiguration:
     return RagConfiguration(
         embedding=EmbeddingPolicy(
             model=_text(embedding.get("model"), "embedding.model"),
+            dimensions=_positive_integer(
+                embedding.get("dimensions"),
+                "embedding.dimensions",
+            ),
             batch_size=_positive_integer(
                 embedding.get("batch_size"),
                 "embedding.batch_size",
@@ -292,6 +298,10 @@ def load_rag_config(path: Path = RAG_CONFIG_PATH) -> RagConfiguration:
         ),
         reranking=RerankingPolicy(
             model=_text(reranking.get("model"), "reranking.model"),
+            batch_size=_positive_integer(
+                reranking.get("batch_size"),
+                "reranking.batch_size",
+            ),
             limit=rerank_limit,
         ),
         retrieval=RetrievalPolicy(

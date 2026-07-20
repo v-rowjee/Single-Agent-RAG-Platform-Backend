@@ -7,9 +7,14 @@ from app.core.config import get_rag_config
 
 
 _EMBEDDING_POLICY = get_rag_config().embedding
+_QUERY_PREFIXES = {
+    "BAAI/bge-small-en-v1.5": (
+        "Represent this sentence for searching relevant passages: "
+    ),
+}
 
 
-class FastEmbedEmbeddingService:
+class SentenceTransformerEmbeddingService:
     def __init__(self, model_name: str | None = None) -> None:
         self.model_name = model_name or _EMBEDDING_POLICY.model
         self._model: object | None = None
@@ -18,24 +23,33 @@ class FastEmbedEmbeddingService:
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        return self._normalise_vectors(
-            self._model_instance().embed(
-                texts,
-                batch_size=_EMBEDDING_POLICY.batch_size,
-            )
-        )
+        return self._encode(texts)
 
     def embed_query(self, text: str) -> list[float]:
-        vectors = self.embed_documents([text])
+        if not text:
+            return []
+        prefix = _QUERY_PREFIXES.get(self.model_name, "")
+        vectors = self._encode([f"{prefix}{text}"])
         return vectors[0] if vectors else []
+
+    def _encode(self, texts: list[str]) -> list[list[float]]:
+        encode_options: dict[str, object] = {
+            "batch_size": _EMBEDDING_POLICY.batch_size,
+            "convert_to_numpy": True,
+            "normalize_embeddings": True,
+            "show_progress_bar": False,
+        }
+        return self._normalise_vectors(
+            self._model_instance().encode(texts, **encode_options)
+        )
 
     def _model_instance(self):
         if self._model is None:
             with self._lock:
                 if self._model is None:
-                    from fastembed import TextEmbedding
+                    from sentence_transformers import SentenceTransformer
 
-                    self._model = TextEmbedding(model_name=self.model_name)
+                    self._model = SentenceTransformer(self.model_name)
         return self._model
 
     @staticmethod
@@ -50,14 +64,14 @@ class FastEmbedEmbeddingService:
         return output
 
 
-_embedding_service: FastEmbedEmbeddingService | None = None
+_embedding_service: SentenceTransformerEmbeddingService | None = None
 _embedding_service_lock = threading.Lock()
 
 
-def get_embedding_service() -> FastEmbedEmbeddingService:
+def get_embedding_service() -> SentenceTransformerEmbeddingService:
     global _embedding_service
     if _embedding_service is None:
         with _embedding_service_lock:
             if _embedding_service is None:
-                _embedding_service = FastEmbedEmbeddingService()
+                _embedding_service = SentenceTransformerEmbeddingService()
     return _embedding_service

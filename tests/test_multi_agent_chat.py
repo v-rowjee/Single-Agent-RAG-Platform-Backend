@@ -169,7 +169,7 @@ def test_multi_chat_is_session_scoped_grounded_and_persisted() -> None:
 
     assert response.answer == "The revenue KPI is 120."
     assert response.grounding == "Retrieved dataset sources: `kpi_revenue`."
-    assert rag.calls == [(SESSION_ID, "What is the revenue KPI?", 12)]
+    assert rag.calls == [(SESSION_ID, "What is the revenue KPI?", 20)]
     assert rag.rerank_calls == [
         ("What is the revenue KPI?", ["kpi_revenue"])
     ]

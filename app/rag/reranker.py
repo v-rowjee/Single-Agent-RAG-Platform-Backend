@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 _RERANKING_POLICY = get_rag_config().reranking
 
 
-class FastEmbedReranker:
+class SentenceTransformerReranker:
     def __init__(self, model_name: str | None = None) -> None:
         self.model_name = model_name or _RERANKING_POLICY.model
         self._model: Any | None = None
@@ -28,9 +28,30 @@ class FastEmbedReranker:
             return []
         try:
             model = self._model_instance()
-            contents = [document.page_content for document in documents]
-            raw_results = list(model.rerank(query=query, documents=contents))
-            ranked = self._merge_results(documents, raw_results)
+            pairs = [
+                (query, document.page_content)
+                for document in documents
+            ]
+            raw_scores = model.predict(
+                pairs,
+                batch_size=_RERANKING_POLICY.batch_size,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )
+            scores = self._normalise_scores(raw_scores)
+            if len(scores) != len(documents):
+                raise ValueError(
+                    "Document and reranker score counts do not match."
+                )
+            ranked = [
+                RerankedDocument(
+                    page_content=document.page_content,
+                    metadata=document.metadata,
+                    score=document.score,
+                    reranker_score=score,
+                )
+                for document, score in zip(documents, scores)
+            ]
             ranked.sort(
                 key=lambda item: (
                     item.reranker_score if item.reranker_score is not None else item.score
@@ -55,64 +76,29 @@ class FastEmbedReranker:
         if self._model is None:
             with self._lock:
                 if self._model is None:
-                    from fastembed.rerank.cross_encoder import TextCrossEncoder
+                    from sentence_transformers import CrossEncoder
 
-                    self._model = TextCrossEncoder(model_name=self.model_name)
+                    self._model = CrossEncoder(self.model_name)
         return self._model
 
     @staticmethod
-    def _merge_results(
-        documents: list[RetrievedDocument],
-        raw_results: list[Any],
-    ) -> list[RerankedDocument]:
-        output: list[RerankedDocument] = []
-        used: set[int] = set()
-        for position, result in enumerate(raw_results):
-            if isinstance(result, int | float):
-                index = position
-                score = float(result)
-            else:
-                index = getattr(result, "index", None)
-                score = getattr(result, "score", None)
-            if index is None and isinstance(result, dict):
-                index = result.get("index")
-            if not isinstance(index, int):
-                index = position
-            if index < 0 or index >= len(documents):
-                continue
-            used.add(index)
-            if score is None and isinstance(result, dict):
-                score = result.get("score")
-            document = documents[index]
-            output.append(
-                RerankedDocument(
-                    page_content=document.page_content,
-                    metadata=document.metadata,
-                    score=document.score,
-                    reranker_score=float(score) if score is not None else None,
-                )
-            )
-        for index, document in enumerate(documents):
-            if index not in used:
-                output.append(
-                    RerankedDocument(
-                        page_content=document.page_content,
-                        metadata=document.metadata,
-                        score=document.score,
-                        reranker_score=None,
-                    )
-                )
-        return output
+    def _normalise_scores(raw_scores: Any) -> list[float]:
+        values = (
+            raw_scores.tolist()
+            if hasattr(raw_scores, "tolist")
+            else list(raw_scores)
+        )
+        return [float(score) for score in values]
 
 
-_reranker: FastEmbedReranker | None = None
+_reranker: SentenceTransformerReranker | None = None
 _reranker_lock = threading.Lock()
 
 
-def get_reranker() -> FastEmbedReranker:
+def get_reranker() -> SentenceTransformerReranker:
     global _reranker
     if _reranker is None:
         with _reranker_lock:
             if _reranker is None:
-                _reranker = FastEmbedReranker()
+                _reranker = SentenceTransformerReranker()
     return _reranker

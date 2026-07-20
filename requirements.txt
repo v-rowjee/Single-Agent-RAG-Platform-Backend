@@ -19,6 +19,7 @@ langchain
 langchain-groq
 langchain-openai
 langgraph
-fastembed
+sentence-transformers>=5.4.0
+transformers>=4.51.0
 pytest
 timesfm[torch]

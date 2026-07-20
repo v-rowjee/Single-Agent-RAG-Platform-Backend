@@ -1,27 +1,9 @@
--- Clean-install Supabase schema for multi-dataset analysis workspaces.
--- This recreates application tables but leaves auth.users and Storage intact.
+-- First-time Supabase schema for multi-dataset analysis workspaces.
+-- Run this once against a new project. It does not remove or migrate objects.
+
+begin;
 
 create extension if not exists vector with schema extensions;
-
-drop trigger if exists on_auth_user_created on auth.users;
-drop function if exists public.match_session_document_chunks(
-    uuid, extensions.vector, integer, double precision
-);
-drop function if exists public.replace_session_document_chunks(uuid, jsonb);
-drop function if exists public.match_document_chunks(
-    uuid, extensions.vector, integer, double precision
-);
-drop function if exists public.replace_document_chunks(uuid, jsonb);
-drop function if exists public.create_profile_for_new_user();
-drop function if exists public.set_updated_at();
-
-drop table if exists public.session_processing cascade;
-drop table if exists public.document_chunks cascade;
-drop table if exists public.messages cascade;
-drop table if exists public.dashboards cascade;
-drop table if exists public.datasets cascade;
-drop table if exists public.analysis_sessions cascade;
-drop table if exists public.profiles cascade;
 
 create table public.profiles (
     id uuid primary key references auth.users(id) on delete cascade,
@@ -125,7 +107,7 @@ create index document_chunks_embedding_hnsw_idx
     on public.document_chunks
     using hnsw (embedding extensions.vector_cosine_ops);
 
-create or replace function public.set_updated_at()
+create function public.set_updated_at()
 returns trigger language plpgsql as $$
 begin
     new.updated_at = now();
@@ -144,8 +126,8 @@ for each row execute function public.set_updated_at();
 create trigger session_processing_set_updated_at before update on public.session_processing
 for each row execute function public.set_updated_at();
 
-create or replace function public.create_profile_for_new_user()
-returns trigger language plpgsql security definer set search_path = public as $$
+create function public.create_profile_for_new_user()
+returns trigger language plpgsql security definer set search_path = '' as $$
 begin
     insert into public.profiles (id, email)
     values (new.id, coalesce(new.email, 'unknown@example.invalid'))
@@ -155,7 +137,7 @@ end;
 $$;
 
 create trigger on_auth_user_created after insert on auth.users
-for each row execute procedure public.create_profile_for_new_user();
+for each row execute function public.create_profile_for_new_user();
 
 insert into public.profiles (id, email)
 select id, coalesce(email, 'unknown@example.invalid')
@@ -233,7 +215,7 @@ for all to authenticated using (
     )
 );
 
-create or replace function public.replace_session_document_chunks(
+create function public.replace_session_document_chunks(
     p_session_id uuid,
     p_chunks jsonb
 )
@@ -265,7 +247,7 @@ begin
 end;
 $$;
 
-create or replace function public.match_session_document_chunks(
+create function public.match_session_document_chunks(
     p_session_id uuid,
     p_query_embedding extensions.vector(384),
     p_match_count integer default 5,
@@ -288,6 +270,13 @@ set search_path = public, extensions as $$
     limit least(greatest(p_match_count, 1), 50);
 $$;
 
+revoke execute on function public.set_updated_at() from public;
+revoke execute on function public.create_profile_for_new_user() from public;
+revoke execute on function public.replace_session_document_chunks(uuid, jsonb) from public;
+revoke execute on function public.match_session_document_chunks(
+    uuid, extensions.vector, integer, double precision
+) from public;
+
 grant usage on schema public to service_role;
 grant all privileges on all tables in schema public to service_role;
 grant usage, select on all sequences in schema public to service_role;
@@ -295,3 +284,5 @@ grant execute on all functions in schema public to service_role;
 alter default privileges in schema public grant all privileges on tables to service_role;
 alter default privileges in schema public grant usage, select on sequences to service_role;
 alter default privileges in schema public grant execute on functions to service_role;
+
+commit;
