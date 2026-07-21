@@ -9,6 +9,25 @@ import pytest
 from app.orchestration.business_intelligence_graph import (
     build_business_intelligence_graph,
 )
+from app.agents.multi.orchestrator_agent import OrchestrationPlan
+
+
+def test_orchestration_plan_accepts_compound_keyed_decisions() -> None:
+    plan = OrchestrationPlan.model_validate(
+        {
+            "selected_agents": ["kpi_trend", "forecasting"],
+            "decisions": {
+                "kpi_trend": "The dataset supports KPI and trend analysis.",
+                "forecasting": "The dataset has a usable time series.",
+            },
+        }
+    )
+
+    assert [decision.agent for decision in plan.decisions] == [
+        "kpi_trend",
+        "forecasting",
+    ]
+    assert all(decision.selected for decision in plan.decisions)
 
 
 def _node(
@@ -70,20 +89,7 @@ def _run_graph(selected_agents: list[str]) -> tuple[dict[str, Any], list[str]]:
             events,
             {"retrieval_documents": []},
         ),
-        "retrieval_indexing": _node(
-            "retrieval_indexing",
-            events,
-            {"retrieval_indexing_result": {"status": "success"}},
-        ),
         "output_join": _node("output_join", events),
-        "persistence": _node(
-            "persistence",
-            events,
-            {
-                "workflow_status": "partial",
-                "persistence_result": {"status": "success"},
-            },
-        ),
     }
     graph = build_business_intelligence_graph(node_overrides=overrides)
     result = asyncio.run(
@@ -122,7 +128,6 @@ def test_capability_routing_and_joins_execute_once(
     assert events.count("specialist_join") == 1
     assert events.count("insight_synthesis") == 1
     assert events.count("output_join") == 1
-    assert events.count("persistence") == 1
 
     specialist_positions = [
         events.index(agent) for agent in selected_agents
@@ -130,12 +135,11 @@ def test_capability_routing_and_joins_execute_once(
     if specialist_positions:
         assert max(specialist_positions) < events.index("specialist_join")
     assert events.index("specialist_join") < events.index("insight_synthesis")
-    assert events.index("dashboard_generation") < events.index("output_join")
-    assert events.index("retrieval_indexing") < events.index("output_join")
-    assert events.index("output_join") < events.index("persistence")
+    assert events.index("dashboard_generation") < events.index("retrieval_preparation")
+    assert events.index("retrieval_preparation") < events.index("output_join")
 
 
-def test_optional_specialist_exception_reaches_persistence_as_failure_state() -> None:
+def test_optional_specialist_exception_reaches_output_as_failure_state() -> None:
     events: list[str] = []
 
     async def failing_kpi(state: dict[str, Any]) -> dict[str, Any]:
@@ -163,20 +167,7 @@ def test_optional_specialist_exception_reaches_persistence_as_failure_state() ->
         "retrieval_preparation": _node(
             "retrieval_preparation", events, {"retrieval_documents": []}
         ),
-        "retrieval_indexing": _node(
-            "retrieval_indexing",
-            events,
-            {"retrieval_indexing_result": {"status": "success"}},
-        ),
         "output_join": _node("output_join", events),
-        "persistence": _node(
-            "persistence",
-            events,
-            {
-                "workflow_status": "partial",
-                "persistence_result": {"status": "success"},
-            },
-        ),
     }
     graph = build_business_intelligence_graph(node_overrides=overrides)
     result = asyncio.run(
@@ -196,5 +187,5 @@ def test_optional_specialist_exception_reaches_persistence_as_failure_state() ->
     assert "kpi_trend" in result["failed_agents"]
     assert result["kpi_trend_output"]["status"] == "partial"
     assert events.count("specialist_join") == 1
-    assert events.count("persistence") == 1
+    assert events.count("output_join") == 1
 

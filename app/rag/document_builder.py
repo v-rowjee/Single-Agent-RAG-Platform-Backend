@@ -8,14 +8,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from app.rag.config import (
-    CHUNK_OVERLAP,
-    CHUNK_SIZE,
-    MAX_COLUMNS_PER_ROW_DOCUMENT,
-    MAX_ROW_BATCH_DOCUMENTS,
-    ROWS_PER_BATCH_DOCUMENT,
-)
+from app.core.config import get_rag_config
 from app.rag.models import RagDocument
+
+
+_CHUNKING_POLICY = get_rag_config().chunking
 
 
 class DatasetDocumentBuilder:
@@ -88,42 +85,78 @@ class DatasetDocumentBuilder:
         )
         return self.chunk_documents(documents)
 
+    def build_row_documents(
+        self,
+        df: pd.DataFrame,
+        session_id: str,
+        file_name: str,
+        measures: list[str],
+        dimensions: list[str],
+        date_field: str | None,
+    ) -> list[RagDocument]:
+        """Build bounded raw-row evidence for either pipeline mode."""
+        return self.chunk_documents(
+            self._row_batches(
+                df,
+                session_id,
+                file_name,
+                measures,
+                dimensions,
+                date_field,
+            )
+        )
+
     def chunk_documents(self, documents: list[RagDocument]) -> list[RagDocument]:
         chunks: list[RagDocument] = []
         for document in documents:
             content = document.page_content.strip()
-            if len(content) <= CHUNK_SIZE:
+            if len(content) <= _CHUNKING_POLICY.size:
                 chunks.append(document)
                 continue
 
-            lines = content.splitlines()
-            current: list[str] = []
-            current_length = 0
-            chunk_index = 0
-            for line in lines:
-                projected = current_length + len(line) + 1
-                if current and projected > CHUNK_SIZE:
-                    chunks.append(
-                        RagDocument(
-                            page_content="\n".join(current).strip(),
-                            metadata={**document.metadata, "chunk_index": chunk_index},
-                        )
-                    )
-                    chunk_index += 1
-                    overlap_lines = self._overlap_lines(current)
-                    current = overlap_lines
-                    current_length = sum(len(item) + 1 for item in current)
-                current.append(line)
-                current_length += len(line) + 1
-
-            if current:
+            for chunk_index, chunk in enumerate(self._split_content(content)):
                 chunks.append(
                     RagDocument(
-                        page_content="\n".join(current).strip(),
+                        page_content=chunk,
                         metadata={**document.metadata, "chunk_index": chunk_index},
                     )
                 )
         return chunks
+
+    @staticmethod
+    def _split_content(content: str) -> list[str]:
+        """Split on readable boundaries while enforcing the configured limit."""
+        size = _CHUNKING_POLICY.size
+        overlap = _CHUNKING_POLICY.overlap
+        output: list[str] = []
+        start = 0
+        content_length = len(content)
+
+        while start < content_length:
+            hard_end = min(start + size, content_length)
+            end = hard_end
+            if hard_end < content_length:
+                minimum_break = start + max(1, size // 2)
+                candidates = (
+                    content.rfind("\n", minimum_break, hard_end + 1),
+                    content.rfind(" ", minimum_break, hard_end + 1),
+                )
+                boundary = max(candidates)
+                if boundary > start:
+                    end = boundary
+
+            chunk = content[start:end].strip()
+            if chunk:
+                output.append(chunk)
+            if end >= content_length:
+                break
+
+            next_start = max(start + 1, end - overlap)
+            while next_start < end and content[next_start].isspace():
+                next_start += 1
+            start = next_start
+
+        return output
 
     def _dataset_overview(
         self,
@@ -414,8 +447,11 @@ class DatasetDocumentBuilder:
             return []
         columns = self._unique_keep_order(
             [*( [date_field] if date_field else [] ), *dimensions, *measures, *[str(column) for column in df.columns]]
-        )[:MAX_COLUMNS_PER_ROW_DOCUMENT]
-        max_rows = MAX_ROW_BATCH_DOCUMENTS * ROWS_PER_BATCH_DOCUMENT
+        )[:_CHUNKING_POLICY.max_columns_per_row_document]
+        max_rows = (
+            _CHUNKING_POLICY.max_row_batch_documents
+            * _CHUNKING_POLICY.rows_per_batch_document
+        )
         sample_size = min(len(df), max_rows)
         indices = (
             sorted(set(np.linspace(0, len(df) - 1, sample_size, dtype=int).tolist()))
@@ -423,8 +459,15 @@ class DatasetDocumentBuilder:
             else []
         )
         output: list[RagDocument] = []
-        for batch_start in range(0, len(indices), ROWS_PER_BATCH_DOCUMENT):
-            batch_indices = indices[batch_start : batch_start + ROWS_PER_BATCH_DOCUMENT]
+        for batch_start in range(
+            0,
+            len(indices),
+            _CHUNKING_POLICY.rows_per_batch_document,
+        ):
+            batch_indices = indices[
+                batch_start : batch_start
+                + _CHUNKING_POLICY.rows_per_batch_document
+            ]
             if not batch_indices:
                 continue
             lines = [
@@ -559,7 +602,7 @@ class DatasetDocumentBuilder:
         overlap: list[str] = []
         total = 0
         for line in reversed(lines):
-            if total + len(line) > CHUNK_OVERLAP:
+            if total + len(line) > _CHUNKING_POLICY.overlap:
                 break
             overlap.insert(0, line)
             total += len(line) + 1

@@ -1,14 +1,13 @@
 """Grounded synthesis of specialist business-intelligence results."""
 from __future__ import annotations
 
-import json
-import os
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.core.agent_models import agent_model_policy
-from app.core.groq_structured import request_structured
+from app.core.config import agent_model_policy
+from app.core.llm import request_structured
+from app.core.prompts import render_agent_prompts
 
 
 MAX_INSIGHTS = 6
@@ -121,41 +120,17 @@ def _source_ids(
     return sources
 
 
-async def _request_groq_synthesis(
+async def _request_synthesis(
     payload: dict[str, Any],
 ) -> InsightSynthesisOutput:
-    key = os.getenv("GROQ_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("GROQ_API_KEY is missing.")
+    prompts = render_agent_prompts("multi/insight_synthesis", payload=payload)
     return await request_structured(
-        api_key=key,
         policy=agent_model_policy("insight_synthesis"),
         response_model=InsightSynthesisOutput,
         schema_name="insight_synthesis",
-        temperature=0.2,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Return JSON only with status, executive_summary, key_insights, "
-                    "recommendations, limitations and warnings. Write one grounded "
-                    "60-100 word executive_summary covering the business or dataset "
-                    "scope, latest KPI movement, an important historical trend or "
-                    "anomaly, and the three-point outlook when supplied. Produce "
-                    "3-5 concise recommended actions. Every insight and action must "
-                    "reference supplied evidence [{source_type,source_id}]. Use only "
-                    "supplied IDs and numbers. Do not calculate values, invent context, "
-                    "or claim causation."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    payload,
-                    default=str,
-                    separators=(",", ":"),
-                ),
-            },
+            {"role": "system", "content": prompts.system},
+            {"role": "user", "content": prompts.user},
         ],
     )
 
@@ -542,7 +517,7 @@ class InsightSynthesisAgent:
             forecasting_output,
         )
         try:
-            result = await _request_groq_synthesis(
+            result = await _request_synthesis(
                 _compact(
                     prepared,
                     kpi_trend_output,

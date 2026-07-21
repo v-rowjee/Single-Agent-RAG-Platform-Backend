@@ -1,13 +1,24 @@
-"""Shared deterministic semantics for KPI, trend, forecast, and chart agents."""
+"""Shared deterministic semantics for KPI, trend, forecast, and chart analysis."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, TypeAlias, cast
 
 import pandas as pd
 
+from app.core.currency import detect_currency
 
-SUPPORTED_GRANULARITIES = {"day", "week", "month", "quarter", "year"}
+TimeGranularity: TypeAlias = Literal["day", "week", "month", "quarter", "year"]
+SUPPORTED_GRANULARITIES: frozenset[TimeGranularity] = frozenset(
+    {"day", "week", "month", "quarter", "year"}
+)
+TIME_GRANULARITIES: tuple[TimeGranularity, ...] = (
+    "day",
+    "week",
+    "month",
+    "quarter",
+    "year",
+)
 TEMPORAL_DIMENSION_NAMES = {
     "date",
     "day",
@@ -53,7 +64,7 @@ class PrimarySeries:
     measure: str
     aggregation: str
     date_column: str
-    granularity: str
+    granularity: TimeGranularity
 
 
 def is_numeric_measure(df: pd.DataFrame, column: str) -> bool:
@@ -112,10 +123,10 @@ def ranked_measures(
     )
 
 
-def selected_granularity(prepared: dict[str, Any]) -> str:
+def selected_granularity(prepared: dict[str, Any]) -> TimeGranularity:
     temporal = prepared.get("temporal_profile") or {}
     value = temporal.get("inferred_frequency") or prepared.get("time_granularity")
-    return str(value) if value in SUPPORTED_GRANULARITIES else "month"
+    return value if value in SUPPORTED_GRANULARITIES else "month"
 
 
 def selected_date_column(
@@ -156,8 +167,8 @@ def period_frequency(granularity: str) -> str:
 
 def infer_time_granularity(
     values: pd.Series,
-    fallback: str | None = None,
-) -> str:
+    fallback: TimeGranularity | None = None,
+) -> TimeGranularity:
     """Choose a readable, sufficiently regular grain for a dated dataset.
 
     Transaction datasets often contain dates only when a transaction occurred.
@@ -167,9 +178,13 @@ def infer_time_granularity(
     """
     dates = pd.to_datetime(values, errors="coerce").dropna()
     if dates.empty:
-        return fallback if fallback in SUPPORTED_GRANULARITIES else "month"
+        return (
+            cast(TimeGranularity, fallback)
+            if fallback is not None and fallback in SUPPORTED_GRANULARITIES
+            else "month"
+        )
 
-    for granularity in ("day", "week", "month", "quarter", "year"):
+    for granularity in TIME_GRANULARITIES:
         frequency = period_frequency(granularity)
         periods = dates.dt.to_period(frequency)
         observed = periods.nunique()
@@ -188,8 +203,8 @@ def infer_time_granularity(
 
     # Sparse histories may only become regular at a coarser grain.  Prefer the
     # most complete viable candidate rather than rejecting useful temporal data.
-    candidates: list[tuple[float, int, str]] = []
-    for granularity in ("day", "week", "month", "quarter", "year"):
+    candidates: list[tuple[float, int, TimeGranularity]] = []
+    for granularity in TIME_GRANULARITIES:
         frequency = period_frequency(granularity)
         periods = dates.dt.to_period(frequency)
         observed = periods.nunique()
@@ -203,7 +218,11 @@ def infer_time_granularity(
 
     if candidates:
         return max(candidates)[2]
-    return fallback if fallback in SUPPORTED_GRANULARITIES else "month"
+    return (
+        cast(TimeGranularity, fallback)
+        if fallback is not None and fallback in SUPPORTED_GRANULARITIES
+        else "month"
+    )
 
 
 def temporal_period_count(values: pd.Series, granularity: str) -> int:
@@ -240,8 +259,7 @@ def value_format_for_measure(measure: str, prepared: dict[str, Any]) -> str:
     lowered = measure.lower()
     if any(token in lowered for token in ("pct", "percent", "percentage", "rate")):
         return "percentage"
-    currency = (prepared.get("dataset_profile") or {}).get("currency")
-    if currency or any(
+    if detect_currency([measure]) or any(
         token in lowered
         for token in ("amount", "cost", "gbp", "price", "profit", "revenue", "sales")
     ):

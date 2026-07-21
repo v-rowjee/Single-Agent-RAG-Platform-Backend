@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,23 +9,22 @@ from typing import Any, Literal, TypedDict
 
 import numpy as np
 import pandas as pd
-from dotenv import load_dotenv
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableLambda
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field
 
 from app.schemas.business_intelligence import (
     BusinessIntelligenceAgentInput,
     DashboardResponse,
 )
+from app.core.config import agent_model_policy
+from app.core.llm import create_chat_model
+from app.core.prompts import render_agent_prompts
 from app.rag.models import RerankedDocument, RetrievedDocument
 from app.rag.rag_service import compact_profile_for_chat, rag_service
 
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
-MODEL_NAME = "llama-3.3-70b-versatile"
-CHAT_MAX_TOKENS = 220
 logger = logging.getLogger(__name__)
 
 
@@ -203,7 +201,10 @@ class BusinessIntelligenceAgent:
         agent_input = state["agent_input"]
         if not rag_service.ensure_index(agent_input, state["profile"]):
             return {"retrieved_documents": []}
-        documents = rag_service.retrieve(agent_input=agent_input, query=state["query"])
+        documents = rag_service.retrieve(
+            session_id=agent_input.sessionId,
+            query=state["query"],
+        )
         return {"retrieved_documents": documents}
 
     def _rerank_documents(
@@ -231,7 +232,11 @@ class BusinessIntelligenceAgent:
         )
         self._last_source_ids[state["agent_input"].sessionId] = source_ids
 
-        if not context and direct_answer:
+        if direct_answer:
+            logger.info(
+                "Returning deterministic chat answer session_id=%s",
+                state["agent_input"].sessionId,
+            )
             return {"chat_response": direct_answer}
 
         if context:
@@ -253,7 +258,7 @@ class BusinessIntelligenceAgent:
                 return {"chat_response": response.strip()}
             except Exception:
                 logger.exception(
-                    "Groq RAG answer generation failed session_id=%s",
+                    "LLM RAG answer generation failed session_id=%s",
                     state["agent_input"].sessionId,
                 )
                 if direct_answer:
@@ -272,186 +277,52 @@ class BusinessIntelligenceAgent:
             )
         }
 
-    def _deterministic_chat_response(
-        self,
-        agent_input: BusinessIntelligenceAgentInput,
-        query: str,
-    ) -> str | None:
-        lowered = query.casefold()
-        asks_for_forecast = any(
-            word in lowered for word in ("forecast", "predict", "project")
-        )
-        if not asks_for_forecast or "revenue" not in lowered:
-            return None
-
-        try:
-            return self._forecast_revenue_response(agent_input, query)
-        except Exception:
-            return None
-
-    def _forecast_revenue_response(
-        self,
-        agent_input: BusinessIntelligenceAgentInput,
-        query: str,
-    ) -> str | None:
-        df = self._read(agent_input.filePath)
-        year_column = self._column(df, "Year")
-        price_column = self._column(df, "Price_USD")
-        volume_column = self._column(df, "Sales_Volume")
-        if not year_column or not price_column or not volume_column:
-            return None
-
-        match = re.search(r"\b(19\d{2}|20\d{2})\b", query)
-        if not match:
-            return None
-        target_year = int(match.group(1))
-
-        working = df[[year_column, price_column, volume_column]].copy()
-        region_column = self._column(df, "Region")
-        region = (
-            self._query_category(df, region_column, query)
-            if region_column
-            else None
-        )
-        if region_column and region:
-            working[region_column] = df[region_column]
-            working = working[
-                working[region_column].astype(str).str.casefold()
-                == region.casefold()
-            ]
-
-        working[year_column] = pd.to_numeric(working[year_column], errors="coerce")
-        working[price_column] = pd.to_numeric(working[price_column], errors="coerce")
-        working[volume_column] = pd.to_numeric(working[volume_column], errors="coerce")
-        working = working.dropna(subset=[year_column, price_column, volume_column])
-        if working.empty:
-            return None
-
-        working["revenue"] = working[price_column] * working[volume_column]
-        grouped = working.groupby(year_column)["revenue"].sum().sort_index()
-        grouped = grouped[grouped.index.astype(int) == grouped.index]
-        if len(grouped) < 4:
-            return None
-
-        years = [int(year) for year in grouped.index]
-        last_year = max(years)
-        if target_year <= last_year:
-            return None
-
-        values = grouped.astype(float).to_numpy()
-        x = np.arange(len(values), dtype=float)
-        slope, intercept = np.polyfit(x, values, 1)
-        steps_ahead = target_year - last_year
-        prediction = float(slope * (len(values) - 1 + steps_ahead) + intercept)
-
-        region_text = f" for {region}" if region else ""
-        filter_text = f", filtered to `Region = {region}`" if region else ""
-        return (
-            f"**Answer:** The forecasted total revenue{region_text} in "
-            f"{target_year} is **{self._display_currency(prediction)}**, using "
-            "a linear trend on annual revenue.\n\n"
-            f"**Grounding:** Dataset `{agent_input.fileName}`; revenue = "
-            f"`{price_column} * {volume_column}`{filter_text}, using "
-            f"`{year_column}` {min(years)}-{last_year}."
-        )
-
     def _create_chains(self) -> None:
         if self._dashboard_chain is not None:
             return
 
-        api_key = os.environ.get("GROQ_API_KEY")
-        if not api_key:
-            raise ValueError("GROQ_API_KEY is missing from the environment.")
+        dashboard_policy = agent_model_policy("single_dashboard")
+        chat_policy = agent_model_policy("single_chat")
+        llm = create_chat_model(dashboard_policy)
+        chat_llm = create_chat_model(chat_policy)
 
-        llm = ChatGroq(
-            model=MODEL_NAME,
-            api_key=SecretStr(api_key),
-            temperature=0,
-            max_tokens=1000,
-            timeout=120,
-            max_retries=1,
-        )
-        chat_llm = ChatGroq(
-            model=MODEL_NAME,
-            api_key=SecretStr(api_key),
-            temperature=0,
-            max_tokens=CHAT_MAX_TOKENS,
-            timeout=120,
-            max_retries=1,
-        )
-
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    """Use only the supplied dataset profile. Never invent values,
-trends, anomalies or forecasts. Return concise business narrative only.""",
-                ),
-                (
-                    "human",
-                    """Description: {description}
-Profile: {profile}
-
-Return a title, executive summary, business summary, up to five findings,
-three opportunities, three limitations and three recommended actions.""",
-                ),
-            ]
-        )
-        self._dashboard_chain = prompt | llm.with_structured_output(
+        self._dashboard_chain = RunnableLambda(
+            lambda values: self._prompt_value(
+                "single/business_intelligence",
+                "dashboard",
+                values,
+            )
+        ) | llm.with_structured_output(
             Narrative, method="function_calling"
         )
 
-        rag_chat_prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    """Answer only from the supplied calculated evidence and retrieved dataset context.
-Do not invent values, rows, trends, forecasts or categories.
-Deterministic calculated evidence takes priority over retrieved evidence.
-If evidence is insufficient, say so directly.
-Do not use outside knowledge to make claims about the uploaded dataset.
-Keep the response concise.
-Cite retrieved sources using their source IDs.
-Distinguish historical values from forecast values.
-Do not claim that correlation proves causation.
+        self._rag_chat_chain = RunnableLambda(
+            lambda values: self._prompt_value(
+                "single/business_intelligence",
+                "rag_chat",
+                values,
+            )
+        ) | chat_llm | StrOutputParser()
 
-Return exactly these two Markdown sections. The API returns each section as a
-separate field:
-**Answer:** Direct answer in one to four sentences.
+        self._profile_chat_chain = RunnableLambda(
+            lambda values: self._prompt_value(
+                "single/business_intelligence",
+                "profile_chat",
+                values,
+            )
+        ) | chat_llm | StrOutputParser()
 
-**Grounding:** Mention the calculation fields and/or retrieved source IDs that support the answer.""",
-                ),
-                (
-                    "human",
-                    "History: {history}\nEvidence:\n{context}\n\nQuestion: {query}",
-                ),
-            ]
-        )
-        self._rag_chat_chain = rag_chat_prompt | chat_llm | StrOutputParser()
-
-        profile_chat_prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    """Answer only from the supplied compact dataset profile.
-Return short Markdown under 90 words.
-
-Return exactly these two Markdown sections. The API returns each section as a
-separate field:
-**Answer:** 1-2 direct sentences.
-
-**Grounding:** Mention the compact profile fields that support the answer.
-
-If the compact profile does not contain enough evidence, say that directly.
-Do not include raw JSON, long lists, tables, code blocks, or unsupported recommendations.""",
-                ),
-                (
-                    "human",
-                    "Compact profile: {profile}\nHistory: {history}\nQuestion: {query}",
-                ),
-            ]
-        )
-        self._profile_chat_chain = profile_chat_prompt | chat_llm | StrOutputParser()
+    @staticmethod
+    def _prompt_value(
+        agent_name: str,
+        message_set: str,
+        values: dict[str, Any],
+    ) -> list[SystemMessage | HumanMessage]:
+        prompts = render_agent_prompts(agent_name, message_set, **values)
+        return [
+            SystemMessage(content=prompts.system),
+            HumanMessage(content=prompts.user),
+        ]
 
     def _profile(self, agent_input: BusinessIntelligenceAgentInput) -> dict[str, Any]:
         df = self._read(agent_input.filePath)

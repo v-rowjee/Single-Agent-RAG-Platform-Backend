@@ -7,9 +7,12 @@ from typing import Any
 
 import numpy as np
 
-TIMESFM_MODEL_ID = "google/timesfm-2.5-200m-pytorch"
-MAX_CONTEXT = 1024
-MAX_HORIZON = 256
+from app.core.config import get_runtime_config
+
+_FORECASTING_POLICY = get_runtime_config().forecasting
+TIMESFM_MODEL_ID = _FORECASTING_POLICY.model
+MAX_CONTEXT = _FORECASTING_POLICY.max_context
+MAX_HORIZON = _FORECASTING_POLICY.max_horizon
 
 
 class TimesFMServiceError(RuntimeError):
@@ -35,7 +38,10 @@ class TimesFMService:
         except ImportError as exc:
             raise TimesFMServiceError("TimesFM is not installed; install timesfm[torch] to enable forecasting.") from exc
         try:
-            model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(TIMESFM_MODEL_ID)
+            model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
+                TIMESFM_MODEL_ID,
+                torch_compile=False,
+            )
             model.compile(timesfm.ForecastConfig(max_context=MAX_CONTEXT, max_horizon=MAX_HORIZON, normalize_inputs=True, use_continuous_quantile_head=True, force_flip_invariance=True, infer_is_positive=True, fix_quantile_crossing=True))
         except Exception as exc:
             raise TimesFMServiceError(f"TimesFM model could not be loaded: {exc}") from exc

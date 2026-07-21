@@ -26,10 +26,6 @@ from app.agents.multi.retrieval_preparation_agent import (
     retrieval_preparation_node,
 )
 from app.schemas.business_intelligence import DashboardResponse
-from app.services.business_intelligence_persistence_service import (
-    business_intelligence_persistence_service,
-)
-from app.services.retrieval_indexing_service import retrieval_indexing_service
 
 from .routing import route_specialists
 from .state import BusinessIntelligenceState
@@ -107,50 +103,18 @@ async def output_join_node(
     state: BusinessIntelligenceState,
 ) -> dict[str, Any]:
     """Confirm downstream fan-in without turning a partial output into failure."""
-    expected = {"dashboard_generation", "retrieval_indexing"}
+    expected = {"dashboard_generation", "retrieval_preparation"}
     reported = set(state.get("completed_agents", [])) | set(state.get("failed_agents", []))
-    update: dict[str, Any] = {"completed_agents": ["output_join"]}
+    update: dict[str, Any] = {
+        "completed_agents": ["output_join"],
+        "workflow_status": _workflow_status(state),
+    }
     missing = expected - reported
     failed = expected & set(state.get("failed_agents", []))
     if missing or failed:
         names = sorted(missing | failed)
         update["warnings"] = [f"Output branch did not complete successfully: {', '.join(names)}."]
     return update
-
-
-async def retrieval_indexing_node(
-    state: BusinessIntelligenceState,
-) -> dict[str, Any]:
-    if "retrieval_preparation" in set(state.get("failed_agents", [])):
-        return {
-            "retrieval_indexing_result": {
-                "status": "failed",
-                "document_count": 0,
-                "indexed_count": 0,
-                "failed_count": 0,
-                "message": "Retrieval preparation failed.",
-            },
-            "failed_agents": ["retrieval_indexing"],
-            "warnings": [
-                "Retrieval indexing was skipped because retrieval preparation failed."
-            ],
-        }
-
-    result = retrieval_indexing_service.index_documents(
-        session_id=str(state.get("session_id") or ""),
-        dataset_id=str(state.get("dataset_id") or state.get("session_id") or ""),
-        retrieval_documents=list(state.get("retrieval_documents") or []),
-    )
-    if result.get("status") == "success":
-        return {
-            "retrieval_indexing_result": result,
-            "completed_agents": ["retrieval_indexing"],
-        }
-    return {
-        "retrieval_indexing_result": result,
-        "failed_agents": ["retrieval_indexing"],
-        "warnings": ["Retrieval indexing failed."],
-    }
 
 
 def _workflow_status(state: BusinessIntelligenceState) -> str:
@@ -180,71 +144,16 @@ def _workflow_status(state: BusinessIntelligenceState) -> str:
         or "kpi_trend" in failed
         or "insight_synthesis" in failed
         or "retrieval_preparation" in failed
-        or "retrieval_indexing" in failed
         or ("forecasting" in selected and not (state.get("forecasting_output") or {}).get("forecast"))
     )
     selected_complete = selected <= completed
     required_complete = {
         "dashboard_generation",
         "retrieval_preparation",
-        "retrieval_indexing",
     } <= completed
     if meets_success_shape and selected_complete and required_complete and not optional_failure:
         return "success"
     return "partial"
-
-
-async def persistence_node(
-    state: BusinessIntelligenceState,
-) -> dict[str, Any]:
-    final_status = _workflow_status(state)
-    try:
-        response = DashboardResponse.model_validate(state.get("dashboard_output"))
-        validated_response = response.model_copy(
-            update={"status": final_status}
-        )
-        dashboard_output = DashboardResponse.model_validate(
-            validated_response.model_dump(mode="json")
-        ).model_dump(mode="json")
-    except Exception as exc:
-        return {
-            "workflow_status": "failed",
-            "persistence_result": {
-                "status": "failed",
-                "session_id": str(state.get("session_id") or ""),
-                "dataset_id": str(state.get("dataset_id") or state.get("session_id") or ""),
-                "message": str(exc),
-            },
-            "failed_agents": ["persistence"],
-            "errors": ["Final workflow persistence failed."],
-        }
-
-    bundle = {
-        key: state.get(key)
-        for key in (
-            "session_id", "dataset_id", "prepared_dataset", "orchestration_plan",
-            "generic_cleaning_report",
-            "kpi_trend_output", "anomaly_output", "forecasting_output",
-            "synthesis_output", "retrieval_documents", "retrieval_indexing_result",
-            "warnings", "errors", "completed_agents", "failed_agents", "skipped_agents",
-        )
-    }
-    bundle["workflow_status"] = final_status
-    bundle["dashboard_output"] = dashboard_output
-    result = business_intelligence_persistence_service.persist_workflow(bundle)
-    if result.get("status") == "success":
-        return {
-            "workflow_status": final_status,
-            "dashboard_output": dashboard_output,
-            "persistence_result": result,
-            "completed_agents": ["persistence"],
-        }
-    return {
-        "workflow_status": "failed",
-        "persistence_result": result,
-        "failed_agents": ["persistence"],
-        "errors": ["Final workflow persistence failed."],
-    }
 
 
 def _recoverable_node(
@@ -398,28 +307,8 @@ def build_business_intelligence_graph(
         ),
     )
     graph.add_node(
-        "retrieval_indexing",
-        _recoverable_node(
-            "retrieval_indexing",
-            selected("retrieval_indexing", retrieval_indexing_node),
-            empty_update={
-                "retrieval_indexing_result": {
-                    "status": "failed",
-                    "document_count": 0,
-                    "indexed_count": 0,
-                    "failed_count": 0,
-                    "message": "Retrieval indexing failed.",
-                }
-            },
-        ),
-    )
-    graph.add_node(
         "output_join",
         selected("output_join", output_join_node),
-    )
-    graph.add_node(
-        "persistence",
-        selected("persistence", persistence_node),
     )
 
     graph.add_edge(START, "generic_cleaning")
@@ -440,14 +329,9 @@ def build_business_intelligence_graph(
     graph.add_edge("forecasting", "specialist_join")
     graph.add_edge("specialist_join", "insight_synthesis")
     graph.add_edge("insight_synthesis", "dashboard_generation")
-    graph.add_edge("insight_synthesis", "retrieval_preparation")
-    graph.add_edge("retrieval_preparation", "retrieval_indexing")
-    graph.add_edge(
-        ["dashboard_generation", "retrieval_indexing"],
-        "output_join",
-    )
-    graph.add_edge("output_join", "persistence")
-    graph.add_edge("persistence", END)
+    graph.add_edge("dashboard_generation", "retrieval_preparation")
+    graph.add_edge("retrieval_preparation", "output_join")
+    graph.add_edge("output_join", END)
     return graph.compile()
 
 

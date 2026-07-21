@@ -22,7 +22,6 @@ from app.api import business_intelligence as business_intelligence_api
 from app.core.auth import CurrentUser, get_current_user
 from app.core.config import Settings
 from app.main import app
-from app.rag import rag_service as rag_service_module
 from app.schemas.business_intelligence import DashboardResponse
 from app.services.business_intelligence_service import BusinessIntelligenceService
 from app.services.supabase_service import (
@@ -283,6 +282,7 @@ def full_flow(monkeypatch: pytest.MonkeyPatch):
     service = BusinessIntelligenceService(
         storage=storage,  # type: ignore[arg-type]
         settings=Settings("", "", bi_pipeline_mode="single"),
+        rag=rag,
     )
 
     async def multi_agent_pipeline_must_not_run(*args: object, **kwargs: object):
@@ -299,7 +299,6 @@ def full_flow(monkeypatch: pytest.MonkeyPatch):
         service,
     )
     monkeypatch.setattr(single_agent_module, "business_intelligence_agent", agent)
-    monkeypatch.setattr(rag_service_module, "rag_service", rag)
     app.dependency_overrides[get_current_user] = lambda: CurrentUser(id=USER_ID)
 
     try:
@@ -374,11 +373,21 @@ def test_single_agent_api_full_flow_uses_only_deterministic_fakes(full_flow) -> 
     assert first_chat.json() == {
         "answer": "Revenue totals 30 across North and South.",
         "grounding": "The uploaded sales dataset.",
+        "agentMetadata": {
+            "agent": "Chat assistant",
+            "provider": "groq",
+            "model": "openai/gpt-oss-120b",
+        },
     }
     assert second_chat.status_code == 200
     assert second_chat.json() == {
         "answer": "North contributes 10 and South contributes 20.",
         "grounding": "The prior revenue result and the regional rows.",
+        "agentMetadata": {
+            "agent": "Chat assistant",
+            "provider": "groq",
+            "model": "openai/gpt-oss-120b",
+        },
     }
     assert agent.chat_calls[0]["history"] == []
     assert agent.chat_calls[1]["history"] == [
@@ -410,6 +419,11 @@ def test_single_agent_api_full_flow_uses_only_deterministic_fakes(full_flow) -> 
         False,
         True,
     ]
+    assert history.json()["messages"][1]["agentMetadata"] == {
+        "agent": "Chat assistant",
+        "provider": "groq",
+        "model": "openai/gpt-oss-120b",
+    }
 
 
 def test_analysis_routes_reject_requests_without_a_bearer_token() -> None:
@@ -478,6 +492,7 @@ def test_active_dataset_details_preview_second_upload_and_reset(full_flow) -> No
         "rowCount": 2,
         "columnCount": 2,
         "analysisStatus": "ready",
+        "ragStatus": "ready",
         "originalPrompt": "Quarterly sales analysis",
     }
 

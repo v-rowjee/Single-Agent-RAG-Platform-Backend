@@ -8,6 +8,7 @@ class BusinessIntelligenceState(TypedDict, total=False):
     session_id: str
     dataset_id: str
     business_description: str | None
+    source_datasets: list[dict[str, Any]]
 
     uploaded_file_path: str
     working_directory: str
@@ -29,8 +30,6 @@ class BusinessIntelligenceState(TypedDict, total=False):
     dashboard_layout_plan: dict[str, Any]
     retrieval_output: dict[str, Any]
     retrieval_documents: list[dict[str, Any]]
-    retrieval_indexing_result: dict[str, Any]
-    persistence_result: dict[str, Any]
 
     workflow_status: str
 

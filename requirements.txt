@@ -8,12 +8,18 @@ openpyxl
 xlrd
 
 python-dotenv
+Jinja2
+toons==0.7.0
+tomli>=2.0; python_version < "3.11"
 supabase>=2.25.0
 
+groq
+openai
 langchain
 langchain-groq
 langchain-openai
 langgraph
-fastembed
+sentence-transformers>=5.4.0
+transformers>=4.51.0
 pytest
-timesfm[torch]
+chronos-forecasting>=2.0

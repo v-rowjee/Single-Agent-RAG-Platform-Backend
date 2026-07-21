@@ -6,12 +6,16 @@ from types import MethodType
 from typing import Any
 
 import pytest
+from fastapi import BackgroundTasks
 from starlette.datastructures import Headers, UploadFile
 
 from app.core.config import Settings
 from app.schemas.business_intelligence import DashboardResponse
 from app.services import business_intelligence_service as service_module
-from app.services.business_intelligence_service import BusinessIntelligenceService
+from app.services.business_intelligence_service import (
+    BusinessIntelligenceService,
+    PipelineExecution,
+)
 from app.services.supabase_service import DatasetRecord
 
 
@@ -21,6 +25,7 @@ USER_ID = "59b3d0fc-2d4a-40a0-8bb1-99e19da406ee"
 class UploadStorage:
     def __init__(self) -> None:
         self.saved_dashboards = 0
+        self.saved_processing = 0
         self.status_updates: list[dict[str, Any]] = []
 
     def upload_file(self, storage_path: str, content: bytes, mime_type: str) -> None:
@@ -49,6 +54,9 @@ class UploadStorage:
     def save_dashboard(self, **values: Any) -> None:
         self.saved_dashboards += 1
 
+    def save_session_processing(self, **values: Any) -> None:
+        self.saved_processing += 1
+
     def update_dataset_status(self, dataset_id: str, **values: Any) -> None:
         self.status_updates.append({"dataset_id": dataset_id, **values})
 
@@ -59,13 +67,99 @@ class UploadStorage:
         return None
 
 
-def test_multi_upload_uses_graph_owned_persistence_and_never_single_agent(
+class IndexingRag:
+    def index_documents(self, **values: Any) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "document_count": len(values["retrieval_documents"]),
+            "indexed_count": len(values["retrieval_documents"]),
+            "failed_count": 0,
+        }
+
+
+def test_dashboard_persists_before_background_retrieval_indexing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = UploadStorage()
+
+    class RecordingRag(IndexingRag):
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def index_documents(self, **values: Any) -> dict[str, Any]:
+            self.calls.append(values)
+            return super().index_documents(**values)
+
+    rag = RecordingRag()
+    service = BusinessIntelligenceService(
+        storage=storage,  # type: ignore[arg-type]
+        settings=Settings("", "", bi_pipeline_mode="multi"),
+        rag=rag,
+    )
+
+    async def run_multi(
+        self: BusinessIntelligenceService,
+        dataset: DatasetRecord,
+        content: bytes | None = None,
+        workspace_session_id: str | None = None,
+    ) -> PipelineExecution:
+        info = self._inspect_file(dataset.file_name, content or b"")
+        return PipelineExecution(
+            response=DashboardResponse.model_validate(
+                self._build_placeholder_dashboard(dataset, info)
+            ),
+            retrieval_documents=[
+                {
+                    "id": "dataset_overview",
+                    "content": "Revenue overview.",
+                    "document_type": "dataset_overview",
+                }
+            ],
+        )
+
+    monkeypatch.setattr(
+        service,
+        "_run_multi_agent_pipeline",
+        MethodType(run_multi, service),
+    )
+    background_tasks = BackgroundTasks()
+    upload = UploadFile(
+        filename="sales.csv",
+        file=io.BytesIO(b"date,revenue\n2025-01-01,100\n"),
+        headers=Headers({"content-type": "text/csv"}),
+    )
+
+    response = asyncio.run(
+        service.create_analysis(
+            upload,
+            user_id=USER_ID,
+            background_tasks=background_tasks,
+        )
+    )
+
+    assert response["status"] == "success"
+    assert rag.calls == []
+    assert storage.saved_dashboards == 1
+    assert storage.status_updates[-1]["status"] == "ready"
+    assert storage.status_updates[-1]["rag_status"] == "indexing"
+    assert len(background_tasks.tasks) == 1
+
+    asyncio.run(background_tasks())
+
+    assert len(rag.calls) == 1
+    assert storage.saved_dashboards == 2
+    assert storage.status_updates[-1]["status"] == "ready"
+    assert storage.status_updates[-1]["rag_status"] == "ready"
+
+
+def test_multi_upload_uses_service_owned_persistence_and_never_single_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage = UploadStorage()
     service = BusinessIntelligenceService(
         storage=storage,  # type: ignore[arg-type]
         settings=Settings("", "", bi_pipeline_mode="multi"),
+        rag=IndexingRag(),
     )
     multi_calls: list[str] = []
 
@@ -103,11 +197,15 @@ def test_multi_upload_uses_graph_owned_persistence_and_never_single_agent(
 
     assert response["status"] == "success"
     assert len(multi_calls) == 1
-    assert storage.saved_dashboards == 0
+    assert storage.saved_dashboards == 1
+    assert storage.saved_processing == 1
+    assert len(storage.status_updates) == 2
+    assert storage.status_updates[0]["rag_status"] == "indexing"
     assert storage.status_updates[-1]["status"] == "ready"
+    assert storage.status_updates[-1]["rag_status"] == "ready"
 
 
-def test_failed_graph_persistence_returns_failed_dashboard_response(
+def test_failed_graph_returns_failed_dashboard_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dataset = DatasetRecord(
@@ -128,12 +226,11 @@ def test_failed_graph_persistence_returns_failed_dashboard_response(
         settings=Settings("", "", bi_pipeline_mode="multi"),
     )
 
-    class FailedPersistenceGraph:
+    class FailedWorkflowGraph:
         async def ainvoke(self, state: dict[str, Any]) -> dict[str, Any]:
             return {
                 **state,
                 "workflow_status": "failed",
-                "persistence_result": {"status": "failed"},
                 "dashboard_output": {
                     "status": "partial",
                     "sessionId": dataset.id,
@@ -146,16 +243,16 @@ def test_failed_graph_persistence_returns_failed_dashboard_response(
     monkeypatch.setattr(
         service_module,
         "business_intelligence_graph",
-        FailedPersistenceGraph(),
+        FailedWorkflowGraph(),
     )
 
-    response = asyncio.run(
+    execution = asyncio.run(
         service._run_multi_agent_pipeline(
             dataset,
             b"date,revenue\n2025-01-01,100\n",
         )
     )
 
-    assert response.status == "failed"
-    assert response.dashboard is None
-    assert response.errors[0].code == "MULTI_AGENT_PIPELINE_FAILED"
+    assert execution.response.status == "failed"
+    assert execution.response.dashboard is None
+    assert execution.response.errors[0].code == "MULTI_AGENT_PIPELINE_FAILED"

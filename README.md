@@ -6,57 +6,186 @@
 uvicorn app.main:app --reload
 ```
 
-Copy `.env.sample` to `.env` and set the Supabase service-role key. Apply
-`scripts/db.sql` in the Supabase SQL editor before starting the API. The script
-recreates application data tables, creates a profile for each Supabase Auth
-account, and leaves the Supabase-managed `auth.users` records intact.
+Copy `.env.sample` to `.env` and set the Supabase service-role key. In a new
+Supabase project, create a private Storage bucket named `uploads`, then apply
+`scripts/db.sql` once in the SQL editor before starting the API. The script is a
+non-destructive first-time bootstrap: it creates the application tables,
+profiles existing Supabase Auth accounts, and never drops or migrates objects.
+If the application schema already exists, use a dedicated migration instead of
+rerunning this bootstrap.
 
 All `/api/upload`, `/api/dashboard/{session_id}`, `/api/chat`, and
 `/api/chat/{session_id}/history` requests require an `Authorization: Bearer
 <Supabase access JWT>` header. The backend validates the JWT and returns data
 only when the session belongs to its authenticated user.
 
+`POST /api/upload` accepts one to five repeated multipart `files` fields.
+Different schemas are prepared independently and synthesized into one
+session-scoped dashboard and retrieval index. `GET /api/dataset` returns the
+workspace plus its `datasets[]`; previews use
+`GET /api/dataset/preview?dataset_id=<uuid>&page=1&page_size=50`.
+Additional files can be appended with `POST /api/dataset` using the same
+repeated `files` fields, up to five total datasets. Remove one with
+`DELETE /api/dataset/{dataset_id}`. Both operations rebuild the dashboard and
+retrieval index, and clear chat history that was grounded in the previous file
+set. Removing the last dataset deletes the workspace.
+Chat questions use every dataset in the active workspace by default; naming a
+file explicitly narrows the answer to that dataset.
+
 ## Pipeline mode
 
-Set `BI_PIPELINE_MODE` in `.env`:
+Set the pipeline mode in `config/agents.toml`:
 
-```dotenv
-# Existing single-agent dashboard and chat workflow
-BI_PIPELINE_MODE=single
-
-# Multi-agent analysis and session-scoped retrieval chat
-BI_PIPELINE_MODE=multi
+```toml
+[pipeline]
+# Change this to "single" for the existing single-agent dashboard and chat workflow.
+mode = "multi"
 ```
 
-`single` remains the default when the variable is omitted. The two modes expose
+`multi` is the checked-in default. The two modes expose
 the same upload, dashboard, chat, and chat-history API contracts.
+
+Each `agents.<name>` section selects the provider, model, generation limits,
+and reasoning effort for one LLM invocation. Each LLM agent has one versioned
+TOON bundle in `app/prompts/`; the backend validates the bundle at startup and
+serializes its structured system and user context as TOON before invocation.
+Mode and model settings are deliberately not read from `.env`.
+The multi-agent chat response has a 25-second generation limit. If it expires,
+the API returns already-retrieved recommendation evidence when available.
+The `[forecasting]` table configures the Chronos-2 model and its limits.
+Keep API keys, Supabase credentials, and other secrets in `.env` only.
+
+## Model alignment
+
+The checked-in multi-agent workflow mixes providers by workload:
+
+| Step / agent | Model | Provider |
+| --- | --- | --- |
+| Data preparation | `openai/gpt-oss-20b` | Groq |
+| Orchestrator | `groq/compound` | Groq |
+| KPI and trend analysis | `openai/gpt-oss-120b` | Groq |
+| Anomaly detection | `nvidia/nemotron-3-super-120b-a12b:free` | OpenRouter |
+| Forecasting | `amazon/chronos-2` | Self-hosted |
+| Insight synthesis | `nvidia/nemotron-3-ultra-550b-a55b:free` | OpenRouter |
+| Dashboard generation | `poolside/laguna-xs-2.1:free` | OpenRouter |
+| Retrieval embedding | `BAAI/bge-small-en-v1.5` | Self-hosted |
+| Retrieval reranking | `BAAI/bge-reranker-v2-m3` | Self-hosted |
+| Chat | `openai/gpt-oss-120b` | Groq |
+
+Generic cleaning, specialist join, and Supabase persistence are non-LLM
+steps. Forecast output is passed directly to insight synthesis, so the optional
+forecast-narration call is not instantiated. If a separate narration node is
+introduced later, it should use `openai/gpt-oss-20b` through Groq.
+
+Every LLM agent independently selects `groq` or `openrouter` in
+`config/agents.toml`. Use a model identifier available from the selected
+provider. Configure only the credentials needed by the active policies:
+
+```dotenv
+GROQ_API_KEY=your-groq-api-key
+OPENROUTER_API_KEY=your-openrouter-api-key
+```
+
+Changing `provider` does not change the agent prompts, response schemas,
+deterministic validation, fallback behavior, or API contracts.
 
 The multi-agent analysis flow is:
 
 ```text
-Upload -> Generic Cleaning -> Data Preparation -> Orchestrator
+Upload -> Generic Cleaning -> Data Preparation -> Compound Orchestrator
        -> capability-gated KPI/Trend, Anomaly, and Forecast specialists
        -> Specialist Join -> Insight Synthesis
-       -> Dashboard Generation --------------------\
-       -> Retrieval Preparation -> Retrieval Indexing
-                                                    -> Output Join
-                                                    -> Persistence -> END
+       -> Dashboard Generation ----\
+       -> Retrieval Preparation -----> Output Join
+                                      -> Dashboard/Workflow Persistence
+                                      -> API Response
+                                      -> Background Retrieval Indexing
+                                      -> Final RAG Status/Persistence -> END
 ```
 
-Dashboard generation and retrieval indexing must both report completion or
-failure before the output join runs. Optional specialist and retrieval failures
-produce a partial dashboard with warnings; cleaning, preparation, dashboard, or
-persistence failures produce a failed result.
+RAG model assignments, embedding and reranking limits, retrieval thresholds,
+and document chunking settings live in `config/rag.toml`. Both checked-in TOML
+files are validated when the API starts, so invalid settings fail early with a
+configuration error.
+
+The embedding model is `BAAI/bge-small-en-v1.5` and the second-stage reranker is
+`BAAI/bge-reranker-v2-m3`. Both are loaded lazily through Sentence Transformers,
+download their weights on first use, and let PyTorch select CUDA when available
+or fall back to CPU. BGE-small produces normalized 384-dimensional vectors.
+Short retrieval queries receive BGE's recommended English query instruction,
+while indexed documents remain unprefixed.
+The reranker scores query-document pairs from the vector search candidates.
+
+The fresh-project schema creates `document_chunks` and its vector-search
+function with `vector(384)`, matching the BGE-small embedding output. Projects
+that applied the 1024-dimensional Voyage migration must stop the API and run
+`scripts/rollback_voyage_4_nano_to_bge_small.sql` once in the Supabase SQL editor
+before restarting. The rollback preserves uploaded files but clears derived
+dashboards and vectors so the next dashboard request rebuilds them consistently.
+
+Dashboard generation and retrieval preparation must both report completion or
+failure before the graph's output join runs. The top-level business intelligence
+service persists and returns the usable dashboard before starting the expensive
+embedding/index replacement as a response background task. The workspace reports
+`ragStatus: indexing` until that task records `ready` or `failed`; chat and
+dataset mutations wait for indexing to finish. Optional specialist and retrieval
+failures produce a partial dashboard with warnings; cleaning, preparation,
+dashboard, or persistence failures produce a failed result.
 
 Multi-agent chat uses a separate pipeline:
 
 ```text
-Session Validation -> Input Guardrail -> Session-Filtered Retrieval
-                   -> Chat Agent -> Output Grounding Guardrail -> Chat Response
+Session Validation -> Input Guardrail -> History-Aware Session Retrieval
+                   -> Cross-Encoder Reranking -> Chat Agent
+                   -> Output Grounding Guardrail -> Chat Response
 ```
+
+Both pipeline modes use the same configured chunker and transactional Supabase
+index replacement. Multi-agent retrieval combines compact analytical findings
+with bounded prepared-row batches so detailed lookups are not limited to
+dashboard summaries. Recent conversation history is used to resolve follow-up
+references, but only retrieved documents are accepted as factual evidence.
 
 ## Tests
 
 ```powershell
 pytest -q
 ```
+
+## Orchestration
+
+USER UPLOAD
+    │
+    ▼
+Generic Cleaning Service
+    │
+    ▼
+Data Preparation Agent
+    │
+    ▼
+Orchestrator Agent
+    │
+    ├──────────────┬──────────────────┐
+    ▼              ▼                  ▼
+KPI & Trend     Anomaly Detection   Forecasting
+Agent           Agent               Agent
+    │              │                  │
+    └──────────────┴──────────────────┘
+                   │
+                   ▼
+             Specialist Join
+                   │
+                   ▼
+         Insight Synthesis Agent
+                   │
+         ┌─────────┴──────────┐
+         ▼                    ▼
+Dashboard Generation   Retrieval Preparation
+Agent                  Agent
+         │                    │
+         ▼                    ▼
+ Dashboard JSON       RAG Documents / Chunks
+         │                    │
+         └─────────┬──────────┘
+                   ▼
+          Supabase Persistence

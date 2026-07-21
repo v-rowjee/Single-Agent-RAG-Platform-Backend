@@ -1,22 +1,22 @@
 """Grounded chat generation over session-scoped retrieval evidence only."""
 from __future__ import annotations
 
-import json
 import logging
-import os
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app.core.agent_models import agent_model_policy
-from app.core.groq_structured import request_structured
+from app.core.config import agent_model_policy, get_rag_config
+from app.core.llm import request_structured
+from app.core.prompts import render_agent_prompts
 from app.rag.models import RetrievedDocument
 
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIEVED_DOCUMENTS = 6
-MAX_CONTEXT_CHARACTERS = 12_000
-MAX_DOCUMENT_CHARACTERS = 2_500
+_RAG_CONFIG = get_rag_config()
+MAX_RETRIEVED_DOCUMENTS = _RAG_CONFIG.retrieval.chat_search_limit
+MAX_CONTEXT_CHARACTERS = _RAG_CONFIG.retrieval.max_context_chars
+MAX_DOCUMENT_CHARACTERS = _RAG_CONFIG.chunking.size
 INSUFFICIENT_CONTEXT_ANSWER = (
     "The available analysis does not contain enough information to answer that "
     "question."
@@ -60,6 +60,7 @@ def _compact_context(documents: list[RetrievedDocument]) -> str:
             continue
         header = (
             f"Document ID: {source_ids[0] if source_ids else 'unknown'}\n"
+            f"Dataset: {metadata.get('file_name') or 'active workspace'}\n"
             f"Type: {metadata.get('document_type') or 'unknown'}\n"
             f"Title: {metadata.get('title') or source_ids[0] if source_ids else 'Business intelligence evidence'}\n"
             f"Source IDs: {', '.join(source_ids) or 'not available'}\n"
@@ -87,39 +88,26 @@ def _validated_source_ids(
     return output
 
 
-async def _request_groq_draft(query: str, context: str) -> GroundedChatDraft:
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY is missing.")
+async def _request_draft(
+    query: str,
+    context: str,
+    history: list[dict[str, str]],
+) -> GroundedChatDraft:
+    prompts = render_agent_prompts(
+        "multi/chat",
+        payload={
+            "query": query,
+            "conversation_history": history,
+            "documents": context,
+        },
+    )
     return await request_structured(
-        api_key=api_key,
         policy=agent_model_policy("chat"),
         response_model=GroundedChatDraft,
         schema_name="grounded_chat_draft",
-        temperature=0.1,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a grounded business intelligence assistant. Answer only "
-                    "from the supplied retrieved analysis documents. Do not invent "
-                    "facts, values, causes, trends, anomalies, forecasts, or "
-                    "recommendations. Do not perform authoritative calculations. Use "
-                    "numeric values only when they appear in the documents. Do not "
-                    "claim causation unless the evidence explicitly supports it. When "
-                    "evidence is insufficient, say so clearly. Return JSON only with "
-                    "answer, source_ids, and insufficient_context. source_ids must "
-                    "contain only supplied document IDs. Keep the answer concise and "
-                    "non-technical."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {"query": query, "documents": context},
-                    separators=(",", ":"),
-                ),
-            },
+            {"role": "system", "content": prompts.system},
+            {"role": "user", "content": prompts.user},
         ],
     )
 
@@ -130,6 +118,7 @@ class ChatAgent:
         session_id: str,
         query: str,
         retrieved_documents: list[RetrievedDocument],
+        history: list[dict[str, str]] | None = None,
     ) -> GroundedChatDraft:
         documents = retrieved_documents[:MAX_RETRIEVED_DOCUMENTS]
         logger.info(
@@ -146,7 +135,11 @@ class ChatAgent:
             )
 
         try:
-            draft = await _request_groq_draft(query, _compact_context(documents))
+            draft = await _request_draft(
+                query,
+                _compact_context(documents),
+                history or [],
+            )
             validated = draft.model_copy(
                 update={"source_ids": _validated_source_ids(draft, documents)}
             )

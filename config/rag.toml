@@ -1,0 +1,23 @@
+[embedding]
+model = "BAAI/bge-small-en-v1.5"
+dimensions = 384
+batch_size = 8
+
+[reranking]
+model = "BAAI/bge-reranker-v2-m3"
+batch_size = 8
+limit = 4
+max_length = 384
+
+[retrieval]
+vector_search_limit = 8
+chat_search_limit = 4
+match_threshold = 0.25
+max_context_chars = 4000
+
+[chunking]
+size = 800
+overlap = 100
+max_row_batch_documents = 24
+rows_per_batch_document = 8
+max_columns_per_row_document = 12

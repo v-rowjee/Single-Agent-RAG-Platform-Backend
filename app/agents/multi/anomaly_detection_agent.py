@@ -1,8 +1,6 @@
 """Independent anomaly-detection specialist using pandas and numpy."""
 from __future__ import annotations
 
-import json
-import os
 import re
 from pathlib import Path
 from typing import Any, Literal
@@ -11,7 +9,7 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.agents.multi.analysis_series import (
+from app.services.series import (
     aggregation_for_measure,
     is_numeric_measure,
     ranked_measures,
@@ -19,8 +17,9 @@ from app.agents.multi.analysis_series import (
     selected_date_column,
     selected_granularity,
 )
-from app.core.agent_models import agent_model_policy
-from app.core.groq_structured import request_structured
+from app.core.config import agent_model_policy
+from app.core.llm import request_structured
+from app.core.prompts import render_agent_prompts
 
 MIN_TIME_PERIODS = 6
 MIN_ROLLING_PERIODS = 6
@@ -101,16 +100,19 @@ def _metadata(prepared: dict[str, Any]) -> dict[str, Any]:
     return {"columns": [{"name": p.get("name"), "type": p.get("inferred_type"), "unique_count": p.get("unique_count")} for p in profile.get("column_profiles", []) if isinstance(p, dict)][:80], "row_count": profile.get("row_count"), "primary_measures": prepared.get("primary_measures") or [], "dimension_candidates": prepared.get("dimension_candidates") or [], "date_column": prepared.get("date_column"), "temporal_profile": prepared.get("temporal_profile") or {"inferred_frequency": prepared.get("time_granularity")}, "time_series_candidates": prepared.get("time_series_candidates") or [], "capability_flags": prepared.get("capability_flags") or {}, "limitations": prepared.get("limitations") or []}
 
 
-async def _request_groq_plan(prepared: dict[str, Any]) -> AnomalyPlan:
-    key = os.getenv("GROQ_API_KEY", "").strip()
-    if not key: raise AnomalyDetectionError("GROQ_API_KEY is missing.")
+async def _request_plan(prepared: dict[str, Any]) -> AnomalyPlan:
+    prompts = render_agent_prompts(
+        "multi/anomaly_detection",
+        payload=_metadata(prepared),
+    )
     return await request_structured(
-        api_key=key,
         policy=agent_model_policy("anomaly_detection"),
         response_model=AnomalyPlan,
         schema_name="anomaly_detection_plan",
-        temperature=0.1,
-        messages=[{"role": "system", "content": "Return JSON only: {analyses:[{id,measure,method,aggregation,date_column?,granularity?,group_by?}],limitations:[]}. Use supported methods z_score, iqr, rolling_deviation, percentage_change; aggregations sum, mean, count; granularities day, week, month, quarter, year. Prefer time series when available. Do not calculate values."}, {"role": "user", "content": json.dumps(_metadata(prepared), default=str, separators=(",", ":"))}],
+        messages=[
+            {"role": "system", "content": prompts.system},
+            {"role": "user", "content": prompts.user},
+        ],
     )
 
 
@@ -130,7 +132,7 @@ def _fallback(prepared: dict[str, Any], df: pd.DataFrame) -> AnomalyPlan:
         definition = AnomalyDefinition(id=f"{granularity}_{_slug(measures[0])}_rolling", measure=measures[0], method="rolling_deviation", aggregation=aggregation_for_measure(measures[0]), date_column=date, granularity=granularity)
     else:
         definition = AnomalyDefinition(id=f"{_slug(measures[0])}_iqr", measure=measures[0], method="iqr")
-    return AnomalyPlan(analyses=[definition], limitations=["Deterministic planning was used because Groq planning was unavailable or invalid."])
+    return AnomalyPlan(analyses=[definition], limitations=["Anomaly - Deterministic planning was used because LLM planning was unavailable or invalid."])
 
 
 def _ensure_primary_temporal_analysis(
@@ -274,8 +276,8 @@ class AnomalyDetectionAgent:
         df = pd.read_csv(_path(prepared_dataset), low_memory=False)
         warnings: list[str] = []
         try:
-            proposed = await _request_groq_plan(prepared_dataset); analyses, validation = _validate(proposed, df); warnings.extend(validation)
-            if not analyses: raise AnomalyDetectionError("Groq plan has no valid analyses.")
+            proposed = await _request_plan(prepared_dataset); analyses, validation = _validate(proposed, df); warnings.extend(validation)
+            if not analyses: raise AnomalyDetectionError("LLM plan has no valid analyses.")
             limitations = proposed.limitations
         except Exception as exc:
             warnings.append(str(exc)); fallback = _fallback(prepared_dataset, df); analyses, validation = _validate(fallback, df); warnings.extend(validation); limitations = fallback.limitations

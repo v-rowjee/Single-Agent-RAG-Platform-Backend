@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import io
 import logging
@@ -8,19 +7,21 @@ import math
 import re
 import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Literal
 from uuid import UUID, uuid4
 
 import pandas as pd
-from fastapi import UploadFile
+from fastapi import BackgroundTasks, UploadFile
 
-from app.agents.multi.chat_agent import GroundedChatDraft, chat_agent
 from app.core.config import Settings, get_settings
-from app.guardrails.chat_input import chat_input_guardrail
-from app.guardrails.chat_grounding import chat_grounding_guardrail
-from app.orchestration.chat_graph import build_multi_agent_chat_graph
+from app.core.model_usage import (
+    chat_model_usage,
+    multi_dashboard_model_usage,
+    single_dashboard_model_usage,
+)
 from app.schemas.business_intelligence import (
     ApiMessage,
     BusinessIntelligenceAgentInput,
@@ -30,9 +31,13 @@ from app.schemas.business_intelligence import (
 from app.orchestration.business_intelligence_graph import (
     business_intelligence_graph,
 )
-from app.rag.models import RetrievedDocument
-from app.rag.rag_service import DEFAULT_RETRIEVAL_LIMIT, rag_service
+from app.agents.multi.retrieval_preparation_agent import (
+    dashboard_retrieval_documents,
+)
+from app.rag.rag_service import rag_service
+from app.services.chat_service import ChatService
 from app.services.supabase_service import (
+    AnalysisSessionRecord,
     DatasetRecord,
     MessageRecord,
     SupabaseService,
@@ -43,6 +48,7 @@ from app.services.supabase_service import (
 logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_UPLOAD_FILES = 5
 ALLOWED_EXTENSIONS = {".csv", ".xlsx"}
 ALLOWED_MIME_TYPES = {
     "text/csv",
@@ -64,6 +70,13 @@ class DatasetAlreadyExistsError(Exception):
     """Raised when a user attempts to upload a second active dataset."""
 
 
+@dataclass
+class PipelineExecution:
+    response: DashboardResponse
+    workflow: dict[str, Any] | None = None
+    retrieval_documents: list[dict[str, Any]] | None = None
+
+
 class BusinessIntelligenceService:
     def __init__(
         self,
@@ -72,167 +85,571 @@ class BusinessIntelligenceService:
         *,
         rag: Any | None = None,
         multi_chat_agent: Any | None = None,
-        input_guardrail: Any | None = None,
-        output_guardrail: Any | None = None,
-        multi_chat_graph: Any | None = None,
+        chat_service: ChatService | None = None,
     ) -> None:
         self.storage = storage or supabase_service
         self.settings = settings or get_settings()
         self._rag_service = rag or rag_service
-        self._multi_chat_agent = multi_chat_agent or chat_agent
-        self._input_guardrail = input_guardrail or chat_input_guardrail
-        self._output_guardrail = output_guardrail or chat_grounding_guardrail
-        self._multi_chat_graph = multi_chat_graph or build_multi_agent_chat_graph(
-            validate_session=self._load_dataset,
-            validate_input=self._input_guardrail.validate,
-            retrieve_documents=self._retrieve_multi_chat_documents,
-            generate_draft=self._generate_multi_chat_draft,
-            ground_draft=self._ground_multi_chat_draft,
+        self._chat_service = chat_service or ChatService(
+            rag=self._rag_service,
+            agent=multi_chat_agent,
         )
+        self._legacy_contract_sessions: set[str] = set()
+
+    def uses_legacy_contract(self, session_id: str) -> bool:
+        return session_id in self._legacy_contract_sessions
 
     async def create_analysis(
         self,
-        file: UploadFile,
+        files: list[UploadFile] | UploadFile,
         user_id: str,
         description: str | None = None,
+        legacy_contract: bool = False,
+        background_tasks: BackgroundTasks | None = None,
     ) -> dict[str, Any]:
         if not user_id:
             raise ValueError("An authenticated user is required.")
-        original_name = Path(file.filename or "").name
-        file_name = self._sanitize_file_name(original_name)
-        mime_type = (file.content_type or "").strip()
-        extension = Path(file_name).suffix.lower()
-        self._validate_upload_metadata(file_name, mime_type, extension)
+        uploaded_files = (
+            [files]
+            if hasattr(files, "read") and not isinstance(files, (list, tuple))
+            else list(files)
+        )
+        if not 1 <= len(uploaded_files) <= MAX_UPLOAD_FILES:
+            raise InvalidUploadError(
+                f"Upload between 1 and {MAX_UPLOAD_FILES} files at once."
+            )
 
-        content = await file.read()
-        if not content:
-            raise InvalidUploadError("The uploaded file is empty.")
-        if len(content) > MAX_UPLOAD_BYTES:
-            raise InvalidUploadError("The uploaded file is too large.")
-
-        dataset_info = self._inspect_file(file_name, content)
-        if self.storage.get_active_dataset(user_id) is not None:
+        get_active_session = getattr(self.storage, "get_active_session", None)
+        active_session = (
+            get_active_session(user_id)
+            if callable(get_active_session)
+            else self.storage.get_active_dataset(user_id)
+        )
+        if active_session is not None:
             raise DatasetAlreadyExistsError(
-                "You already have an active dataset. Use Start Over before uploading another file."
+                "You already have an active workspace. Use Start Over before uploading another batch."
+            )
+
+        inspected: list[dict[str, Any]] = []
+        names: set[str] = set()
+        hashes: set[str] = set()
+        for file in uploaded_files:
+            original_name = Path(file.filename or "").name
+            file_name = self._sanitize_file_name(original_name)
+            mime_type = (file.content_type or "").strip()
+            extension = Path(file_name).suffix.lower()
+            self._validate_upload_metadata(file_name, mime_type, extension)
+            normalized_name = file_name.casefold()
+            if normalized_name in names:
+                raise InvalidUploadError(
+                    f"Duplicate filename '{file_name}' is not allowed."
+                )
+
+            content = await file.read()
+            if not content:
+                raise InvalidUploadError(f"'{file_name}' is empty.")
+            if len(content) > MAX_UPLOAD_BYTES:
+                raise InvalidUploadError(
+                    f"'{file_name}' is larger than the 25 MiB limit."
+                )
+
+            file_hash = hashlib.sha256(content).hexdigest()
+            if file_hash in hashes:
+                raise InvalidUploadError(
+                    f"'{file_name}' duplicates another file in this batch."
+                )
+
+            dataset_info = self._inspect_file(file_name, content)
+            names.add(normalized_name)
+            hashes.add(file_hash)
+            inspected.append(
+                {
+                    "file_name": file_name,
+                    "mime_type": mime_type,
+                    "content": content,
+                    "file_hash": file_hash,
+                    "dataset_info": dataset_info,
+                }
             )
 
         session_id = str(uuid4())
-        storage_path = f"{user_id}/{session_id}/{file_name}"
-        file_hash = hashlib.sha256(content).hexdigest()
-
-        dataset_inserted = False
-        file_uploaded = False
+        session: AnalysisSessionRecord
+        datasets: list[DatasetRecord] = []
+        uploaded_paths: list[str] = []
+        session_created = False
         try:
-            dataset = self.storage.create_dataset(
-                dataset_id=session_id,
-                user_id=user_id,
-                file_name=file_name,
-                storage_path=storage_path,
-                mime_type=mime_type,
-                file_size=len(content),
-                file_hash=file_hash,
-                description=description,
-                row_count=int(dataset_info["rowCount"]),
-                column_count=int(dataset_info["columnCount"]),
-            )
-            dataset_inserted = True
-
-            self.storage.upload_file(
-                storage_path=storage_path,
-                content=content,
-                mime_type=mime_type,
-            )
-            file_uploaded = True
-
-            dashboard_response = await self._run_selected_pipeline(dataset, content)
-
-            if self.settings.bi_pipeline_mode == "single":
-                self._save_dashboard(dataset.id, dashboard_response)
-                self._try_index_rag(
-                    dataset=dataset,
-                    content=content,
+            create_session = getattr(self.storage, "create_session", None)
+            if callable(create_session):
+                session = create_session(
+                    session_id=session_id,
+                    user_id=user_id,
+                    description=description,
+                )
+                session_created = True
+            else:
+                session = AnalysisSessionRecord(
+                    id=session_id,
+                    user_id=user_id,
+                    description=description,
+                    status="processing",
+                    rag_status="pending",
+                    error_message=None,
                 )
 
-            self.storage.update_dataset_status(
-                dataset.id,
-                status=(
-                    "failed" if dashboard_response.status == "failed" else "ready"
-                ),
-                error_message=(
-                    "Business intelligence pipeline failed."
-                    if dashboard_response.status == "failed"
-                    else None
-                ),
+            for index, item in enumerate(inspected):
+                dataset_id = (
+                    session_id
+                    if not session_created and index == 0
+                    else str(uuid4())
+                )
+                storage_path = (
+                    f"{user_id}/{session_id}/{item['file_name']}"
+                    if not session_created and len(inspected) == 1
+                    else f"{user_id}/{session_id}/{dataset_id}/{item['file_name']}"
+                )
+                create_values = {
+                    "dataset_id": dataset_id,
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "file_name": item["file_name"],
+                    "storage_path": storage_path,
+                    "mime_type": item["mime_type"],
+                    "file_size": len(item["content"]),
+                    "file_hash": item["file_hash"],
+                    "description": description,
+                    "row_count": int(item["dataset_info"]["rowCount"]),
+                    "column_count": int(item["dataset_info"]["columnCount"]),
+                }
+                try:
+                    dataset = self.storage.create_dataset(**create_values)
+                except TypeError:
+                    create_values.pop("session_id")
+                    dataset = self.storage.create_dataset(**create_values)
+                    dataset = DatasetRecord(
+                        **{
+                            **dataset.__dict__,
+                            "session_id": session_id,
+                        }
+                    )
+                datasets.append(dataset)
+
+                self.storage.upload_file(
+                    storage_path=storage_path,
+                    content=item["content"],
+                    mime_type=item["mime_type"],
+                )
+                uploaded_paths.append(storage_path)
+
+            await self._run_workspace_pipeline(
+                session=session,
+                datasets=datasets,
+                contents=[item["content"] for item in inspected],
+                background_tasks=background_tasks,
             )
+            if legacy_contract:
+                self._legacy_contract_sessions.add(session_id)
 
         except Exception as error:
-            if not dataset_inserted and self._is_duplicate_dataset_error(error):
+            if not datasets and self._is_duplicate_dataset_error(error):
                 raise DatasetAlreadyExistsError(
-                    "You already have an active dataset. Use Start Over before uploading another file."
+                    "You already have an active workspace. Use Start Over before uploading another batch."
                 ) from error
 
-            safe_error = self._safe_error(error)
             logger.exception(
-                "Dataset processing failed session_id=%s operation=upload storage_path=%s",
+                "Workspace processing failed session_id=%s operation=upload",
                 session_id,
-                storage_path,
             )
-            if dataset_inserted:
-                if file_uploaded:
-                    self.storage.update_dataset_status(
-                        session_id,
-                        status="failed",
-                        error_message=safe_error,
+            for storage_path in reversed(uploaded_paths):
+                try:
+                    self.storage.delete_file(storage_path)
+                except Exception:
+                    logger.exception(
+                        "Unable to roll back uploaded object path=%s",
+                        storage_path,
                     )
-                else:
-                    self.storage.delete_dataset(session_id, user_id)
+            if session_created and hasattr(self.storage, "delete_session"):
+                self.storage.delete_session(session_id, user_id)
+            else:
+                for dataset in datasets:
+                    self.storage.delete_dataset(dataset.id, user_id)
+            raise
+
+        result = {
+            "status": "success",
+            "sessionId": session_id,
+            "datasetIds": [dataset.id for dataset in datasets],
+            "message": "Files uploaded and analysis workspace created successfully.",
+        }
+        if len(datasets) == 1:
+            result["fileName"] = datasets[0].file_name
+        return result
+
+    async def add_datasets(
+        self,
+        files: list[UploadFile] | UploadFile,
+        user_id: str,
+        background_tasks: BackgroundTasks | None = None,
+    ) -> dict[str, Any]:
+        session, existing_datasets = self._active_workspace(user_id)
+        if session.requires_reset:
+            raise InvalidUploadError(
+                "This legacy workspace must be reset before datasets can be added."
+            )
+        if session.status == "processing" or session.rag_status == "indexing":
+            raise InvalidUploadError(
+                "Workspace analysis or retrieval indexing is already in progress. "
+                "Try again when it has finished."
+            )
+
+        uploaded_files = (
+            [files]
+            if hasattr(files, "read") and not isinstance(files, (list, tuple))
+            else list(files)
+        )
+        available_spaces = MAX_UPLOAD_FILES - len(existing_datasets)
+        if available_spaces <= 0:
+            raise InvalidUploadError(
+                f"A workspace can contain up to {MAX_UPLOAD_FILES} datasets."
+            )
+        if not 1 <= len(uploaded_files) <= available_spaces:
+            raise InvalidUploadError(
+                f"Upload between 1 and {available_spaces} more "
+                f"{'file' if available_spaces == 1 else 'files'}."
+            )
+
+        inspected: list[dict[str, Any]] = []
+        names = {dataset.file_name.casefold() for dataset in existing_datasets}
+        hashes = {dataset.file_hash for dataset in existing_datasets}
+        for file in uploaded_files:
+            original_name = Path(file.filename or "").name
+            file_name = self._sanitize_file_name(original_name)
+            mime_type = (file.content_type or "").strip()
+            extension = Path(file_name).suffix.lower()
+            self._validate_upload_metadata(file_name, mime_type, extension)
+
+            normalized_name = file_name.casefold()
+            if normalized_name in names:
+                raise InvalidUploadError(
+                    f"A dataset named '{file_name}' already exists in this workspace."
+                )
+
+            content = await file.read()
+            if not content:
+                raise InvalidUploadError(f"'{file_name}' is empty.")
+            if len(content) > MAX_UPLOAD_BYTES:
+                raise InvalidUploadError(
+                    f"'{file_name}' is larger than the 25 MiB limit."
+                )
+
+            file_hash = hashlib.sha256(content).hexdigest()
+            if file_hash in hashes:
+                raise InvalidUploadError(
+                    f"'{file_name}' duplicates an existing workspace dataset."
+                )
+
+            inspected.append(
+                {
+                    "file_name": file_name,
+                    "mime_type": mime_type,
+                    "content": content,
+                    "file_hash": file_hash,
+                    "dataset_info": self._inspect_file(file_name, content),
+                }
+            )
+            names.add(normalized_name)
+            hashes.add(file_hash)
+
+        existing_contents = [
+            self.storage.download_file(dataset.storage_path)
+            for dataset in existing_datasets
+        ]
+        added_datasets: list[DatasetRecord] = []
+        uploaded_paths: list[str] = []
+        try:
+            for item in inspected:
+                dataset_id = str(uuid4())
+                storage_path = (
+                    f"{user_id}/{session.id}/{dataset_id}/{item['file_name']}"
+                )
+                dataset = self.storage.create_dataset(
+                    dataset_id=dataset_id,
+                    session_id=session.id,
+                    user_id=user_id,
+                    file_name=item["file_name"],
+                    storage_path=storage_path,
+                    mime_type=item["mime_type"],
+                    file_size=len(item["content"]),
+                    file_hash=item["file_hash"],
+                    description=session.description,
+                    row_count=int(item["dataset_info"]["rowCount"]),
+                    column_count=int(item["dataset_info"]["columnCount"]),
+                )
+                added_datasets.append(dataset)
+                self.storage.upload_file(
+                    storage_path=storage_path,
+                    content=item["content"],
+                    mime_type=item["mime_type"],
+                )
+                uploaded_paths.append(storage_path)
+        except Exception as error:
+            for storage_path in reversed(uploaded_paths):
+                try:
+                    self.storage.delete_file(storage_path)
+                except Exception:
+                    logger.exception(
+                        "Unable to roll back uploaded object path=%s",
+                        storage_path,
+                    )
+            for dataset in added_datasets:
+                self.storage.delete_dataset(dataset.id, user_id)
+            if self._is_duplicate_dataset_error(error):
+                raise InvalidUploadError(
+                    "One of these datasets already exists in the workspace."
+                ) from error
+            raise
+
+        all_datasets = [*existing_datasets, *added_datasets]
+        all_contents = [
+            *existing_contents,
+            *(item["content"] for item in inspected),
+        ]
+        self._prepare_workspace_reanalysis(session, all_datasets)
+        try:
+            await self._run_workspace_pipeline(
+                session=session,
+                datasets=all_datasets,
+                contents=all_contents,
+                background_tasks=background_tasks,
+            )
+        except Exception as error:
+            self._mark_workspace_reanalysis_failed(session, all_datasets, error)
             raise
 
         return {
             "status": "success",
-            "sessionId": session_id,
-            "fileName": file_name,
-            "message": "File uploaded and analysis session created successfully.",
+            "sessionId": session.id,
+            "datasetIds": [dataset.id for dataset in added_datasets],
+            "message": "Datasets added and workspace analysis rebuilt successfully.",
         }
 
+    async def remove_dataset(
+        self,
+        dataset_id: str,
+        user_id: str,
+        background_tasks: BackgroundTasks | None = None,
+    ) -> None:
+        session, datasets = self._active_workspace(user_id)
+        if session.requires_reset:
+            raise InvalidUploadError(
+                "This legacy workspace must be reset before datasets can be removed."
+            )
+        if session.status == "processing" or session.rag_status == "indexing":
+            raise InvalidUploadError(
+                "Workspace analysis or retrieval indexing is already in progress. "
+                "Try again when it has finished."
+            )
+
+        target = next(
+            (dataset for dataset in datasets if dataset.id == dataset_id),
+            None,
+        )
+        if target is None:
+            raise SessionNotFoundError(
+                f"Dataset '{dataset_id}' was not found in the active workspace."
+            )
+        if len(datasets) == 1:
+            self.reset_active_dataset(user_id)
+            return
+
+        remaining_datasets = [
+            dataset for dataset in datasets if dataset.id != target.id
+        ]
+        remaining_contents = [
+            self.storage.download_file(dataset.storage_path)
+            for dataset in remaining_datasets
+        ]
+        self.storage.delete_dataset(target.id, user_id)
+        try:
+            self.storage.delete_file(target.storage_path)
+        except Exception:
+            logger.exception(
+                "Dataset metadata was removed but its stored object could not be "
+                "deleted path=%s",
+                target.storage_path,
+            )
+
+        self._prepare_workspace_reanalysis(session, remaining_datasets)
+        try:
+            await self._run_workspace_pipeline(
+                session=session,
+                datasets=remaining_datasets,
+                contents=remaining_contents,
+                background_tasks=background_tasks,
+            )
+        except Exception as error:
+            self._mark_workspace_reanalysis_failed(
+                session,
+                remaining_datasets,
+                error,
+            )
+            raise
+
+    def _prepare_workspace_reanalysis(
+        self,
+        session: AnalysisSessionRecord,
+        datasets: list[DatasetRecord],
+    ) -> None:
+        clear_analysis = getattr(self.storage, "clear_session_analysis", None)
+        if callable(clear_analysis):
+            clear_analysis(session.id)
+
+        update_session = getattr(self.storage, "update_session_status", None)
+        if callable(update_session):
+            update_session(
+                session.id,
+                status="processing",
+                rag_status="pending",
+                error_message=None,
+            )
+        update_dataset = getattr(self.storage, "update_dataset_status", None)
+        if callable(update_dataset):
+            for dataset in datasets:
+                update_dataset(
+                    dataset.id,
+                    status="processing",
+                    rag_status="pending",
+                    error_message=None,
+                )
+
+    def _mark_workspace_reanalysis_failed(
+        self,
+        session: AnalysisSessionRecord,
+        datasets: list[DatasetRecord],
+        error: Exception,
+    ) -> None:
+        message = self._safe_error(error)
+        update_session = getattr(self.storage, "update_session_status", None)
+        if callable(update_session):
+            update_session(
+                session.id,
+                status="failed",
+                rag_status="failed",
+                error_message=message,
+            )
+        update_dataset = getattr(self.storage, "update_dataset_status", None)
+        if callable(update_dataset):
+            for dataset in datasets:
+                update_dataset(
+                    dataset.id,
+                    status="failed",
+                    rag_status="failed",
+                    error_message=message,
+                )
+
     def get_active_dataset(self, user_id: str) -> DatasetRecord:
+        _, datasets = self._active_workspace(user_id)
+        return datasets[0]
+
+    def _active_workspace(
+        self,
+        user_id: str,
+    ) -> tuple[AnalysisSessionRecord, list[DatasetRecord]]:
         if not user_id:
             raise SessionNotFoundError("No active dataset was found.")
+        get_active_session = getattr(self.storage, "get_active_session", None)
+        if callable(get_active_session):
+            session = get_active_session(user_id)
+            if session is None:
+                raise SessionNotFoundError("No active dataset was found.")
+            datasets = self.storage.get_session_datasets(session.id, user_id)
+            if not datasets:
+                raise SessionNotFoundError("No active dataset was found.")
+            return session, datasets
+
         dataset = self.storage.get_active_dataset(user_id)
         if dataset is None:
             raise SessionNotFoundError("No active dataset was found.")
-        return dataset
+        session = AnalysisSessionRecord(
+            id=dataset.session_id or dataset.id,
+            user_id=dataset.user_id,
+            description=dataset.description,
+            status=dataset.status,
+            rag_status=dataset.rag_status,
+            error_message=dataset.error_message,
+        )
+        return session, [dataset]
 
     def get_active_dataset_details(self, user_id: str) -> dict[str, Any]:
-        dataset = self.get_active_dataset(user_id)
-        row_count = dataset.row_count
-        column_count = dataset.column_count
-        if row_count is None or column_count is None:
-            dataset_info = self._inspect_file(
-                dataset.file_name,
-                self.storage.download_file(dataset.storage_path),
+        session, datasets = self._active_workspace(user_id)
+        metadata: list[dict[str, Any]] = []
+        for dataset in datasets:
+            row_count = dataset.row_count
+            column_count = dataset.column_count
+            if row_count is None or column_count is None:
+                dataset_info = self._inspect_file(
+                    dataset.file_name,
+                    self.storage.download_file(dataset.storage_path),
+                )
+                row_count = int(dataset_info["rowCount"])
+                column_count = int(dataset_info["columnCount"])
+            metadata.append(
+                {
+                    "datasetId": dataset.id,
+                    "fileName": dataset.file_name,
+                    "fileSize": dataset.file_size,
+                    "uploadedAt": dataset.created_at or "",
+                    "rowCount": row_count,
+                    "columnCount": column_count,
+                }
             )
-            row_count = int(dataset_info["rowCount"])
-            column_count = int(dataset_info["columnCount"])
+
+        if session.id in self._legacy_contract_sessions and len(metadata) == 1:
+            item = metadata[0]
+            return {
+                "sessionId": session.id,
+                "fileName": item["fileName"],
+                "fileSize": item["fileSize"],
+                "uploadedAt": item["uploadedAt"],
+                "rowCount": item["rowCount"],
+                "columnCount": item["columnCount"],
+                "analysisStatus": session.status,
+                "ragStatus": session.rag_status,
+                "originalPrompt": session.description,
+            }
 
         return {
-            "sessionId": dataset.id,
-            "fileName": dataset.file_name,
-            "fileSize": dataset.file_size,
-            "uploadedAt": dataset.created_at or "",
-            "rowCount": row_count,
-            "columnCount": column_count,
-            "analysisStatus": dataset.status,
-            "originalPrompt": dataset.description,
+            "sessionId": session.id,
+            "analysisStatus": session.status,
+            "ragStatus": session.rag_status,
+            "originalPrompt": session.description,
+            "requiresReset": session.requires_reset,
+            "datasets": metadata,
         }
 
     def get_dataset_preview(
         self,
         user_id: str,
+        dataset_id: str | None,
         page: int,
         page_size: int,
     ) -> dict[str, Any]:
-        dataset = self.get_active_dataset(user_id)
+        session, datasets = self._active_workspace(user_id)
+        dataset = (
+            datasets[0]
+            if dataset_id is None
+            else next(
+                (candidate for candidate in datasets if candidate.id == dataset_id),
+                None,
+            )
+        )
+        if dataset is None:
+            raise SessionNotFoundError(
+                f"Dataset '{dataset_id}' was not found in the active workspace."
+            )
+        if session.requires_reset:
+            raise InvalidUploadError(
+                "This legacy workspace must be reset before previews are available."
+            )
         content = self.storage.download_file(dataset.storage_path)
         total_rows = (
             dataset.row_count
@@ -256,24 +673,571 @@ class BusinessIntelligenceService:
         }
 
     def reset_active_dataset(self, user_id: str) -> None:
-        dataset = self.get_active_dataset(user_id)
-        self.storage.delete_file(dataset.storage_path)
-        self.storage.delete_dataset(dataset.id, user_id)
+        session, datasets = self._active_workspace(user_id)
+        for dataset in datasets:
+            self.storage.delete_file(dataset.storage_path)
+        if hasattr(self.storage, "delete_session"):
+            self.storage.delete_session(session.id, user_id)
+        else:
+            for dataset in datasets:
+                self.storage.delete_dataset(dataset.id, user_id)
+        self._legacy_contract_sessions.discard(session.id)
 
-    async def get_dashboard(self, session_id: str, user_id: str) -> DashboardResponse:
-        dataset = self._load_dataset(session_id, user_id)
-        dashboard = self.storage.get_dashboard(dataset.id)
+    async def get_dashboard(
+        self,
+        session_id: str,
+        user_id: str,
+        background_tasks: BackgroundTasks | None = None,
+    ) -> DashboardResponse:
+        session, datasets = self._load_workspace(session_id, user_id)
+        if session.requires_reset:
+            raise SessionNotFoundError(
+                "This legacy workspace must be reset before its dashboard is available."
+            )
+        dashboard = self.storage.get_dashboard(session.id)
 
         if dashboard is not None:
             try:
-                return DashboardResponse.model_validate(dashboard.response)
+                return self._with_dashboard_model_metadata(
+                    DashboardResponse.model_validate(dashboard.response)
+                )
             except Exception:
                 logger.exception(
                     "Saved dashboard validation failed session_id=%s operation=get_dashboard",
-                    dataset.id,
+                    session.id,
                 )
 
-        return await self._run_selected_pipeline(dataset)
+        contents = [
+            self.storage.download_file(dataset.storage_path)
+            for dataset in datasets
+        ]
+        return await self._run_workspace_pipeline(
+            session,
+            datasets,
+            contents,
+            background_tasks=background_tasks,
+        )
+
+    def rebuild_dashboard_retrieval(
+        self,
+        session_id: str,
+        user_id: str,
+        background_tasks: BackgroundTasks,
+    ) -> None:
+        """Replace a session's retrieval index with evidence from its saved dashboard."""
+        session, datasets = self._load_workspace(session_id, user_id)
+        dashboard_record = self.storage.get_dashboard(session.id)
+        if dashboard_record is None:
+            raise ValueError("Generate the dashboard before rebuilding retrieval.")
+        response = DashboardResponse.model_validate(dashboard_record.response)
+        documents = [
+            document.model_dump(mode="json")
+            for document in dashboard_retrieval_documents(
+                response.model_dump(mode="json")
+            )
+        ]
+        if not documents:
+            raise ValueError("The saved dashboard contains no retrieval evidence.")
+        documents = self._workspace_retrieval_documents(
+            session,
+            datasets,
+            documents,
+        )
+
+        workflow = {
+            "session_id": session.id,
+            "dataset_ids": [dataset.id for dataset in datasets],
+            "workflow_status": response.status,
+            "retrieval_indexing_result": {
+                "status": "indexing",
+                "document_count": len(documents),
+                "indexed_count": 0,
+                "failed_count": 0,
+                "message": "Dashboard retrieval indexing is running in the background.",
+            },
+        }
+        self._save_workflow_dashboard(session.id, response, workflow)
+        update_session = getattr(self.storage, "update_session_status", None)
+        if callable(update_session):
+            update_session(session.id, status="ready", rag_status="indexing", error_message=None)
+        else:
+            for dataset in datasets:
+                self.storage.update_dataset_status(dataset.id, status="ready", rag_status="indexing", error_message=None)
+        background_tasks.add_task(
+            self._complete_workspace_indexing,
+            session=session,
+            datasets=datasets,
+            retrieval_documents=documents,
+            response=response,
+            workflow=workflow,
+        )
+
+    async def _run_workspace_pipeline(
+        self,
+        session: AnalysisSessionRecord,
+        datasets: list[DatasetRecord],
+        contents: list[bytes],
+        background_tasks: BackgroundTasks | None = None,
+    ) -> DashboardResponse:
+        if len(datasets) != len(contents) or not datasets:
+            raise ValueError("Every workspace dataset requires source content.")
+
+        workspace_dataset, workspace_content = self._workspace_analysis_input(
+            session,
+            datasets,
+            contents,
+        )
+        if self.settings.bi_pipeline_mode == "multi":
+            try:
+                execution = await self._run_multi_agent_pipeline(
+                    workspace_dataset,
+                    workspace_content,
+                    workspace_session_id=session.id,
+                    workspace_datasets=datasets,
+                )
+            except TypeError as error:
+                # Keep pre-workspace extensions and test doubles compatible.
+                if "unexpected keyword argument" not in str(error):
+                    raise
+                try:
+                    execution = await self._run_multi_agent_pipeline(
+                        workspace_dataset,
+                        workspace_content,
+                        workspace_session_id=session.id,
+                    )
+                except TypeError as fallback_error:
+                    if "unexpected keyword argument" not in str(fallback_error):
+                        raise
+                    execution = await self._run_multi_agent_pipeline(
+                        workspace_dataset,
+                        workspace_content,
+                    )
+        else:
+            execution = await self._run_single_agent_pipeline(
+                workspace_dataset,
+                workspace_content,
+            )
+        if isinstance(execution, DashboardResponse):
+            execution = PipelineExecution(response=execution)
+
+        combined = self._combine_workspace_executions(
+            session,
+            datasets,
+            [execution],
+            contents,
+        )
+        return self._persist_workspace_execution(
+            session=session,
+            datasets=datasets,
+            contents=contents,
+            execution=combined,
+            background_tasks=background_tasks,
+        )
+
+    def _workspace_analysis_input(
+        self,
+        session: AnalysisSessionRecord,
+        datasets: list[DatasetRecord],
+        contents: list[bytes],
+    ) -> tuple[DatasetRecord, bytes]:
+        """Create one canonical source file for workspace-level analysis.
+
+        Individual files remain persisted and previewable.  The analysis agents,
+        however, receive every row in one source so KPI and trend calculations
+        run once across the workspace rather than once per dataset.
+        """
+        if len(datasets) == 1:
+            return datasets[0], contents[0]
+
+        frames: list[pd.DataFrame] = []
+        source_column = "__workspace_source_dataset__"
+        for dataset, content in zip(datasets, contents, strict=True):
+            frame = self._read_workspace_dataframe(dataset.file_name, content)
+            frames.append(frame)
+
+        existing_columns = {
+            str(column)
+            for frame in frames
+            for column in frame.columns
+        }
+        while source_column in existing_columns:
+            source_column = f"_{source_column}_"
+
+        for dataset, frame in zip(datasets, frames, strict=True):
+            frame[source_column] = dataset.file_name
+
+        combined = pd.concat(frames, ignore_index=True, sort=False)
+        content = combined.to_csv(index=False).encode("utf-8")
+        description = (
+            f"Workspace analysis across {len(datasets)} datasets: "
+            + ", ".join(dataset.file_name for dataset in datasets)
+        )
+        return (
+            replace(
+                datasets[0],
+                id=session.id,
+                file_name="all_uploaded_datasets.csv",
+                file_size=len(content),
+                file_hash=hashlib.sha256(content).hexdigest(),
+                description=description,
+            ),
+            content,
+        )
+
+    @staticmethod
+    def _read_workspace_dataframe(file_name: str, content: bytes) -> pd.DataFrame:
+        suffix = Path(file_name).suffix.lower()
+        try:
+            if suffix == ".csv":
+                frame = pd.read_csv(io.BytesIO(content), low_memory=False)
+            elif suffix == ".xlsx":
+                frame = pd.read_excel(io.BytesIO(content))
+            else:
+                raise InvalidUploadError("Only CSV and XLSX files are supported.")
+        except UnicodeDecodeError as error:
+            raise InvalidUploadError("The CSV file must use UTF-8 encoding.") from error
+        except InvalidUploadError:
+            raise
+        except Exception as error:
+            raise InvalidUploadError("The uploaded dataset could not be parsed.") from error
+
+        # Align equivalent headers (for example `Revenue` and `revenue`) before
+        # concatenation.  The generic cleaner applies the same convention later.
+        counts: dict[str, int] = {}
+        columns: list[str] = []
+        for index, column in enumerate(frame.columns, start=1):
+            base = re.sub(r"[^a-z0-9]+", "_", str(column).strip().lower()).strip("_")
+            base = base or f"unnamed_{index}"
+            occurrence = counts.get(base, 0)
+            columns.append(base if occurrence == 0 else f"{base}_{occurrence + 1}")
+            counts[base] = occurrence + 1
+        frame.columns = columns
+        return frame
+
+    def _combine_workspace_executions(
+        self,
+        session: AnalysisSessionRecord,
+        datasets: list[DatasetRecord],
+        executions: list[PipelineExecution],
+        contents: list[bytes] | None = None,
+    ) -> PipelineExecution:
+        if (
+            len(executions) == 1
+            and executions[0].response.status != "failed"
+            and executions[0].response.dashboard is not None
+        ):
+            return self._with_workspace_dataset_summaries(
+                session,
+                datasets,
+                contents or [],
+                executions[0],
+            )
+        if any(execution.response.status == "failed" for execution in executions):
+            return PipelineExecution(
+                response=self._with_dashboard_model_metadata(
+                    DashboardResponse(
+                        status="failed",
+                        sessionId=session.id,
+                        dashboard=None,
+                        warnings=[
+                            warning
+                            for execution in executions
+                            for warning in execution.response.warnings
+                        ],
+                        errors=[
+                            *[
+                                error
+                                for execution in executions
+                                for error in execution.response.errors
+                            ],
+                            ApiMessage(
+                                code="DATASET_PREPARATION_FAILED",
+                                message=(
+                                    "At least one dataset could not be prepared, so "
+                                    "the workspace analysis was stopped."
+                                ),
+                                component="data_preparation",
+                                recoverable=True,
+                            ),
+                        ],
+                    )
+                ),
+                workflow={
+                    "session_id": session.id,
+                    "dataset_workflows": [
+                        execution.workflow or {}
+                        for execution in executions
+                    ],
+                    "workflow_status": "failed",
+                },
+                retrieval_documents=[],
+            )
+
+        dashboards = [
+            execution.response.dashboard
+            for execution in executions
+            if execution.response.dashboard is not None
+        ]
+        if not dashboards:
+            raise ValueError("Workspace processing returned no dashboard data.")
+
+        base = dashboards[0].model_dump(mode="json")
+        summaries: list[dict[str, Any]] = []
+        for dataset, dashboard in zip(datasets, dashboards, strict=True):
+            summary = dashboard.datasetSummary.model_dump(mode="json")
+            summary["datasetId"] = dataset.id
+            summary["fileName"] = dataset.file_name
+            summaries.append(summary)
+
+        def namespace(
+            dataset: DatasetRecord,
+            item: dict[str, Any],
+        ) -> dict[str, Any]:
+            payload = dict(item)
+            payload["id"] = f"{dataset.id}:{payload.get('id', 'item')}"
+            if isinstance(payload.get("sourceIds"), list):
+                payload["sourceIds"] = [
+                    f"{dataset.id}:{source_id}"
+                    for source_id in payload["sourceIds"]
+                ]
+            return payload
+
+        kpis: list[dict[str, Any]] = []
+        charts: list[dict[str, Any]] = []
+        chart_types: set[str] = set()
+        findings: list[str] = []
+        business_summaries: list[str] = []
+        executive_summaries: list[str] = []
+        insights = {
+            "criticalAnomalies": [],
+            "warnings": [],
+            "limitations": [],
+            "opportunities": [],
+        }
+        actions: list[dict[str, Any]] = []
+
+        for dataset, dashboard in zip(datasets, dashboards, strict=True):
+            executive_summaries.append(
+                f"{dataset.file_name}: {dashboard.executiveSummary}"
+            )
+            business_summaries.append(
+                f"{dataset.file_name}: {dashboard.analysis.businessSummary}"
+            )
+            findings.extend(
+                f"{dataset.file_name}: {finding}"
+                for finding in dashboard.analysis.keyFindings
+            )
+            kpis.extend(
+                namespace(dataset, kpi.model_dump(mode="json"))
+                for kpi in dashboard.kpis
+            )
+            for chart in dashboard.supportingCharts:
+                if chart.type in chart_types or len(charts) >= 4:
+                    continue
+                chart_types.add(chart.type)
+                charts.append(namespace(dataset, chart.model_dump(mode="json")))
+            dashboard_insights = dashboard.insights.model_dump(mode="json")
+            for category in insights:
+                insights[category].extend(
+                    namespace(dataset, item)
+                    for item in dashboard_insights.get(category, [])
+                )
+            actions.extend(
+                namespace(dataset, action.model_dump(mode="json"))
+                for action in dashboard.recommendedActions
+            )
+
+        base.update(
+            {
+                "title": (
+                    dashboards[0].title
+                    if len(datasets) == 1
+                    else "Multi-Dataset Business Intelligence Dashboard"
+                ),
+                "executiveSummary": "\n\n".join(executive_summaries),
+                "kpis": kpis[:8],
+                "supportingCharts": charts,
+                "analysis": {
+                    "businessSummary": "\n\n".join(business_summaries),
+                    "keyFindings": findings,
+                },
+                "insights": insights,
+                "recommendedActions": actions[:5],
+                "datasetSummaries": summaries,
+            }
+        )
+
+        status = (
+            "partial"
+            if any(execution.response.status == "partial" for execution in executions)
+            else "success"
+        )
+        response = DashboardResponse.model_validate(
+            {
+                "status": status,
+                "sessionId": session.id,
+                "dashboard": base,
+                "warnings": [
+                    warning.model_dump(mode="json")
+                    for execution in executions
+                    for warning in execution.response.warnings
+                ],
+                "errors": [
+                    error.model_dump(mode="json")
+                    for execution in executions
+                    for error in execution.response.errors
+                ],
+                "pipelineMode": self.settings.bi_pipeline_mode,
+                "agentModels": self._combined_agent_models(executions),
+            }
+        )
+
+        retrieval_documents: list[dict[str, Any]] = []
+        for dataset, execution in zip(datasets, executions, strict=True):
+            for index, document in enumerate(execution.retrieval_documents or []):
+                payload = dict(document)
+                source_id = str(payload.get("id") or f"document_{index}")
+                payload["id"] = f"{dataset.id}:{source_id}"
+                metadata = dict(payload.get("metadata") or {})
+                metadata.update(
+                    {
+                        "session_id": session.id,
+                        "dataset_id": dataset.id,
+                        "file_name": dataset.file_name,
+                    }
+                )
+                payload["metadata"] = metadata
+                retrieval_documents.append(payload)
+
+        return PipelineExecution(
+            response=response,
+            workflow={
+                "session_id": session.id,
+                "dataset_ids": [dataset.id for dataset in datasets],
+                "dataset_workflows": [
+                    execution.workflow or {}
+                    for execution in executions
+                ],
+                "workflow_status": status,
+            },
+            retrieval_documents=retrieval_documents,
+        )
+
+    def _with_workspace_dataset_summaries(
+        self,
+        session: AnalysisSessionRecord,
+        datasets: list[DatasetRecord],
+        contents: list[bytes],
+        execution: PipelineExecution,
+    ) -> PipelineExecution:
+        """Keep source-file metadata while preserving the one merged analysis."""
+        payload = execution.response.model_dump(mode="json")
+        dashboard = dict(payload["dashboard"] or {})
+        summaries: list[dict[str, Any]] = []
+        for index, dataset in enumerate(datasets):
+            info = (
+                self._inspect_file(dataset.file_name, contents[index])
+                if index < len(contents)
+                else {
+                    "rowCount": dataset.row_count or 0,
+                    "columnCount": dataset.column_count or 0,
+                    "measures": [],
+                    "dimensions": [],
+                    "completenessPercent": 100.0,
+                    "missingValueCount": 0,
+                    "duplicateRowCount": 0,
+                }
+            )
+            summaries.append(
+                {
+                    "datasetId": dataset.id,
+                    "fileName": dataset.file_name,
+                    "rowCount": int(info["rowCount"]),
+                    "columnCount": int(info["columnCount"]),
+                    "timeField": None,
+                    "period": None,
+                    "measures": list(info["measures"]),
+                    "dimensions": list(info["dimensions"]),
+                    "quality": {
+                        "completenessPercent": float(info["completenessPercent"]),
+                        "missingValueCount": int(info["missingValueCount"]),
+                        "duplicateRowCount": int(info["duplicateRowCount"]),
+                    },
+                    "generatedAt": self._current_timestamp(),
+                }
+            )
+        dashboard["datasetSummaries"] = summaries
+        if len(datasets) > 1:
+            dashboard["title"] = "Multi-Dataset Business Intelligence Dashboard"
+        payload["sessionId"] = session.id
+        payload["dashboard"] = dashboard
+
+        retrieval_documents = self._workspace_retrieval_documents(
+            session,
+            datasets,
+            execution.retrieval_documents or [],
+        )
+
+        workflow = dict(execution.workflow or {})
+        workflow.update(
+            {
+                "session_id": session.id,
+                "dataset_ids": [dataset.id for dataset in datasets],
+                "source_datasets": [
+                    {"dataset_id": dataset.id, "file_name": dataset.file_name}
+                    for dataset in datasets
+                ],
+            }
+        )
+        return PipelineExecution(
+            response=DashboardResponse.model_validate(payload),
+            workflow=workflow,
+            retrieval_documents=retrieval_documents,
+        )
+
+    @staticmethod
+    def _workspace_retrieval_documents(
+        session: AnalysisSessionRecord,
+        datasets: list[DatasetRecord],
+        retrieval_documents: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Attach the session-wide evidence to a valid dataset foreign key."""
+        primary_dataset_id = datasets[0].id
+        output: list[dict[str, Any]] = []
+        for document in retrieval_documents:
+            item = dict(document)
+            metadata = dict(item.get("metadata") or {})
+            metadata.update(
+                {
+                    "session_id": session.id,
+                    # `document_chunks.dataset_id` is a foreign key.  The
+                    # aggregate evidence represents the whole workspace, but
+                    # must still point to one persisted source dataset.
+                    "dataset_id": primary_dataset_id,
+                    "file_name": "all_uploaded_datasets.csv",
+                    "dataset_ids": [dataset.id for dataset in datasets],
+                    "file_names": [dataset.file_name for dataset in datasets],
+                }
+            )
+            item["metadata"] = metadata
+            output.append(item)
+        return output
+
+    @staticmethod
+    def _combined_agent_models(
+        executions: list[PipelineExecution],
+    ) -> list[dict[str, str]]:
+        unique: dict[tuple[str, str, str], dict[str, str]] = {}
+        for execution in executions:
+            for usage in execution.response.agentModels:
+                payload = usage.model_dump(mode="json")
+                key = (
+                    str(payload.get("agent") or ""),
+                    str(payload.get("model") or ""),
+                    str(payload.get("provider") or ""),
+                )
+                unique[key] = payload
+        return list(unique.values())
 
     async def _run_selected_pipeline(
         self,
@@ -285,31 +1249,52 @@ class BusinessIntelligenceService:
             self.settings.bi_pipeline_mode,
             session.id,
         )
+        source_content = (
+            content
+            if content is not None
+            else self.storage.download_file(session.storage_path)
+        )
         if self.settings.bi_pipeline_mode == "multi":
-            return await self._run_multi_agent_pipeline(session, content)
-        return await self._run_single_agent_pipeline(session, content)
+            execution = await self._run_multi_agent_pipeline(session, source_content)
+        else:
+            execution = await self._run_single_agent_pipeline(session, source_content)
+
+        # Keep test doubles and extensions returning the pre-refactor type working.
+        if isinstance(execution, DashboardResponse):
+            execution = PipelineExecution(response=execution)
+        return self._persist_pipeline_execution(
+            session=session,
+            content=source_content,
+            execution=execution,
+        )
 
     async def _run_single_agent_pipeline(
         self,
         session: DatasetRecord,
         content: bytes | None = None,
-    ) -> DashboardResponse:
-        return self._generate_dashboard_from_bytes(
-            dataset=session,
-            content=(
-                content
-                if content is not None
-                else self.storage.download_file(session.storage_path)
-            ),
+    ) -> PipelineExecution:
+        return PipelineExecution(
+            response=self._with_dashboard_model_metadata(
+                self._generate_dashboard_from_bytes(
+                    dataset=session,
+                    content=(
+                        content
+                        if content is not None
+                        else self.storage.download_file(session.storage_path)
+                    ),
+                )
+            )
         )
 
     async def _run_multi_agent_pipeline(
         self,
         session: DatasetRecord,
         content: bytes | None = None,
-    ) -> DashboardResponse:
-        """Run the compiled workflow and return only its canonical dashboard."""
-        session_id = session.id
+        workspace_session_id: str | None = None,
+        workspace_datasets: list[DatasetRecord] | None = None,
+    ) -> PipelineExecution:
+        """Run the compiled workflow and return its dashboard and durable artifacts."""
+        session_id = workspace_session_id or session.session_id or session.id
         content = (
             content
             if content is not None
@@ -323,7 +1308,17 @@ class BusinessIntelligenceService:
             initial_state = {
                 "session_id": session_id,
                 "dataset_id": session.id,
+                "file_name": session.file_name,
                 "business_description": session.description,
+                "source_datasets": [
+                    {
+                        "dataset_id": dataset.id,
+                        "file_name": dataset.file_name,
+                        "row_count": dataset.row_count,
+                        "column_count": dataset.column_count,
+                    }
+                    for dataset in (workspace_datasets or [session])
+                ],
                 "uploaded_file_path": agent_input.filePath,
                 "working_directory": str(workspace),
                 "warnings": [],
@@ -336,23 +1331,44 @@ class BusinessIntelligenceService:
 
             try:
                 result = await business_intelligence_graph.ainvoke(initial_state)
-                persistence_result = result.get("persistence_result")
-                if (
-                    result.get("workflow_status") == "failed"
-                    or not isinstance(persistence_result, dict)
-                    or persistence_result.get("status") != "success"
-                ):
-                    raise RuntimeError(
-                        "The multi-agent workflow did not persist successfully."
-                    )
-
                 dashboard_output = result.get("dashboard_output")
                 if not isinstance(dashboard_output, dict):
                     raise ValueError("The workflow did not return a dashboard output.")
 
                 dashboard_output = dict(dashboard_output)
                 dashboard_output["sessionId"] = session_id
-                response = DashboardResponse.model_validate(dashboard_output)
+                workflow_status = str(result.get("workflow_status") or "failed")
+                if workflow_status == "failed":
+                    raise RuntimeError("The multi-agent workflow failed.")
+                dashboard_output["status"] = workflow_status
+                response = self._with_dashboard_model_metadata(
+                    DashboardResponse.model_validate(dashboard_output),
+                    selected_agents=(
+                        result.get("orchestration_plan") or {}
+                    ).get("selected_agents", []),
+                )
+                workflow = {
+                    key: result.get(key)
+                    for key in (
+                        "session_id",
+                        "dataset_id",
+                        "file_name",
+                        "prepared_dataset",
+                        "orchestration_plan",
+                        "generic_cleaning_report",
+                        "kpi_trend_output",
+                        "anomaly_output",
+                        "forecasting_output",
+                        "synthesis_output",
+                        "retrieval_documents",
+                        "warnings",
+                        "errors",
+                        "completed_agents",
+                        "failed_agents",
+                        "skipped_agents",
+                        "workflow_status",
+                    )
+                }
             except Exception:
                 logger.exception(
                     "Unexpected multi-agent pipeline failure session_id=%s",
@@ -380,7 +1396,20 @@ class BusinessIntelligenceService:
                     session_id,
                     failed_response.status,
                 )
-                return failed_response
+                return PipelineExecution(
+                    response=self._with_dashboard_model_metadata(failed_response),
+                    workflow={
+                        "session_id": session_id,
+                        "dataset_id": session.id,
+                        "workflow_status": "failed",
+                        "warnings": [],
+                        "errors": ["The multi-agent workflow failed."],
+                        "completed_agents": [],
+                        "failed_agents": ["business_intelligence"],
+                        "skipped_agents": [],
+                    },
+                    retrieval_documents=[],
+                )
 
         logger.info("Multi-agent pipeline completed session_id=%s", session_id)
         logger.info(
@@ -388,17 +1417,67 @@ class BusinessIntelligenceService:
             session_id,
             response.status,
         )
-        return response
+        return PipelineExecution(
+            response=response,
+            workflow=workflow,
+            retrieval_documents=list(result.get("retrieval_documents") or []),
+        )
+
+    def _with_dashboard_model_metadata(
+        self,
+        response: DashboardResponse,
+        selected_agents: list[str] | tuple[str, ...] = (),
+    ) -> DashboardResponse:
+        """Add model provenance to old and newly generated dashboard records."""
+        payload = response.model_dump(mode="json")
+        if not response.agentModels and self.settings.bi_pipeline_mode == "single":
+            usage = single_dashboard_model_usage()
+            payload.update(
+                {
+                    "pipelineMode": "single",
+                    "model": usage[0]["model"],
+                    "agentModels": usage,
+                }
+            )
+        elif not response.agentModels:
+            payload.update(
+                {
+                    "pipelineMode": "multi",
+                    "agentModels": multi_dashboard_model_usage(selected_agents),
+                }
+            )
+        if response.chatAgent is None:
+            payload["chatAgent"] = chat_model_usage(self.settings.bi_pipeline_mode)
+        return DashboardResponse.model_validate(payload)
 
     def chat(self, session_id: str, query: str, user_id: str) -> ChatResponse:
-        if self.settings.bi_pipeline_mode == "multi":
+        session, datasets = self._load_workspace(session_id, user_id)
+        if session.requires_reset:
+            raise SessionNotFoundError(
+                "This legacy workspace must be reset before chat is available."
+            )
+        if session.rag_status == "indexing":
+            raise ValueError(
+                "The analysis is ready, but its retrieval index is still being "
+                "prepared. Try chat again shortly."
+            )
+        if session.rag_status != "ready":
+            raise ValueError(
+                "The retrieval index is unavailable. Rebuild the workspace before "
+                "using chat."
+            )
+        if (
+            self.settings.bi_pipeline_mode == "multi"
+            or len(datasets) > 1
+            or datasets[0].session_id is not None
+        ):
             return self._chat_with_multi_agent_pipeline(
                 session_id=session_id,
                 query=query,
                 user_id=user_id,
             )
 
-        dataset = self._load_dataset(session_id, user_id)
+        dataset = datasets[0]
         cleaned_query = query.strip()
         if not cleaned_query:
             raise ValueError("The chat query cannot be empty.")
@@ -424,78 +1503,181 @@ class BusinessIntelligenceService:
         query: str,
         user_id: str,
     ) -> ChatResponse:
-        result = self._multi_chat_graph.invoke(
-            {
-                "session_id": session_id,
-                "query": query,
-                "user_id": user_id,
-            }
+        session, datasets = self._load_workspace(session_id, user_id)
+        history = self._chat_history(session.id)
+        selected, _ = self._select_chat_datasets(query, datasets)
+        scoped_datasets = [selected] if selected is not None else datasets
+        calculated_response = self._workspace_calculation_response(
+            query,
+            scoped_datasets,
         )
-        dataset = result.get("dataset")
-        guarded_draft = result.get("guarded_draft")
-        cleaned_query = str(result.get("query") or "").strip()
-        if not isinstance(dataset, DatasetRecord):
-            raise RuntimeError("Chat session validation did not return a dataset.")
-        if not isinstance(guarded_draft, GroundedChatDraft):
-            raise RuntimeError("The multi-agent chat pipeline returned no response.")
 
+        retrieval_query = (
+            f"In dataset `{selected.file_name}`, {query}"
+            if selected is not None
+            else query
+        )
         self.storage.save_message(
-            dataset_id=dataset.id,
+            dataset_id=session.id,
             role="user",
-            content=cleaned_query,
+            content=query.strip(),
             sources=[],
         )
-        return self._save_chat_response(
-            dataset.id,
-            guarded_draft.answer,
-            guarded_draft.source_ids,
-        )
-
-    def _retrieve_multi_chat_documents(
-        self,
-        session_id: str,
-        query: str,
-    ) -> list[RetrievedDocument]:
-        logger.info("Chat retrieval started session_id=%s", session_id)
-        documents = self._rag_service.retrieve_for_session(
-            session_id=session_id,
-            query=query,
-            limit=DEFAULT_RETRIEVAL_LIMIT,
-        )
-        logger.info(
-            "Chat documents retrieved session_id=%s count=%s",
-            session_id,
-            len(documents),
-        )
-        return documents
-
-    def _generate_multi_chat_draft(
-        self,
-        session_id: str,
-        query: str,
-        documents: list[RetrievedDocument],
-    ) -> GroundedChatDraft:
-        return asyncio.run(
-            self._multi_chat_agent.run(
-                session_id=session_id,
-                query=query,
-                retrieved_documents=documents,
+        if calculated_response is not None:
+            return self._save_chat_response(
+                session.id,
+                calculated_response,
+                [dataset.id for dataset in scoped_datasets],
             )
+
+        result = self._chat_service.answer(
+            session.id,
+            retrieval_query,
+            history=history,
+        )
+        return self._save_chat_response(
+            session.id,
+            result.draft.answer,
+            result.draft.source_ids,
         )
 
-    def _ground_multi_chat_draft(
+    def _select_chat_datasets(
         self,
         query: str,
-        documents: list[RetrievedDocument],
-        draft: GroundedChatDraft,
-    ) -> GroundedChatDraft:
-        guarded = self._output_guardrail.validate(
-            query=query,
-            retrieved_documents=documents,
-            draft=draft,
-        )
-        logger.info("Chat response guarded")
-        return guarded
+        datasets: list[DatasetRecord],
+    ) -> tuple[DatasetRecord | None, list[DatasetRecord]]:
+        if len(datasets) <= 1:
+            return None, []
+        normalized_query = query.casefold()
+        explicitly_named = [
+            dataset
+            for dataset in datasets
+            if dataset.file_name.casefold() in normalized_query
+            or Path(dataset.file_name).stem.casefold() in normalized_query
+        ]
+        if len(explicitly_named) == 1:
+            return explicitly_named[0], []
+        return None, []
+
+    def _workspace_calculation_response(
+        self,
+        query: str,
+        datasets: list[DatasetRecord],
+    ) -> str | None:
+        """Calculate broad numeric questions over the complete dataset scope."""
+        if not datasets:
+            return None
+
+        try:
+            frames: list[pd.DataFrame] = []
+            canonical_columns: dict[str, str] = {}
+            for dataset in datasets:
+                content = self.storage.download_file(dataset.storage_path)
+                suffix = Path(dataset.file_name).suffix.lower()
+                if suffix == ".csv":
+                    frame = pd.read_csv(io.BytesIO(content), low_memory=False)
+                elif suffix == ".xlsx":
+                    frame = pd.read_excel(io.BytesIO(content))
+                else:
+                    continue
+
+                rename: dict[Any, str] = {}
+                occupied = {str(column) for column in frame.columns}
+                for column in frame.columns:
+                    column_name = str(column)
+                    normalized = re.sub(
+                        r"[^a-z0-9]+",
+                        "_",
+                        column_name.casefold(),
+                    ).strip("_")
+                    canonical = canonical_columns.setdefault(
+                        normalized or column_name.casefold(),
+                        column_name,
+                    )
+                    if canonical == column_name or canonical in occupied:
+                        continue
+                    rename[column] = canonical
+                if rename:
+                    frame = frame.rename(columns=rename)
+                frame["__source_dataset__"] = dataset.file_name
+                frames.append(frame)
+
+            if not frames:
+                return None
+            combined = pd.concat(frames, ignore_index=True, sort=False)
+            if combined.empty:
+                return None
+
+            numeric_columns = [
+                str(column)
+                for column in combined.columns
+                if column != "__source_dataset__"
+                and pd.to_numeric(combined[column], errors="coerce").notna().any()
+            ]
+            dimensions = [
+                str(column)
+                for column in combined.columns
+                if str(column) not in numeric_columns
+            ]
+            date_field = next(
+                (
+                    str(column)
+                    for column in combined.columns
+                    if any(
+                        term in str(column).casefold()
+                        for term in ("date", "time", "year", "month", "period")
+                    )
+                ),
+                None,
+            )
+            profile = {
+                "summary": {
+                    "measures": numeric_columns,
+                    "dimensions": dimensions,
+                    "timeField": date_field,
+                }
+            }
+            query_type = rag_service.route_query(query, profile)
+            if query_type not in {
+                "calculation",
+                "comparison",
+                "forecast",
+                "mixed",
+            }:
+                return None
+
+            with tempfile.TemporaryDirectory(
+                prefix="bi_workspace_chat_",
+            ) as directory:
+                combined_path = Path(directory) / "all_uploaded_datasets.csv"
+                combined.to_csv(combined_path, index=False)
+                agent_input = BusinessIntelligenceAgentInput(
+                    sessionId=datasets[0].session_id or datasets[0].id,
+                    datasetId=datasets[0].session_id or datasets[0].id,
+                    filePath=str(combined_path),
+                    fileName="all uploaded datasets",
+                    description=datasets[0].description,
+                )
+                evidence = rag_service.calculate_evidence(
+                    agent_input=agent_input,
+                    query=query,
+                    query_type=query_type,
+                    profile=profile,
+                )
+            if evidence is None or not evidence.direct_answer:
+                return None
+
+            file_names = ", ".join(f"`{dataset.file_name}`" for dataset in datasets)
+            return (
+                f"{evidence.direct_answer.rstrip()} "
+                f"Dataset scope: {file_names}."
+            )
+        except Exception:
+            logger.exception(
+                "Workspace chat calculation failed datasets=%s",
+                [dataset.id for dataset in datasets],
+            )
+            return None
 
     def _chat_with_single_agent(
         self,
@@ -543,7 +1725,11 @@ class BusinessIntelligenceService:
             content=f"**Answer:** {answer}\n\n**Grounding:** {grounding}",
             sources=source_ids,
         )
-        return ChatResponse(answer=answer, grounding=grounding)
+        return ChatResponse(
+            answer=answer,
+            grounding=grounding,
+            agentMetadata=self._chat_model_metadata(),
+        )
 
     @staticmethod
     def _split_chat_response(
@@ -580,27 +1766,83 @@ class BusinessIntelligenceService:
         )
 
     def get_chat_history(self, session_id: str, user_id: str) -> dict[str, Any]:
-        dataset = self._load_dataset(session_id, user_id)
+        session, _ = self._load_workspace(session_id, user_id)
+        if session.requires_reset:
+            raise SessionNotFoundError(
+                "This legacy workspace must be reset before chat history is available."
+            )
         return {
-            "sessionId": dataset.id,
+            "sessionId": session.id,
             "messages": [
                 self._chat_message(message)
-                for message in self.storage.get_recent_messages(dataset.id, limit=50)
+                for message in self.storage.get_recent_messages(session.id, limit=50)
             ],
         }
 
-    def _load_dataset(self, session_id: str, user_id: str) -> DatasetRecord:
-        dataset_id = self._validate_session_id(session_id)
+    def _load_workspace(
+        self,
+        session_id: str,
+        user_id: str,
+    ) -> tuple[AnalysisSessionRecord, list[DatasetRecord]]:
+        normalized_id = self._validate_session_id(session_id)
         if not user_id:
             raise SessionNotFoundError(
                 f"Analysis session '{session_id}' was not found."
             )
-        dataset = self.storage.get_dataset(dataset_id, user_id)
+        get_session = getattr(self.storage, "get_session", None)
+        if callable(get_session):
+            session = get_session(normalized_id, user_id)
+            if session is None:
+                raise SessionNotFoundError(
+                    f"Analysis session '{session_id}' was not found."
+                )
+            datasets = self.storage.get_session_datasets(session.id, user_id)
+            if not datasets:
+                raise SessionNotFoundError(
+                    f"Analysis session '{session_id}' was not found."
+                )
+            return session, datasets
+
+        dataset = self.storage.get_dataset(normalized_id, user_id)
+        if dataset is None:
+            get_active_dataset = getattr(
+                self.storage,
+                "get_active_dataset",
+                None,
+            )
+            active_dataset = (
+                get_active_dataset(user_id)
+                if callable(get_active_dataset)
+                else None
+            )
+            dataset = next(
+                (
+                    candidate
+                    for candidate in [active_dataset]
+                    if candidate is not None
+                    and (candidate.session_id or candidate.id) == normalized_id
+                ),
+                None,
+            )
         if dataset is None:
             raise SessionNotFoundError(
                 f"Analysis session '{session_id}' was not found."
             )
-        return dataset
+        return (
+            AnalysisSessionRecord(
+                id=dataset.session_id or dataset.id,
+                user_id=dataset.user_id,
+                description=dataset.description,
+                status=dataset.status,
+                rag_status=dataset.rag_status,
+                error_message=dataset.error_message,
+            ),
+            [dataset],
+        )
+
+    def _load_dataset(self, session_id: str, user_id: str) -> DatasetRecord:
+        _, datasets = self._load_workspace(session_id, user_id)
+        return datasets[0]
 
     def _generate_dashboard_from_bytes(
         self,
@@ -638,39 +1880,472 @@ class BusinessIntelligenceService:
             response=dashboard_response.model_dump(mode="json"),
         )
 
+    def _persist_workspace_execution(
+        self,
+        session: AnalysisSessionRecord,
+        datasets: list[DatasetRecord],
+        contents: list[bytes],
+        execution: PipelineExecution,
+        background_tasks: BackgroundTasks | None = None,
+    ) -> DashboardResponse:
+        response = execution.response
+        update_session = getattr(self.storage, "update_session_status", None)
+        if callable(update_session):
+            update_session(session.id, rag_status="indexing")
+        else:
+            for dataset in datasets:
+                self.storage.update_dataset_status(
+                    dataset.id,
+                    rag_status="indexing",
+                )
+
+        if not hasattr(self._rag_service, "index_documents"):
+            rag_status = (
+                "ready"
+                if response.status != "failed"
+                and self._try_index_rag(datasets[0], contents[0])
+                else "failed"
+            )
+            self._save_dashboard(session.id, response)
+            for dataset in datasets:
+                self.storage.update_dataset_status(
+                    dataset.id,
+                    status="failed" if response.status == "failed" else "ready",
+                    rag_status=rag_status,
+                    error_message=None,
+                )
+            return response
+
+        retrieval_documents = list(execution.retrieval_documents or [])
+        if self.settings.bi_pipeline_mode == "single" and response.status != "failed":
+            retrieval_documents = self._single_workspace_documents(
+                session,
+                datasets,
+                contents,
+            )
+
+        if background_tasks is not None and response.status != "failed":
+            pending_result = {
+                "status": "indexing",
+                "document_count": len(retrieval_documents),
+                "indexed_count": 0,
+                "failed_count": 0,
+                "message": "Retrieval indexing is running in the background.",
+            }
+            workflow = dict(execution.workflow or {})
+            workflow.update(
+                {
+                    "session_id": session.id,
+                    "dataset_ids": [dataset.id for dataset in datasets],
+                    "workflow_status": response.status,
+                    "retrieval_indexing_result": pending_result,
+                }
+            )
+
+            # Persist the usable dashboard before the expensive embedding model
+            # starts. The HTTP response can now complete while Starlette runs the
+            # synchronous indexer in its background thread pool.
+            self._save_workflow_dashboard(session.id, response, workflow)
+            if callable(update_session):
+                update_session(
+                    session.id,
+                    status="ready",
+                    rag_status="indexing",
+                    error_message=None,
+                )
+            else:
+                for dataset in datasets:
+                    self.storage.update_dataset_status(
+                        dataset.id,
+                        status="ready",
+                        rag_status="indexing",
+                        error_message=None,
+                    )
+
+            background_tasks.add_task(
+                self._complete_workspace_indexing,
+                session=session,
+                datasets=datasets,
+                retrieval_documents=retrieval_documents,
+                response=response,
+                workflow=workflow,
+            )
+            return response
+
+        if response.status == "failed":
+            indexing_result = {
+                "status": "failed",
+                "document_count": len(retrieval_documents),
+                "indexed_count": 0,
+                "failed_count": len(retrieval_documents),
+                "message": "Retrieval indexing was skipped because analysis failed.",
+            }
+        else:
+            indexing_result = self._rag_service.index_documents(
+                session_id=session.id,
+                dataset_id=session.id,
+                retrieval_documents=retrieval_documents,
+            )
+
+        rag_status = (
+            "ready" if indexing_result.get("status") == "success" else "failed"
+        )
+        if rag_status == "failed" and response.status != "failed":
+            response = response.model_copy(
+                update={
+                    "status": "partial",
+                    "warnings": [
+                        *response.warnings,
+                        ApiMessage(
+                            code="RAG_INDEXING_FAILED",
+                            message=(
+                                "The dashboard was generated, but workspace "
+                                "retrieval indexing could not be completed."
+                            ),
+                            component="rag",
+                            recoverable=True,
+                        ),
+                    ],
+                }
+            )
+
+        workflow = dict(execution.workflow or {})
+        workflow.update(
+            {
+                "session_id": session.id,
+                "dataset_ids": [dataset.id for dataset in datasets],
+                "workflow_status": response.status,
+                "retrieval_indexing_result": indexing_result,
+            }
+        )
+        self._save_workflow_dashboard(session.id, response, workflow)
+
+        if callable(update_session):
+            update_session(
+                session.id,
+                status="failed" if response.status == "failed" else "ready",
+                rag_status=rag_status,
+                error_message=(
+                    "Business intelligence pipeline failed."
+                    if response.status == "failed"
+                    else "Retrieval indexing failed."
+                    if rag_status == "failed"
+                    else None
+                ),
+            )
+        else:
+            for dataset in datasets:
+                self.storage.update_dataset_status(
+                    dataset.id,
+                    status="failed" if response.status == "failed" else "ready",
+                    rag_status=rag_status,
+                    error_message=(
+                        "Business intelligence pipeline failed."
+                        if response.status == "failed"
+                        else None
+                    ),
+                )
+        return response
+
+    def _complete_workspace_indexing(
+        self,
+        *,
+        session: AnalysisSessionRecord,
+        datasets: list[DatasetRecord],
+        retrieval_documents: list[dict[str, Any]],
+        response: DashboardResponse,
+        workflow: dict[str, Any],
+    ) -> None:
+        """Finish retrieval indexing after the dashboard response is available."""
+        try:
+            indexing_result = self._rag_service.index_documents(
+                session_id=session.id,
+                dataset_id=session.id,
+                retrieval_documents=retrieval_documents,
+            )
+        except Exception as error:
+            logger.exception(
+                "Background retrieval indexing crashed session_id=%s",
+                session.id,
+            )
+            indexing_result = {
+                "status": "failed",
+                "document_count": len(retrieval_documents),
+                "indexed_count": 0,
+                "failed_count": len(retrieval_documents),
+                "message": self._safe_error(error),
+            }
+
+        rag_status = (
+            "ready" if indexing_result.get("status") == "success" else "failed"
+        )
+        completed_response = response
+        if rag_status == "failed":
+            completed_response = response.model_copy(
+                update={
+                    "status": "partial",
+                    "warnings": [
+                        *response.warnings,
+                        ApiMessage(
+                            code="RAG_INDEXING_FAILED",
+                            message=(
+                                "The dashboard was generated, but workspace "
+                                "retrieval indexing could not be completed."
+                            ),
+                            component="rag",
+                            recoverable=True,
+                        ),
+                    ],
+                }
+            )
+
+        completed_workflow = dict(workflow)
+        completed_workflow.update(
+            {
+                "workflow_status": completed_response.status,
+                "retrieval_indexing_result": indexing_result,
+            }
+        )
+
+        try:
+            self._save_workflow_dashboard(
+                session.id,
+                completed_response,
+                completed_workflow,
+            )
+        except Exception:
+            logger.exception(
+                "Unable to persist background indexing result session_id=%s",
+                session.id,
+            )
+
+        error_message = (
+            "Retrieval indexing failed." if rag_status == "failed" else None
+        )
+        update_session = getattr(self.storage, "update_session_status", None)
+        try:
+            if callable(update_session):
+                update_session(
+                    session.id,
+                    status="ready",
+                    rag_status=rag_status,
+                    error_message=error_message,
+                )
+            else:
+                for dataset in datasets:
+                    self.storage.update_dataset_status(
+                        dataset.id,
+                        status="ready",
+                        rag_status=rag_status,
+                        error_message=error_message,
+                    )
+        except Exception:
+            logger.exception(
+                "Unable to persist background indexing status session_id=%s",
+                session.id,
+            )
+
+    def _single_workspace_documents(
+        self,
+        session: AnalysisSessionRecord,
+        datasets: list[DatasetRecord],
+        contents: list[bytes],
+    ) -> list[dict[str, Any]]:
+        try:
+            from app.agents.single.business_intelligence_agent import (
+                business_intelligence_agent,
+            )
+
+            documents: list[dict[str, Any]] = []
+            for dataset, content in zip(datasets, contents, strict=True):
+                with self._temporary_agent_input(dataset, content) as agent_input:
+                    profile = business_intelligence_agent.profile_for_session(
+                        agent_input
+                    )
+                    build_documents = getattr(
+                        self._rag_service,
+                        "build_dataset_documents",
+                    )
+                    documents.extend(
+                        build_documents(
+                            agent_input=agent_input,
+                            profile=profile,
+                            workspace_session_id=session.id,
+                        )
+                    )
+            return documents
+        except Exception:
+            logger.exception(
+                "Single-agent workspace retrieval preparation failed session_id=%s",
+                session.id,
+            )
+            return []
+
+    def _persist_pipeline_execution(
+        self,
+        session: DatasetRecord,
+        content: bytes,
+        execution: PipelineExecution,
+    ) -> DashboardResponse:
+        """Persist dashboard, RAG state, and dataset status exactly once."""
+        response = execution.response
+        rag_status = "failed"
+        self.storage.update_dataset_status(session.id, rag_status="indexing")
+
+        if self.settings.bi_pipeline_mode == "multi":
+            workflow = dict(execution.workflow or {})
+            retrieval_failed = (
+                response.status == "failed"
+                or "retrieval_preparation"
+                in set(workflow.get("failed_agents") or [])
+            )
+            if retrieval_failed:
+                indexing_result = {
+                    "status": "failed",
+                    "document_count": len(execution.retrieval_documents or []),
+                    "indexed_count": 0,
+                    "failed_count": len(execution.retrieval_documents or []),
+                    "message": "Retrieval indexing was skipped because the workflow failed.",
+                }
+            else:
+                indexing_result = self._rag_service.index_documents(
+                    session_id=session.id,
+                    dataset_id=session.id,
+                    retrieval_documents=list(execution.retrieval_documents or []),
+                )
+
+            rag_status = (
+                "ready"
+                if indexing_result.get("status") == "success"
+                else "failed"
+            )
+            if rag_status == "failed" and response.status != "failed":
+                response = response.model_copy(
+                    update={
+                        "status": "partial",
+                        "warnings": [
+                            *response.warnings,
+                            ApiMessage(
+                                code="RAG_INDEXING_FAILED",
+                                message=(
+                                    "The dashboard was generated, but retrieval "
+                                    "indexing could not be completed."
+                                ),
+                                component="rag",
+                                recoverable=True,
+                            ),
+                        ],
+                    }
+                )
+
+            workflow.update(
+                {
+                    "session_id": session.id,
+                    "dataset_id": session.id,
+                    "workflow_status": response.status,
+                    "retrieval_indexing_result": indexing_result,
+                }
+            )
+            self._save_workflow_dashboard(session.id, response, workflow)
+        else:
+            rag_status = "ready" if self._try_index_rag(session, content) else "failed"
+            self._save_dashboard(session.id, response)
+
+        self.storage.update_dataset_status(
+            session.id,
+            status="failed" if response.status == "failed" else "ready",
+            rag_status=rag_status,
+            error_message=(
+                "Business intelligence pipeline failed."
+                if response.status == "failed"
+                else "Retrieval indexing failed."
+                if rag_status == "failed"
+                else None
+            ),
+        )
+        return response
+
+    def _save_workflow_dashboard(
+        self,
+        dataset_id: str,
+        response: DashboardResponse,
+        workflow: dict[str, Any],
+    ) -> None:
+        generic_cleaning_report = self._persistent_cleaning_report(
+            workflow.get("generic_cleaning_report")
+        )
+        prepared_dataset = self._persistent_prepared_dataset(
+            workflow.get("prepared_dataset")
+        )
+        persistent_workflow = dict(workflow)
+        persistent_workflow["generic_cleaning_report"] = generic_cleaning_report
+        persistent_workflow["prepared_dataset"] = prepared_dataset
+        persistent_workflow.pop("retrieval_documents", None)
+
+        self.storage.save_session_processing(
+            dataset_id=dataset_id,
+            workflow_status=response.status,
+            generic_cleaning_report=generic_cleaning_report,
+            prepared_dataset=prepared_dataset,
+        )
+
+        stored_response = response.model_dump(mode="json")
+        stored_response["workflow"] = {
+            key: value
+            for key, value in persistent_workflow.items()
+            if key != "dashboard_output"
+        }
+        stored_response["workflow"]["dashboard_output"] = stored_response.copy()
+        stored_response["workflow"]["dashboard_output"].pop("workflow", None)
+        self.storage.save_dashboard(
+            dataset_id=dataset_id,
+            status=response.status,
+            response=stored_response,
+        )
+
+    @staticmethod
+    def _persistent_cleaning_report(value: Any) -> dict[str, Any]:
+        report = dict(value) if isinstance(value, dict) else {}
+        report.pop("cleaned_file_path", None)
+        return report
+
+    @classmethod
+    def _persistent_prepared_dataset(cls, value: Any) -> dict[str, Any]:
+        prepared = dict(value) if isinstance(value, dict) else {}
+        prepared.pop("prepared_file_path", None)
+        prepared.pop("temporal_dataset_path", None)
+        cleaning_report = prepared.get("cleaning_report")
+        if isinstance(cleaning_report, dict):
+            prepared["cleaning_report"] = cls._persistent_cleaning_report(
+                cleaning_report
+            )
+        return prepared
+
     def _try_index_rag(
         self,
         dataset: DatasetRecord,
         content: bytes,
-    ) -> None:
+    ) -> bool:
         try:
-            self.storage.update_dataset_status(dataset.id, rag_status="indexing")
-
             from app.agents.single.business_intelligence_agent import (
                 business_intelligence_agent,
             )
-            from app.rag.rag_service import rag_service
 
             with self._temporary_agent_input(dataset, content) as agent_input:
                 profile = business_intelligence_agent.profile_for_session(agent_input)
-                rag_service.index_dataset(
+                self._rag_service.index_dataset(
                     agent_input=agent_input,
                     profile=profile,
                     force=True,
                 )
-
-            self.storage.update_dataset_status(dataset.id, rag_status="ready")
-        except Exception as error:
+            return True
+        except Exception:
             logger.warning(
                 "Recoverable RAG indexing failure session_id=%s operation=index_rag",
                 dataset.id,
                 exc_info=True,
             )
-            self.storage.update_dataset_status(
-                dataset.id,
-                rag_status="failed",
-                error_message=self._safe_error(error),
-            )
+            return False
 
     def _chat_with_agent(
         self,
@@ -739,6 +2414,7 @@ class BusinessIntelligenceService:
             yield (
                 BusinessIntelligenceAgentInput(
                     sessionId=dataset.id,
+                    datasetId=dataset.id,
                     filePath=str(path),
                     fileName=dataset.file_name,
                     description=dataset.description,
@@ -1108,12 +2784,12 @@ class BusinessIntelligenceService:
                 f"Analysis session '{session_id}' was not found."
             ) from error
 
-    @staticmethod
     def _chat_message(
+        self,
         message: MessageRecord,
         grounded: bool | None = None,
     ) -> dict[str, Any]:
-        return {
+        payload = {
             "id": message.id,
             "role": message.role,
             "content": message.content,
@@ -1124,6 +2800,12 @@ class BusinessIntelligenceService:
             ),
             "createdAt": message.created_at,
         }
+        if message.role == "assistant":
+            payload["agentMetadata"] = self._chat_model_metadata()
+        return payload
+
+    def _chat_model_metadata(self) -> dict[str, str]:
+        return chat_model_usage(self.settings.bi_pipeline_mode)
 
     @staticmethod
     def _safe_error(error: Exception) -> str:

@@ -1,4 +1,4 @@
-"""Independent TimesFM forecasting specialist."""
+"""Independent Chronos-2 forecasting specialist."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,17 +8,17 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.agents.multi.analysis_series import (
+from app.services.series import (
     is_numeric_measure,
     period_frequency,
     select_primary_series,
     selected_date_column,
     selected_granularity,
 )
-from app.services.timesfm_service import MAX_CONTEXT, timesfm_service
+from app.services.chronos_service import MAX_CONTEXT, chronos_service
 
 # This matches data preparation's capability gate.  Short histories are still
-# labelled by the fallback model, while longer series can use TimesFM.
+# labelled by the fallback model, while longer series can use Chronos-2.
 MIN_FORECAST_PERIODS = 4
 DEFAULT_HORIZON = 3
 MAX_FORECAST_HORIZON = 24
@@ -207,7 +207,7 @@ class ForecastingAgent:
             return ForecastingOutput(series_id=definition.id, title=definition.title, measure=definition.measure, aggregation=definition.aggregation, granularity=definition.granularity, horizon=definition.horizon, limitations=[*limitations, str(exc)], warnings=warnings)
         historical = [HistoricalPoint(period=str(period), value=round(float(value), 6)) for period, value in series.items()]
         try:
-            response = await timesfm_service.forecast([float(value) for value in series.values], definition.horizon)
+            response = await chronos_service.forecast(series, definition.horizon)
         except Exception as exc:
             model, values, lower_bounds, upper_bounds = _fallback_forecast(
                 series,
@@ -216,11 +216,11 @@ class ForecastingAgent:
             )
             limitations = [
                 *limitations,
-                f"TimesFM was unavailable; {model} fallback was used: {exc}",
+                f"Chronos-2 was unavailable; {model} fallback was used: {exc}",
             ]
             confidence_level = 0.95
         else:
-            model = "TimesFM 2.5"
+            model = "Chronos-2"
             values = response.values
             lower_bounds = response.lower_bounds
             upper_bounds = response.upper_bounds

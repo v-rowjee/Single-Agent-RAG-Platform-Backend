@@ -5,10 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import Settings
+from app.schemas.business_intelligence import DashboardResponse
 from app.services import business_intelligence_service as service_module
-from app.services.business_intelligence_persistence_service import (
-    BusinessIntelligencePersistenceService,
-)
 from app.services.business_intelligence_service import BusinessIntelligenceService
 from app.services.supabase_service import DatasetRecord
 
@@ -35,19 +33,23 @@ class PersistenceStorage:
 
 def test_persistence_stores_processing_metadata_without_temporary_paths() -> None:
     storage = PersistenceStorage()
-    service = BusinessIntelligencePersistenceService(storage=storage)  # type: ignore[arg-type]
-
-    result = service.persist_workflow(
+    service = BusinessIntelligenceService(
+        storage=storage,  # type: ignore[arg-type]
+        settings=Settings("", "", bi_pipeline_mode="multi"),
+    )
+    response = DashboardResponse(
+        status="failed",
+        sessionId=SESSION_ID,
+        dashboard=None,
+        warnings=[],
+        errors=[],
+    )
+    service._save_workflow_dashboard(
+        SESSION_ID,
+        response,
         {
             "session_id": SESSION_ID,
             "dataset_id": SESSION_ID,
-            "dashboard_output": {
-                "status": "failed",
-                "sessionId": SESSION_ID,
-                "dashboard": None,
-                "warnings": [],
-                "errors": [],
-            },
             "generic_cleaning_report": {
                 "cleaned_file_path": "C:/temp/processing/generic_cleaned_dataset.csv",
                 "cleaned_row_count": 3,
@@ -60,10 +62,15 @@ def test_persistence_stores_processing_metadata_without_temporary_paths() -> Non
                     "cleaned_file_path": "C:/temp/processing/generic_cleaned_dataset.csv"
                 },
             },
-        }
+            "retrieval_documents": [
+                {
+                    "id": "row_batch_0_2",
+                    "content": "Large raw retrieval payload",
+                }
+            ],
+        },
     )
 
-    assert result["status"] == "success"
     assert storage.processing == {
         "dataset_id": SESSION_ID,
         "workflow_status": "failed",
@@ -78,6 +85,7 @@ def test_persistence_stores_processing_metadata_without_temporary_paths() -> Non
     assert "prepared_file_path" not in workflow["prepared_dataset"]
     assert "temporal_dataset_path" not in workflow["prepared_dataset"]
     assert "cleaned_file_path" not in workflow["generic_cleaning_report"]
+    assert "retrieval_documents" not in workflow
 
 
 class WorkspaceGraph:
@@ -90,7 +98,6 @@ class WorkspaceGraph:
         assert "app/storage/sessions" not in self.workspace.as_posix()
         return {
             "workflow_status": "partial",
-            "persistence_result": {"status": "success"},
             "dashboard_output": {
                 "status": "failed",
                 "sessionId": state["session_id"],
@@ -129,13 +136,13 @@ def test_multi_agent_workspace_is_temporary_and_not_session_storage(
         error_message=None,
     )
 
-    response = asyncio.run(
+    execution = asyncio.run(
         service._run_multi_agent_pipeline(
             dataset,
             b"date,revenue\n2026-01-01,10\n",
         )
     )
 
-    assert response.status == "failed"
+    assert execution.response.status == "failed"
     assert graph.workspace is not None
     assert not graph.workspace.exists()
