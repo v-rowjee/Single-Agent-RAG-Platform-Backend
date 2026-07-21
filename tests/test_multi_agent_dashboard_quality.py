@@ -9,6 +9,7 @@ import pytest
 
 from app.agents.multi import dashboard_generation_agent as dashboard_module
 from app.agents.multi import forecasting_agent as forecasting_module
+from app.agents.multi import orchestrator_agent as orchestrator_module
 from app.services.series import (
     aggregation_for_measure,
     infer_time_granularity,
@@ -22,6 +23,9 @@ from app.agents.multi.orchestrator_agent import (
     AgentDecision,
     OrchestrationPlan,
     OrchestratorAgent,
+    _build_orchestration_context,
+    _request_plan,
+    detect_analysis_capabilities,
 )
 from app.core.config import configured_agent_models
 
@@ -364,13 +368,18 @@ def test_compound_plan_remains_inside_deterministic_capability_gates() -> None:
     }
 
     async def propose(
-        capabilities: dict[str, bool],
+        routing_context: dict[str, object],
         eligible_agents: set[str],
     ) -> OrchestrationPlan:
-        assert capabilities["supports_kpis"] is True
-        assert eligible_agents == {"kpi_trend"}
+        assert routing_context["available_capabilities"] == {
+            "kpi_analysis": True,
+            "trend_analysis": True,
+            "anomaly_detection": True,
+            "forecasting": False,
+        }
+        assert eligible_agents == {"kpi_trend", "anomaly_detection"}
         return OrchestrationPlan(
-            selected_agents=["kpi_trend", "anomaly_detection"],
+            selected_agents=["kpi_trend", "forecasting"],
             decisions=[
                 AgentDecision(
                     agent="kpi_trend",
@@ -378,7 +387,7 @@ def test_compound_plan_remains_inside_deterministic_capability_gates() -> None:
                     reason="KPI analysis is relevant.",
                 ),
                 AgentDecision(
-                    agent="anomaly_detection",
+                    agent="forecasting",
                     selected=True,
                     reason="Requested despite missing capability.",
                 ),
@@ -388,10 +397,237 @@ def test_compound_plan_remains_inside_deterministic_capability_gates() -> None:
     plan = asyncio.run(OrchestratorAgent(planner=propose).run(prepared))
 
     assert plan.selected_agents == ["kpi_trend"]
-    anomaly = next(
+    forecast = next(
         decision
         for decision in plan.decisions
-        if decision.agent == "anomaly_detection"
+        if decision.agent == "forecasting"
     )
-    assert anomaly.selected is False
-    assert "does not support" in anomaly.reason
+    assert forecast.selected is False
+    assert "does not support" in forecast.reason
+
+
+def test_compound_failure_uses_deterministic_capability_routing() -> None:
+    prepared = {
+        "date_column": "transaction_date",
+        "primary_measures": ["net_revenue_gbp"],
+        "time_series_candidates": ["net_revenue_gbp"],
+        "temporal_profile": {"unique_periods": 24},
+        "capability_flags": {
+            "supports_kpis": True,
+            "supports_trends": True,
+            "supports_anomalies": True,
+            "supports_forecasting": True,
+            "has_temporal_data": True,
+        },
+    }
+
+    async def unavailable_planner(
+        _: dict[str, object],
+        __: set[str],
+    ) -> OrchestrationPlan:
+        raise RuntimeError("413 Request Entity Too Large")
+
+    plan = asyncio.run(OrchestratorAgent(planner=unavailable_planner).run(prepared))
+
+    assert plan.selected_agents == ["kpi_trend", "anomaly_detection", "forecasting"]
+
+
+def test_orchestration_context_is_metadata_only_and_bounds_samples() -> None:
+    prepared = {
+        "dataset_id": "dataset-123",
+        "dataset_profile": {
+            "row_count": 2,
+            "column_count": 2,
+            "column_profiles": [
+                {
+                    "name": "revenue",
+                    "inferred_type": "numeric",
+                    "null_percentage": 0,
+                    "sample_values": list(range(10)),
+                },
+                {
+                    "name": "notes",
+                    "inferred_type": "text",
+                    "null_percentage": 50,
+                    "sample_values": ["sample note " * 20],
+                },
+            ],
+        },
+        "semantic_column_map": {"revenue": "primary_measure"},
+        "prepared_file_path": "/private/full-dataset.csv",
+        "full_dataset": [{"notes": "complete-dataset-row-marker"}],
+    }
+    capabilities = {
+        "supports_kpis": True,
+        "supports_trends": False,
+        "supports_anomalies": True,
+        "supports_forecasting": False,
+        "has_temporal_data": False,
+    }
+
+    context = _build_orchestration_context(
+        prepared,
+        capabilities,
+        {"kpi_trend", "anomaly_detection"},
+    )
+
+    assert context["dataset_id"] == "dataset-123"
+    assert context["numeric_columns"] == ["revenue"]
+    assert len(context["columns"][0]["sample_values"]) == 5
+    assert len(context["columns"][1]["sample_values"][0]) == 80
+    assert set(context) == {
+        "dataset_id",
+        "row_count",
+        "column_count",
+        "columns",
+        "numeric_columns",
+        "categorical_columns",
+        "temporal_columns",
+        "available_capabilities",
+    }
+    assert set(context["columns"][0]) == {
+        "name",
+        "dtype",
+        "semantic_role",
+        "missing_percentage",
+        "unique_count",
+        "sample_values",
+    }
+    assert "prepared_file_path" not in context
+    assert "full_dataset" not in context
+    assert "complete-dataset-row-marker" not in str(context)
+
+
+def test_deterministic_capability_detection_uses_dataset_metadata() -> None:
+    prepared = {
+        "date_column": "transaction_date",
+        "primary_measures": [],
+        "temporal_profile": {"unique_periods": 12},
+        "dataset_profile": {
+            "row_count": 100,
+            "column_count": 3,
+            "column_profiles": [
+                {
+                    "name": "transaction_date",
+                    "inferred_type": "date",
+                    "unique_count": 12,
+                },
+                {
+                    "name": "revenue",
+                    "inferred_type": "numeric",
+                    "unique_count": 90,
+                },
+                {
+                    "name": "branch",
+                    "inferred_type": "categorical",
+                    "unique_count": 4,
+                },
+            ],
+        },
+        # Stale model-authored flags must not suppress metadata capabilities.
+        "capability_flags": {
+            "supports_kpis": False,
+            "supports_trends": False,
+            "supports_anomalies": False,
+            "supports_forecasting": False,
+            "has_temporal_data": False,
+        },
+    }
+
+    assert detect_analysis_capabilities(prepared) == {
+        "supports_kpis": True,
+        "supports_trends": True,
+        "supports_anomalies": True,
+        "supports_forecasting": True,
+        "has_temporal_data": True,
+    }
+
+
+def test_compound_request_size_is_calculated_before_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    def measure(_: list[dict[str, str]]) -> int:
+        events.append("size")
+        return 10
+
+    async def request(**_: Any) -> OrchestrationPlan:
+        events.append("provider")
+        return OrchestrationPlan()
+
+    monkeypatch.setattr(orchestrator_module, "orchestration_request_size", measure)
+    monkeypatch.setattr(orchestrator_module, "request_structured", request)
+
+    asyncio.run(
+        _request_plan(
+            {
+                "dataset_id": "dataset-123",
+                "row_count": 1,
+                "column_count": 1,
+                "columns": [],
+                "numeric_columns": [],
+                "categorical_columns": [],
+                "temporal_columns": [],
+                "available_capabilities": {},
+            },
+            set(),
+        )
+    )
+
+    assert events == ["size", "provider"]
+
+
+def test_oversized_compound_request_skips_provider_and_routes_deterministically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_called = False
+
+    async def request(**_: Any) -> OrchestrationPlan:
+        nonlocal provider_called
+        provider_called = True
+        return OrchestrationPlan()
+
+    monkeypatch.setenv("MAX_ORCHESTRATION_PAYLOAD_BYTES", "1")
+    monkeypatch.setattr(orchestrator_module, "request_structured", request)
+    prepared = {
+        "primary_measures": ["revenue"],
+        "dataset_profile": {
+            "row_count": 100,
+            "column_count": 1,
+            "column_profiles": [
+                {
+                    "name": "revenue",
+                    "inferred_type": "numeric",
+                    "unique_count": 100,
+                }
+            ],
+        },
+    }
+
+    plan = asyncio.run(OrchestratorAgent(planner=_request_plan).run(prepared))
+
+    assert provider_called is False
+    assert plan.selected_agents == ["kpi_trend", "anomaly_detection"]
+
+
+def test_orchestration_decision_normalizes_compound_run_alias() -> None:
+    plan = OrchestrationPlan.model_validate(
+        {
+            "selected_agents": ["kpi_trend"],
+            "decisions": [
+                {
+                    "agent": "kpi_trend",
+                    "run": True,
+                    "reason": "The dataset includes temporal measures.",
+                },
+                {
+                    "agent": "anomaly_detection",
+                    "run": False,
+                    "reason": "Trend analysis is sufficient for this request.",
+                },
+            ],
+        }
+    )
+
+    assert [decision.selected for decision in plan.decisions] == [True, False]

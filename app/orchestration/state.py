@@ -8,6 +8,7 @@ class BusinessIntelligenceState(TypedDict, total=False):
     session_id: str
     dataset_id: str
     business_description: str | None
+    source_datasets: list[dict[str, Any]]
 
     uploaded_file_path: str
     working_directory: str

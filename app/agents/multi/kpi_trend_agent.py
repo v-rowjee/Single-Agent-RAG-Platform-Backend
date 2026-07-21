@@ -128,6 +128,7 @@ def _planning_payload(prepared: dict[str, Any]) -> dict[str, Any]:
         "time_series_candidates": prepared.get("time_series_candidates") or [],
         "capability_flags": prepared.get("capability_flags") or {},
         "limitations": prepared.get("limitations") or [],
+        "source_datasets": prepared.get("source_datasets") or [],
     }
 
 

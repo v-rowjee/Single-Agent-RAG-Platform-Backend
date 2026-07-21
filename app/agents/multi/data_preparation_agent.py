@@ -7,13 +7,16 @@ import math
 import re
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias, get_args
 
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from app.core.currency import detect_currency
 
 from app.services.series import (
+    TimeGranularity,
     infer_time_granularity,
     temporal_period_count,
 )
@@ -118,6 +121,7 @@ class DatasetProfile(StrictModel):
     candidate_numeric_columns: list[str] = Field(default_factory=list)
     candidate_categorical_columns: list[str] = Field(default_factory=list)
     business_description: str | None = None
+    currency: str | None = None
 
 
 class TemporalProfile(StrictModel):
@@ -128,25 +132,35 @@ class TemporalProfile(StrictModel):
     inferred_frequency: Literal["day", "week", "month", "quarter", "year"] | None = None
 
 
-class ColumnSemanticRole(StrictModel):
+SemanticRole: TypeAlias = Literal[
+    "date",
+    "transaction_id",
+    "primary_measure",
+    "dimension",
+    "category",
+    "flag",
+    "text",
+    "description",
+    "unknown",
+]
+SEMANTIC_ROLE_VALUES = frozenset(get_args(SemanticRole))
+
+
+class SemanticRoleAssignment(StrictModel):
     column: str
-    role: Literal[
-        "date",
-        "transaction_id",
-        "primary_measure",
-        "dimension",
-        "category",
-        "description",
-        "unknown",
-    ]
+    role: SemanticRole
     reason: str | None = None
+
+
+# Import compatibility only; the canonical model and schema name are above.
+ColumnSemanticRole = SemanticRoleAssignment
 
 
 class PreparationTransformation(StrictModel):
     operation: TransformationOperation
     column: str
-    reason: str
-    value: str | int | float | bool | None = None
+    reason: str | None = None
+    value: str | float | bool | None = None
     analysis_types: list[str] = Field(default_factory=list)
     formula_id: str | None = None
     source_columns: list[str] = Field(default_factory=list)
@@ -160,8 +174,80 @@ class CapabilityFlags(StrictModel):
     has_temporal_data: bool = False
 
 
+def normalize_semantic_role_assignments(value: Any) -> list[dict[str, Any]]:
+    """Return canonical per-column assignments from current and legacy shapes.
+
+    The first valid assignment for a column wins.  This preserves an existing
+    per-column assignment when a provider repeats that column in a later
+    grouped entry.
+    """
+    entries: list[Any]
+    if isinstance(value, list):
+        entries = value
+    elif isinstance(value, dict):
+        # Retain compatibility with the still older ``{role: columns}`` form.
+        entries = []
+        for role, raw_columns in value.items():
+            if isinstance(raw_columns, dict) and isinstance(
+                raw_columns.get("column"), str
+            ):
+                entries.append({"role": role, **raw_columns})
+            else:
+                entries.append(
+                    {
+                        "role": role,
+                        "values": (
+                            [raw_columns]
+                            if not isinstance(raw_columns, list)
+                            else raw_columns
+                        ),
+                    }
+                )
+    else:
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    seen_columns: set[str] = set()
+
+    def add(column: Any, role: Any, reason: Any = None) -> None:
+        if not isinstance(column, str) or not column.strip():
+            return
+        if not isinstance(role, str) or role not in SEMANTIC_ROLE_VALUES:
+            return
+        canonical_column = column.strip()
+        if canonical_column in seen_columns:
+            return
+        assignment: dict[str, Any] = {
+            "column": canonical_column,
+            "role": role,
+        }
+        if isinstance(reason, str) and reason.strip():
+            assignment["reason"] = reason.strip()
+        normalized.append(assignment)
+        seen_columns.add(canonical_column)
+
+    for entry in entries:
+        if isinstance(entry, SemanticRoleAssignment):
+            add(entry.column, entry.role, entry.reason)
+            continue
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get("role")
+        column = entry.get("column")
+        if isinstance(column, str):
+            add(column, role, entry.get("reason"))
+            continue
+        grouped_columns = entry.get("values")
+        if not isinstance(grouped_columns, list):
+            continue
+        for grouped_column in grouped_columns:
+            add(grouped_column, role, entry.get("reason"))
+
+    return normalized
+
+
 class PreparationPlan(StrictModel):
-    semantic_roles: list[ColumnSemanticRole] = Field(default_factory=list)
+    semantic_roles: list[SemanticRoleAssignment] = Field(default_factory=list)
     date_column: str | None = None
     transaction_id_columns: list[str] = Field(default_factory=list)
     primary_measures: list[str] = Field(default_factory=list)
@@ -174,9 +260,32 @@ class PreparationPlan(StrictModel):
     capability_flags: CapabilityFlags = Field(default_factory=CapabilityFlags)
     limitations: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_common_llm_variants(cls, value: Any) -> Any:
+        """Normalize safe, known JSON variants produced by planning models."""
+        if not isinstance(value, dict):
+            return value
+
+        payload = dict(value)
+        payload["semantic_roles"] = normalize_semantic_role_assignments(
+            payload.get("semantic_roles")
+        )
+
+        granularity = payload.get("time_granularity")
+        if isinstance(granularity, str):
+            payload["time_granularity"] = {
+                "daily": "day",
+                "weekly": "week",
+                "monthly": "month",
+                "quarterly": "quarter",
+                "yearly": "year",
+            }.get(granularity.strip().lower(), granularity.strip().lower())
+        return payload
+
 
 class PreparationReport(StrictModel):
-    plan_source: AgentProvider | Literal["fallback"]
+    plan_source: AgentProvider | Literal["deterministic"]
     executed_transformations: list[str] = Field(default_factory=list)
     rejected_transformations: list[str] = Field(default_factory=list)
     excluded_from_measure_analysis: dict[str, int] = Field(default_factory=dict)
@@ -189,6 +298,7 @@ class PreparedDatasetPackage(StrictModel):
     file_name: str
     temporal_dataset_path: str | None
     dataset_profile: DatasetProfile
+    currency: str | None = None
     semantic_column_map: dict[str, str] = Field(default_factory=dict)
     date_column: str | None
     primary_measures: list[str] = Field(default_factory=list)
@@ -311,6 +421,8 @@ def _convert_dates(df: pd.DataFrame) -> pd.DataFrame:
 def _infer_column_type(series: pd.Series, column: str) -> str:
     if pd.api.types.is_datetime64_any_dtype(series):
         return "date"
+    if pd.api.types.is_bool_dtype(series):
+        return "boolean"
     if pd.api.types.is_numeric_dtype(series):
         return "numeric"
     if _is_date_candidate_name(column):
@@ -494,7 +606,7 @@ def _profile_dataset(df: pd.DataFrame, business_description: str | None) -> Data
             )
         )
 
-    return DatasetProfile(
+    profile = DatasetProfile(
         row_count=int(len(df)),
         column_count=int(len(df.columns)),
         column_profiles=column_profiles,
@@ -503,34 +615,162 @@ def _profile_dataset(df: pd.DataFrame, business_description: str | None) -> Data
         candidate_categorical_columns=categorical_columns,
         business_description=(business_description or None),
     )
+    return profile.model_copy(update={"currency": _detect_currency(profile)})
 
 
-# 6. Deterministic fallback planning
+# 6. Deterministic preparation planning
 
 
 def _contains_any(column: str, tokens: tuple[str, ...]) -> bool:
     return any(token in column.lower() for token in tokens)
 
 
-def _fallback_plan(profile: DatasetProfile, warning: str | None = None) -> PreparationPlan:
+def _semantic_role_for_column(
+    item: ColumnProfile,
+    profile: DatasetProfile,
+) -> SemanticRoleAssignment:
+    """Infer one stable semantic role from bounded profile metadata."""
+    name = item.name
+    lowered = name.casefold()
+    non_null_count = max(0, profile.row_count - item.null_count)
+    unique_ratio = item.unique_count / non_null_count if non_null_count else 0.0
+    mostly_unique = non_null_count > 0 and unique_ratio >= 0.8
+
+    explicit_identifier = (
+        lowered == "id"
+        or lowered.endswith("_id")
+        or _contains_any(
+            lowered,
+            ("transaction_id", "order_id", "invoice_id", "receipt_id"),
+        )
+    )
+    if explicit_identifier and mostly_unique:
+        return SemanticRoleAssignment(
+            column=name,
+            role="transaction_id",
+            reason="Identifier-like name with a mostly unique value distribution.",
+        )
+
+    if (
+        item.inferred_type == "date"
+        or (item.date_parse_success_percentage or 0) >= DATE_CONVERSION_THRESHOLD * 100
+    ):
+        return SemanticRoleAssignment(
+            column=name,
+            role="date",
+            reason="Values are consistently parseable as dates.",
+        )
+
+    boolean_name = (
+        lowered.startswith(("is_", "has_", "can_"))
+        or lowered.endswith(("_flag", "_active", "_enabled"))
+    )
+    if item.inferred_type == "boolean" or (boolean_name and item.unique_count <= 2):
+        return SemanticRoleAssignment(
+            column=name,
+            role="flag",
+            reason="Boolean or binary indicator column.",
+        )
+
+    if item.inferred_type == "numeric":
+        if lowered in {"year", "month", "quarter", "week", "day"} or lowered.endswith(
+            ("_year", "_month", "_quarter", "_week", "_day")
+        ):
+            return SemanticRoleAssignment(
+                column=name,
+                role="dimension",
+                reason="Numeric calendar helper used for grouping.",
+            )
+        if explicit_identifier:
+            return SemanticRoleAssignment(
+                column=name,
+                role="transaction_id",
+                reason="Identifier-like numeric column.",
+            )
+        if _contains_any(
+            lowered,
+            (
+                "revenue",
+                "sales",
+                "amount",
+                "profit",
+                "cost",
+                "value",
+                "quantity",
+                "price",
+                "margin",
+                "discount",
+                "rate",
+                "percent",
+                "pct",
+            ),
+        ):
+            return SemanticRoleAssignment(
+                column=name,
+                role="primary_measure",
+                reason="Numeric business value suitable for aggregation.",
+            )
+        if item.unique_count <= min(20, max(2, int(non_null_count * 0.05))):
+            return SemanticRoleAssignment(
+                column=name,
+                role="dimension",
+                reason="Low-cardinality numeric grouping column.",
+            )
+        return SemanticRoleAssignment(
+            column=name,
+            role="primary_measure",
+            reason="Numeric distribution suitable for measure analysis.",
+        )
+
+    if item.inferred_type == "categorical":
+        role: Literal["category", "dimension"] = (
+            "category"
+            if _contains_any(lowered, ("category", "type", "status", "class"))
+            else "dimension"
+        )
+        return SemanticRoleAssignment(
+            column=name,
+            role=role,
+            reason="Low-cardinality text suitable for grouping.",
+        )
+
+    if item.inferred_type == "text":
+        return SemanticRoleAssignment(
+            column=name,
+            role="text",
+            reason="High-cardinality free-text column.",
+        )
+
+    return SemanticRoleAssignment(
+        column=name,
+        role="unknown",
+        reason="No reliable semantic role could be inferred.",
+    )
+
+
+def _deterministic_plan(
+    profile: DatasetProfile,
+    limitation: str | None = None,
+) -> PreparationPlan:
+    """Build the authoritative preparation plan without an LLM call."""
     columns = {item.name: item for item in profile.column_profiles}
-    numeric = list(profile.candidate_numeric_columns)
-    date_column = profile.candidate_date_columns[0] if profile.candidate_date_columns else None
+    semantic_roles = [
+        _semantic_role_for_column(item, profile)
+        for item in profile.column_profiles
+    ]
+    date_columns = [role.column for role in semantic_roles if role.role == "date"]
+    date_column = date_columns[0] if date_columns else None
     transaction_ids = [
-        name
-        for name in columns
-        if _contains_any(name, ("transaction_id", "order_id", "invoice_id", "receipt_id"))
+        role.column for role in semantic_roles if role.role == "transaction_id"
     ][:3]
     primary_measures = [
-        name
-        for name in numeric
-        if _contains_any(name, ("revenue", "sales", "amount", "profit", "cost", "value", "quantity", "price"))
-    ][:5] or numeric[:3]
+        role.column for role in semantic_roles if role.role == "primary_measure"
+    ][:5]
     dimensions = [
-        item.name
-        for item in profile.column_profiles
-        if item.name not in primary_measures and item.name != date_column and item.inferred_type in {"categorical", "text"}
-    ][:8]
+        role.column
+        for role in semantic_roles
+        if role.role in {"dimension", "category", "flag"}
+    ][:10]
 
     transformations: list[PreparationTransformation] = []
     for name, item in columns.items():
@@ -581,51 +821,55 @@ def _fallback_plan(profile: DatasetProfile, warning: str | None = None) -> Prepa
                     reason="Missing primary measures should not be invented.",
                 )
             )
-    limitations = []
-    if warning:
-        limitations.append(warning)
+    limitations = [limitation] if limitation else []
+    usable_periods = _usable_period_count(profile, date_column)
 
     return PreparationPlan(
-        semantic_roles=[
-            *([ColumnSemanticRole(column=date_column, role="date", reason="Best date candidate.")] if date_column else []),
-            *[
-                ColumnSemanticRole(column=column, role="transaction_id", reason="Identifier-like column name.")
-                for column in transaction_ids
-            ],
-            *[
-                ColumnSemanticRole(column=column, role="primary_measure", reason="Numeric business measure candidate.")
-                for column in primary_measures
-            ],
-        ],
+        semantic_roles=semantic_roles,
         date_column=date_column,
         transaction_id_columns=transaction_ids,
         primary_measures=primary_measures,
         dimensions=dimensions,
-        categorical_columns=list(profile.candidate_categorical_columns)[:10],
+        categorical_columns=[
+            item.name
+            for item in profile.column_profiles
+            if item.inferred_type in {"categorical", "boolean"}
+        ][:10],
         currency=_detect_currency(profile),
         time_granularity=_guess_time_granularity(profile, date_column),
         time_series_candidates=primary_measures[:3] if date_column else [],
         transformations=transformations,
         capability_flags=CapabilityFlags(
             supports_kpis=bool(primary_measures),
-            supports_trends=bool(date_column and primary_measures),
-            supports_forecasting=bool(date_column and primary_measures),
-            supports_anomalies=bool(primary_measures),
-            has_temporal_data=bool(date_column),
+            supports_trends=bool(
+                date_column and primary_measures and usable_periods >= MIN_TREND_PERIODS
+            ),
+            supports_forecasting=bool(
+                date_column
+                and primary_measures
+                and usable_periods >= MIN_FORECAST_PERIODS
+            ),
+            supports_anomalies=bool(
+                primary_measures and profile.row_count >= MIN_ANOMALY_OBSERVATIONS
+            ),
+            has_temporal_data=bool(
+                date_column and usable_periods >= MIN_TREND_PERIODS
+            ),
         ),
         limitations=limitations,
     )
 
 
+def _fallback_plan(
+    profile: DatasetProfile,
+    warning: str | None = None,
+) -> PreparationPlan:
+    """Backward-compatible name for callers that imported the old helper."""
+    return _deterministic_plan(profile, warning)
+
+
 def _detect_currency(profile: DatasetProfile) -> str | None:
-    haystack = " ".join(item.name.lower() for item in profile.column_profiles)
-    if "gbp" in haystack or "pound" in haystack:
-        return "GBP"
-    if "eur" in haystack or "euro" in haystack:
-        return "EUR"
-    if "usd" in haystack or "dollar" in haystack:
-        return "USD"
-    return None
+    return detect_currency(item.name for item in profile.column_profiles)
 
 
 def _guess_time_granularity(profile: DatasetProfile, date_column: str | None) -> Literal["day", "week", "month", "quarter", "year"] | None:
@@ -654,6 +898,7 @@ async def _request_plan(profile: DatasetProfile) -> PreparationPlan:
         supported_operations=sorted(SUPPORTED_OPERATIONS),
         supported_formulas=sorted(SUPPORTED_FORMULAS),
         profile=_compact_profile_payload(profile),
+        output_schema=PreparationPlan.model_json_schema(mode="serialization"),
     )
     return await request_structured(
         policy=agent_model_policy("data_preparation"),
@@ -666,23 +911,113 @@ async def _request_plan(profile: DatasetProfile) -> PreparationPlan:
     )
 
 
-async def _plan_with_provider_or_fallback(
+def _merge_plan_enrichment(
+    base: PreparationPlan,
+    suggestion: PreparationPlan,
     profile: DatasetProfile,
-) -> tuple[PreparationPlan, AgentProvider | Literal["fallback"], list[str]]:
+) -> PreparationPlan:
+    """Merge safe LLM enrichment without replacing deterministic assignments."""
+    known_columns = set(_profile_map(profile))
+    roles_by_column = {role.column: role for role in base.semantic_roles}
+    for role in suggestion.semantic_roles:
+        current = roles_by_column.get(role.column)
+        if role.column not in known_columns or (current and current.role != "unknown"):
+            continue
+        roles_by_column[role.column] = role
+
+    ordered_roles = [
+        roles_by_column[item.name]
+        for item in profile.column_profiles
+        if item.name in roles_by_column
+    ]
+    date_columns = [role.column for role in ordered_roles if role.role == "date"]
+    transaction_ids = [
+        role.column for role in ordered_roles if role.role == "transaction_id"
+    ][:3]
+    primary_measures = [
+        role.column
+        for role in ordered_roles
+        if role.role == "primary_measure"
+        and role.column in profile.candidate_numeric_columns
+    ][:5]
+    dimensions = [
+        role.column
+        for role in ordered_roles
+        if role.role in {"dimension", "category", "flag"}
+    ][:10]
+
+    transformations = list(base.transformations)
+    seen_transformations = {
+        (item.operation, item.column) for item in transformations
+    }
+    for transformation in suggestion.transformations:
+        key = (transformation.operation, transformation.column)
+        if key in seen_transformations:
+            continue
+        transformations.append(transformation)
+        seen_transformations.add(key)
+
+    date_column = base.date_column or (date_columns[0] if date_columns else None)
+    return base.model_copy(
+        update={
+            "semantic_roles": ordered_roles,
+            "date_column": date_column,
+            "transaction_id_columns": transaction_ids,
+            "primary_measures": primary_measures,
+            "dimensions": dimensions,
+            "categorical_columns": _dedupe(
+                [*base.categorical_columns, *suggestion.categorical_columns]
+            )[:10],
+            "currency": base.currency or suggestion.currency,
+            "time_granularity": (
+                base.time_granularity or suggestion.time_granularity
+            ),
+            "time_series_candidates": (
+                primary_measures[:3] if date_column else []
+            ),
+            "transformations": transformations,
+            # Capability detection remains deterministic metadata logic.
+            "capability_flags": base.capability_flags,
+            "limitations": _dedupe(
+                [*base.limitations, *suggestion.limitations]
+            ),
+        }
+    )
+
+
+async def _plan_with_optional_enrichment(
+    profile: DatasetProfile,
+) -> tuple[PreparationPlan, AgentProvider | Literal["deterministic"], list[str]]:
+    base_plan = _deterministic_plan(profile)
     warnings: list[str] = []
     policy = agent_model_policy("data_preparation")
     try:
-        return await _request_plan(profile), policy.provider, warnings
-    except Exception as error:
-        warnings.append(
-            f"{provider_display_name(policy.provider)} preparation planning failed: "
-            f"{error}"
+        suggestion = await _request_plan(profile)
+        return (
+            _merge_plan_enrichment(base_plan, suggestion, profile),
+            policy.provider,
+            warnings,
         )
-        warnings.append("Deterministic fallback preparation plan was used.")
-        return _fallback_plan(
-            profile,
-            "LLM planning failed; deterministic fallback was used.",
-        ), "fallback", warnings
+    except Exception as error:
+        logger.warning(
+            "Optional data preparation enrichment failed; deterministic plan retained "
+            "provider=%s model=%s error=%s",
+            policy.provider,
+            policy.model,
+            error,
+        )
+        warnings.append(
+            f"{provider_display_name(policy.provider)} preparation enrichment was "
+            "unavailable; deterministic preparation was retained."
+        )
+        return base_plan, "deterministic", warnings
+
+
+async def _plan_with_provider_or_fallback(
+    profile: DatasetProfile,
+) -> tuple[PreparationPlan, AgentProvider | Literal["deterministic"], list[str]]:
+    """Backward-compatible wrapper for the renamed enrichment path."""
+    return await _plan_with_optional_enrichment(profile)
 
 
 # 8. Plan validation
@@ -824,7 +1159,7 @@ def _usable_period_count(profile: DatasetProfile, date_column: str | None) -> in
 def _temporal_profile(
     df: pd.DataFrame,
     date_column: str | None,
-    granularity: Literal["day", "week", "month", "quarter", "year"] | None,
+    granularity: TimeGranularity | None,
 ) -> TemporalProfile:
     if not date_column or date_column not in df:
         return TemporalProfile(unique_periods=0)
@@ -844,7 +1179,7 @@ def _temporal_profile(
 def _reconcile_temporal_capabilities(
     plan: PreparationPlan,
     prepared: pd.DataFrame,
-) -> str | None:
+) -> TimeGranularity | None:
     """Re-evaluate temporal capability after dates have been cleaned.
 
     Capability flags from an LLM plan are only a proposal.  The cleaned data is
@@ -901,7 +1236,7 @@ def _execute_plan(
     df: pd.DataFrame,
     plan: PreparationPlan,
     output_dir: Path,
-    plan_source: AgentProvider | Literal["fallback"],
+    plan_source: AgentProvider | Literal["deterministic"],
     validation_warnings: list[str],
     rejected_transformations: list[str],
 ) -> tuple[pd.DataFrame, str | None, PreparationReport]:
@@ -1010,6 +1345,9 @@ def _apply_formula(df: pd.DataFrame, transformation: PreparationTransformation) 
 
 
 class DataPreparationAgent:
+    def __init__(self, *, enable_llm_enrichment: bool = False) -> None:
+        self.enable_llm_enrichment = enable_llm_enrichment
+
     async def run(
         self,
         uploaded_file_path: str,
@@ -1050,20 +1388,27 @@ class DataPreparationAgent:
         )
 
         profile = _profile_dataset(df, business_description)
-        raw_plan, plan_source, planning_warnings = (
-            await _plan_with_provider_or_fallback(profile)
-        )
+        if self.enable_llm_enrichment:
+            raw_plan, plan_source, planning_warnings = (
+                await _plan_with_optional_enrichment(profile)
+            )
+        else:
+            raw_plan = _deterministic_plan(profile)
+            plan_source = "deterministic"
+            planning_warnings = []
 
         try:
             plan, validation_warnings, rejected = _validate_plan(raw_plan, profile)
         except Exception as exc:
-            planning_warnings.append(f"Plan validation failed; fallback plan used: {exc}")
-            raw_plan = _fallback_plan(profile, "Plan validation failed; deterministic fallback was used.")
+            planning_warnings.append(
+                f"Plan enrichment validation failed; deterministic plan retained: {exc}"
+            )
+            raw_plan = _deterministic_plan(profile)
             plan, validation_warnings, rejected = _validate_plan(raw_plan, profile)
-            plan_source = "fallback"
+            plan_source = "deterministic"
 
-        if plan_source == "fallback":
-            logger.info("Data preparation using fallback plan session_id=%s", session_id)
+        if plan_source == "deterministic":
+            logger.info("Data preparation using deterministic plan session_id=%s", session_id)
         else:
             logger.info(
                 "Data preparation using %s plan session_id=%s",
@@ -1098,6 +1443,7 @@ class DataPreparationAgent:
             file_name=str(file_name or Path(uploaded_file_path).name),
             temporal_dataset_path=temporal_path,
             dataset_profile=prepared_profile,
+            currency=prepared_profile.currency,
             semantic_column_map=semantic_map,
             date_column=plan.date_column,
             primary_measures=plan.primary_measures,
@@ -1177,12 +1523,20 @@ async def data_preparation_node(state: dict[str, Any]) -> dict[str, Any]:
         output_dir=Path(working_directory),
     )
 
+    prepared_dataset = result.model_dump(mode="json")
+    dataset_id = str(state.get("dataset_id") or state.get("datasetId") or "").strip()
+    if dataset_id:
+        prepared_dataset["dataset_id"] = dataset_id
+    source_datasets = state.get("source_datasets")
+    if isinstance(source_datasets, list):
+        prepared_dataset["source_datasets"] = source_datasets
+
     return {
         "generic_cleaned_file_path": result.cleaning_report.cleaned_file_path,
         "prepared_file_path": result.prepared_file_path,
         "prepared_temporal_file_path": result.temporal_dataset_path,
         "generic_cleaning_report": result.cleaning_report.model_dump(mode="json"),
-        "prepared_dataset": result.model_dump(mode="json"),
+        "prepared_dataset": prepared_dataset,
         "warnings": result.warnings,
         "completed_agents": ["data_preparation"],
     }

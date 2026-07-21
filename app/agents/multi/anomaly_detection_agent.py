@@ -132,7 +132,7 @@ def _fallback(prepared: dict[str, Any], df: pd.DataFrame) -> AnomalyPlan:
         definition = AnomalyDefinition(id=f"{granularity}_{_slug(measures[0])}_rolling", measure=measures[0], method="rolling_deviation", aggregation=aggregation_for_measure(measures[0]), date_column=date, granularity=granularity)
     else:
         definition = AnomalyDefinition(id=f"{_slug(measures[0])}_iqr", measure=measures[0], method="iqr")
-    return AnomalyPlan(analyses=[definition], limitations=["Deterministic planning was used because LLM planning was unavailable or invalid."])
+    return AnomalyPlan(analyses=[definition], limitations=["Anomaly - Deterministic planning was used because LLM planning was unavailable or invalid."])
 
 
 def _ensure_primary_temporal_analysis(

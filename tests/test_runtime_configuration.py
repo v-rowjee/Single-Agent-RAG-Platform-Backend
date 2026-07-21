@@ -6,6 +6,7 @@ import pytest
 import toons
 
 import app.core.prompts as prompt_module
+from app.agents.multi.data_preparation_agent import PreparationPlan
 from app.core.config import (
     CONFIG_PATH,
     RAG_CONFIG_PATH,
@@ -50,6 +51,7 @@ def test_checked_in_configuration_uses_the_aligned_agent_models() -> None:
         "chat": ("groq", "openai/gpt-oss-120b"),
     }
     assert config.forecasting.model == "amazon/chronos-2"
+    assert config.agents["data_preparation"].strict_json_schema is False
     assert config.agents["chat"].timeout_seconds == 25
     assert config.agents["anomaly_detection"].supports_response_format is True
     assert config.agents["insight_synthesis"].supports_response_format is False
@@ -187,6 +189,7 @@ def test_prompt_bundles_validate_and_render_structured_toon() -> None:
         supported_operations=["preserve_missing"],
         supported_formulas=["quantity_times_unit_price"],
         profile={"row_count": 12, "columns": ["date", "revenue"]},
+        output_schema=PreparationPlan.model_json_schema(mode="serialization"),
     )
 
     system = toons.loads(prompts.system, strict=True)
@@ -200,6 +203,7 @@ def test_prompt_bundles_validate_and_render_structured_toon() -> None:
             "multi/data_preparation",
             supported_operations=["preserve_missing"],
             profile={},
+            output_schema=PreparationPlan.model_json_schema(mode="serialization"),
         )
 
 

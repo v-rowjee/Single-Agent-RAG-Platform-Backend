@@ -179,14 +179,19 @@ def test_mixed_schema_batch_creates_one_workspace_and_uses_every_dataset() -> No
         rag=rag,
     )
     analyzed: list[str] = []
+    analysis_sources: list[list[str]] = []
 
     async def run_dataset(
         self: BusinessIntelligenceService,
         dataset: DatasetRecord,
         content: bytes | None = None,
         workspace_session_id: str | None = None,
+        workspace_datasets: list[DatasetRecord] | None = None,
     ) -> PipelineExecution:
         analyzed.append(dataset.id)
+        analysis_sources.append(
+            [item.file_name for item in workspace_datasets or [dataset]]
+        )
         info = self._inspect_file(dataset.file_name, content or b"")
         response = DashboardResponse.model_validate(
             self._build_placeholder_dashboard(dataset, info)
@@ -216,7 +221,8 @@ def test_mixed_schema_batch_creates_one_workspace_and_uses_every_dataset() -> No
     )
 
     assert len(response["datasetIds"]) == 2
-    assert set(analyzed) == set(response["datasetIds"])
+    assert analyzed == [response["sessionId"]]
+    assert analysis_sources == [["sales.csv", "inventory.csv"]]
     assert len(storage.files) == 2
     assert all(
         f"/{dataset_id}/" in path
@@ -239,13 +245,23 @@ def test_mixed_schema_batch_creates_one_workspace_and_uses_every_dataset() -> No
         "sales.csv",
         "inventory.csv",
     ]
+    kpis = storage.dashboard["response"]["dashboard"]["kpis"]
+    assert len(kpis) == 4
+    assert next(kpi for kpi in kpis if kpi["id"] == "dataset_rows")["rawValue"] == 2
     assert rag.indexed is not None
     documents = rag.indexed["retrieval_documents"]
-    assert {document["metadata"]["file_name"] for document in documents} == {
+    assert {
+        file_name
+        for document in documents
+        for file_name in document["metadata"]["file_names"]
+    } == {
         "sales.csv",
         "inventory.csv",
     }
-    assert len({document["id"] for document in documents}) == 2
+    assert {document["metadata"]["dataset_id"] for document in documents} == {
+        response["datasetIds"][0]
+    }
+    assert len({document["id"] for document in documents}) == 1
 
     first_preview = service.get_dataset_preview(
         USER_ID,
@@ -383,6 +399,7 @@ def test_active_workspace_can_add_and_remove_individual_datasets() -> None:
         dataset: DatasetRecord,
         content: bytes | None = None,
         workspace_session_id: str | None = None,
+        workspace_datasets: list[DatasetRecord] | None = None,
     ) -> PipelineExecution:
         analyzed.append(dataset.file_name)
         response = DashboardResponse.model_validate(
@@ -415,7 +432,7 @@ def test_active_workspace_can_add_and_remove_individual_datasets() -> None:
 
     assert added["sessionId"] == initial["sessionId"]
     assert len(added["datasetIds"]) == 1
-    assert analyzed == ["sales.csv", "inventory.csv"]
+    assert analyzed == ["all_uploaded_datasets.csv"]
     assert {
         item["fileName"]
         for item in service.get_active_dataset_details(USER_ID)["datasets"]

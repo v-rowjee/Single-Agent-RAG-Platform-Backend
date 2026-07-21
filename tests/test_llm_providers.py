@@ -15,6 +15,7 @@ from app.core.llm import (
     create_chat_model,
     request_structured,
 )
+from app.agents.multi.data_preparation_agent import PreparationPlan
 
 
 class StructuredAnswer(BaseModel):
@@ -83,6 +84,75 @@ def test_groq_structured_requests_keep_the_existing_request_shape(
     schema = request["response_format"]["json_schema"]["schema"]
     assert schema["required"] == ["answer"]
     assert schema["additionalProperties"] is False
+
+
+def test_data_preparation_strict_schema_has_one_numeric_value_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class Completions:
+        async def create(self, **request: Any) -> Any:
+            captured["request"] = request
+            return _completion("{}")
+
+    class FakeAsyncGroq:
+        def __init__(self, **kwargs: Any) -> None:
+            self.chat = SimpleNamespace(completions=Completions())
+
+    monkeypatch.setenv("GROQ_API_KEY", "groq-secret")
+    monkeypatch.setattr(llm_module, "AsyncGroq", FakeAsyncGroq)
+
+    result = asyncio.run(
+        request_structured(
+            policy=_policy("groq"),
+            response_model=PreparationPlan,
+            schema_name="data_preparation_plan",
+            messages=[{"role": "user", "content": "Return a plan"}],
+        )
+    )
+
+    assert result == PreparationPlan()
+    schema = captured["request"]["response_format"]["json_schema"]["schema"]
+    value_schema = schema["$defs"]["PreparationTransformation"]["properties"]["value"]
+    assert {item["type"] for item in value_schema["anyOf"]} == {
+        "string",
+        "number",
+        "boolean",
+        "null",
+    }
+
+
+def test_non_strict_data_preparation_accepts_omitted_defaulted_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class Completions:
+        async def create(self, **request: Any) -> Any:
+            captured["request"] = request
+            return _completion('{"primary_measures":["revenue"]}')
+
+    class FakeAsyncGroq:
+        def __init__(self, **kwargs: Any) -> None:
+            self.chat = SimpleNamespace(completions=Completions())
+
+    monkeypatch.setenv("GROQ_API_KEY", "groq-secret")
+    monkeypatch.setattr(llm_module, "AsyncGroq", FakeAsyncGroq)
+
+    result = asyncio.run(
+        request_structured(
+            policy=_policy("groq", strict_json_schema=False),
+            response_model=PreparationPlan,
+            schema_name="data_preparation_plan",
+            messages=[{"role": "user", "content": "Return a plan"}],
+        )
+    )
+
+    assert result.primary_measures == ["revenue"]
+    assert result.capability_flags.supports_kpis is False
+    assert result.limitations == []
+    assert captured["request"]["response_format"] == {"type": "json_object"}
 
 
 def test_openrouter_uses_its_endpoint_and_normalized_reasoning(

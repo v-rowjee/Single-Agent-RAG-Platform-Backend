@@ -12,7 +12,7 @@ model = "openai/gpt-oss-20b"
 temperature = 0.1
 max_completion_tokens = 800
 reasoning_effort = "low"
-strict_json_schema = true
+strict_json_schema = false
 
 [agents.orchestrator]
 provider = "groq"

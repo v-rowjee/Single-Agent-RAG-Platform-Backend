@@ -18,6 +18,7 @@ from app.services.series import (
     value_format_for_measure,
 )
 from app.core.config import agent_model_policy
+from app.core.currency import format_currency
 from app.core.llm import request_structured
 from app.core.prompts import render_agent_prompts
 from app.schemas.business_intelligence import DashboardResponse
@@ -511,7 +512,8 @@ def _format_kpi(
         return str(value)
     value_format = value_format_for_measure(measure, prepared)
     if value_format == "currency":
-        return f"£{float(value):,.2f}"
+        currency = (prepared.get("dataset_profile") or {}).get("currency")
+        return format_currency(float(value), currency)
     if value_format == "percentage":
         return f"{float(value):,.2f}%"
     return f"{float(value):,.2f}"
@@ -982,7 +984,10 @@ def _build_dashboard(
             "title": str(trend.get("title") or trend["id"]),
             "subtitle": None,
             "granularity": trend.get("granularity", "month"),
-            "unit": trend.get("measure"),
+            "unit": (
+                (prepared.get("dataset_profile") or {}).get("currency")
+                or trend.get("measure")
+            ),
             "valueFormat": value_format_for_measure(
                 str(trend.get("measure") or ""),
                 prepared,

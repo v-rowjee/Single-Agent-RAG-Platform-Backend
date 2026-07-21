@@ -198,7 +198,11 @@ def test_multi_retrieval_preparation_includes_prepared_row_evidence(
             prepared_dataset={
                 "prepared_file_path": str(prepared_path),
                 "file_name": "sales.csv",
-                "dataset_profile": {"row_count": 2, "column_count": 3},
+                "dataset_profile": {
+                    "row_count": 2,
+                    "column_count": 3,
+                    "currency": "GBP",
+                },
                 "primary_measures": ["revenue"],
                 "dimension_candidates": ["transaction_id", "region"],
                 "date_column": None,
@@ -218,6 +222,13 @@ def test_multi_retrieval_preparation_includes_prepared_row_evidence(
     assert row_documents
     assert "TX-001" in "\n".join(document.content for document in row_documents)
     assert "TX-002" in "\n".join(document.content for document in row_documents)
+    summary = next(
+        document
+        for document in result.documents
+        if document.document_type == "dataset_summary"
+    )
+    assert "Currency: GBP" in summary.content
+    assert summary.metadata["currency"] == "GBP"
 
 
 def test_multi_retrieval_preparation_indexes_dashboard_recommendations() -> None:

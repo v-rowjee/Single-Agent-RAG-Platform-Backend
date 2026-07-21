@@ -43,11 +43,29 @@ def _analytics(tmp_path: Path) -> DeterministicAnalytics:
     )
 
 
+def _gbp_analytics(tmp_path: Path) -> DeterministicAnalytics:
+    data_path = tmp_path / "sales_gbp.csv"
+    pd.DataFrame(
+        {
+            "Year": [2021, 2022, 2023, 2024],
+            "Revenue_GBP": [100, 110, 120, 130],
+        }
+    ).to_csv(data_path, index=False)
+    return DeterministicAnalytics(
+        BusinessIntelligenceAgentInput(
+            sessionId="gbp-session",
+            filePath=str(data_path),
+            fileName=data_path.name,
+        ),
+        {"summary": {"measures": ["Revenue_GBP"], "dimensions": [], "timeField": "Year"}},
+    )
+
+
 def test_total_revenue_is_derived_from_price_and_volume(tmp_path: Path) -> None:
     result = _analytics(tmp_path).calculate("What is total revenue?")
 
     assert result is not None
-    assert "Sum Revenue: 16,420.00" in result.text
+    assert "Sum Revenue: $16,420.00" in result.text
     assert "Price_USD, Sales_Volume" in result.text
     assert result.direct_answer is not None
     assert "Revenue` derived as `Price_USD` × `Sales_Volume`" in result.direct_answer
@@ -57,7 +75,7 @@ def test_best_product_defaults_to_revenue_performance(tmp_path: Path) -> None:
     result = _analytics(tmp_path).calculate("Which product performed best?")
 
     assert result is not None
-    assert "Top Revenue by Product: Premium: 10,950.00" in result.text
+    assert "Top Revenue by Product: Premium: $10,950.00" in result.text
     assert result.direct_answer is not None
     assert "`Product`" in result.direct_answer
 
@@ -70,6 +88,14 @@ def test_generic_forecast_question_forecasts_next_year_revenue(tmp_path: Path) -
     assert "linear trend on annual totals from 2021 to 2024" in result.text
     assert result.direct_answer is not None
     assert "`Year` from 2021 to 2024" in result.direct_answer
+
+
+def test_forecast_uses_the_uploaded_dataset_currency(tmp_path: Path) -> None:
+    result = _gbp_analytics(tmp_path).calculate("What is the revenue forecast?")
+
+    assert result is not None
+    assert "£140.00" in result.text
+    assert "$140.00" not in result.text
 
 
 def test_best_product_is_routed_to_deterministic_calculation() -> None:

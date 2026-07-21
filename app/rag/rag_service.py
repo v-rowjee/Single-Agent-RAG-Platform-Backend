@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from app.core.config import get_rag_config
+from app.core.currency import detect_currency, format_currency
 from app.rag.document_builder import DatasetDocumentBuilder
 from app.rag.embedding_service import get_embedding_service
 from app.rag.models import CalculatedEvidence, IndexStatus, QueryType, RagDocument, RerankedDocument, RetrievedDocument
@@ -592,6 +593,7 @@ class DeterministicAnalytics:
         self.profile = profile
         self.df = load_dataframe(agent_input.filePath)
         self.summary = profile.get("summary", {})
+        self.currency = self._detect_currency()
         self.date_field = self._date_field()
         self.measures = self._measures()
         self.dimensions = self._dimensions()
@@ -648,11 +650,11 @@ class DeterministicAnalytics:
             measure_label = self._measure_label(measure)
             text = (
                 f"Calculated evidence:\n"
-                f"{label} {measure_label}{filter_text}: {self._number(value)}.\n"
+                f"{label} {measure_label}{filter_text}: {self._format_value(measure, value)}.\n"
                 f"Source fields: {self._source_fields([*self._measure_source_fields(measure), *filters.keys()])}."
             )
             direct = (
-                f"**Answer:** {label} `{measure_label}`{filter_text} is **{self._number(value)}**.\n\n"
+                f"**Answer:** {label} `{measure_label}`{filter_text} is **{self._format_value(measure, value)}**.\n\n"
                 f"**Grounding:** Calculated from {self._measure_grounding(measure)}"
                 f"{self._fields_suffix(filters)} in dataset `{self.agent_input.fileName}`."
             )
@@ -683,7 +685,10 @@ class DeterministicAnalytics:
             else:
                 selected = grouped.head(10)
                 item_label = "Grouped"
-            values = "; ".join(f"{label}: {self._number(value)}" for label, value in selected.items())
+            values = "; ".join(
+                f"{label}: {self._format_value(measure, value)}"
+                for label, value in selected.items()
+            )
             filter_text = self._filter_text(filters)
             measure_label = self._measure_label(measure)
             text = (
@@ -994,6 +999,27 @@ class DeterministicAnalytics:
             term in self._normalised_name(measure) for term in REVENUE_COLUMN_TERMS
         )
 
+    def _detect_currency(self) -> str | None:
+        return detect_currency([
+            *self.df.columns,
+            *self.summary.get("measures", []),
+            *self.summary.get("dimensions", []),
+        ])
+
+    def _format_value(self, measure: str, value: float) -> str:
+        if self._is_currency_measure(measure):
+            return self._currency(float(value))
+        return self._number(value)
+
+    def _is_currency_measure(self, measure: str) -> bool:
+        lowered = measure.casefold()
+        return self._is_revenue_measure(measure) or bool(
+            detect_currency([measure])
+        ) or any(
+            term in lowered
+            for term in ("amount", "cost", "price", "profit", "sales", "turnover")
+        )
+
     def _forecast_time_column(self) -> str | None:
         if self.date_field and self.date_field in self.df.columns:
             return self.date_field
@@ -1062,9 +1088,8 @@ class DeterministicAnalytics:
             return str(value)
         return f"{number:,.2f}" if math.isfinite(number) else str(value)
 
-    @classmethod
-    def _currency(cls, value: float) -> str:
-        return f"${value:,.2f}"
+    def _currency(self, value: float) -> str:
+        return format_currency(value, self.currency)
 
 
 def load_dataframe(file_path: str) -> pd.DataFrame:

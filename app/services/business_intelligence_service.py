@@ -7,7 +7,7 @@ import math
 import re
 import tempfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Literal
@@ -738,6 +738,11 @@ class BusinessIntelligenceService:
         ]
         if not documents:
             raise ValueError("The saved dashboard contains no retrieval evidence.")
+        documents = self._workspace_retrieval_documents(
+            session,
+            datasets,
+            documents,
+        )
 
         workflow = {
             "session_id": session.id,
@@ -777,29 +782,50 @@ class BusinessIntelligenceService:
         if len(datasets) != len(contents) or not datasets:
             raise ValueError("Every workspace dataset requires source content.")
 
-        executions: list[PipelineExecution] = []
-        for dataset, content in zip(datasets, contents, strict=True):
-            if self.settings.bi_pipeline_mode == "multi":
+        workspace_dataset, workspace_content = self._workspace_analysis_input(
+            session,
+            datasets,
+            contents,
+        )
+        if self.settings.bi_pipeline_mode == "multi":
+            try:
+                execution = await self._run_multi_agent_pipeline(
+                    workspace_dataset,
+                    workspace_content,
+                    workspace_session_id=session.id,
+                    workspace_datasets=datasets,
+                )
+            except TypeError as error:
+                # Keep pre-workspace extensions and test doubles compatible.
+                if "unexpected keyword argument" not in str(error):
+                    raise
                 try:
                     execution = await self._run_multi_agent_pipeline(
-                        dataset,
-                        content,
+                        workspace_dataset,
+                        workspace_content,
                         workspace_session_id=session.id,
                     )
-                except TypeError as error:
-                    if "workspace_session_id" not in str(error):
+                except TypeError as fallback_error:
+                    if "unexpected keyword argument" not in str(fallback_error):
                         raise
                     execution = await self._run_multi_agent_pipeline(
-                        dataset,
-                        content,
+                        workspace_dataset,
+                        workspace_content,
                     )
-            else:
-                execution = await self._run_single_agent_pipeline(dataset, content)
-            if isinstance(execution, DashboardResponse):
-                execution = PipelineExecution(response=execution)
-            executions.append(execution)
+        else:
+            execution = await self._run_single_agent_pipeline(
+                workspace_dataset,
+                workspace_content,
+            )
+        if isinstance(execution, DashboardResponse):
+            execution = PipelineExecution(response=execution)
 
-        combined = self._combine_workspace_executions(session, datasets, executions)
+        combined = self._combine_workspace_executions(
+            session,
+            datasets,
+            [execution],
+            contents,
+        )
         return self._persist_workspace_execution(
             session=session,
             datasets=datasets,
@@ -808,12 +834,104 @@ class BusinessIntelligenceService:
             background_tasks=background_tasks,
         )
 
+    def _workspace_analysis_input(
+        self,
+        session: AnalysisSessionRecord,
+        datasets: list[DatasetRecord],
+        contents: list[bytes],
+    ) -> tuple[DatasetRecord, bytes]:
+        """Create one canonical source file for workspace-level analysis.
+
+        Individual files remain persisted and previewable.  The analysis agents,
+        however, receive every row in one source so KPI and trend calculations
+        run once across the workspace rather than once per dataset.
+        """
+        if len(datasets) == 1:
+            return datasets[0], contents[0]
+
+        frames: list[pd.DataFrame] = []
+        source_column = "__workspace_source_dataset__"
+        for dataset, content in zip(datasets, contents, strict=True):
+            frame = self._read_workspace_dataframe(dataset.file_name, content)
+            frames.append(frame)
+
+        existing_columns = {
+            str(column)
+            for frame in frames
+            for column in frame.columns
+        }
+        while source_column in existing_columns:
+            source_column = f"_{source_column}_"
+
+        for dataset, frame in zip(datasets, frames, strict=True):
+            frame[source_column] = dataset.file_name
+
+        combined = pd.concat(frames, ignore_index=True, sort=False)
+        content = combined.to_csv(index=False).encode("utf-8")
+        description = (
+            f"Workspace analysis across {len(datasets)} datasets: "
+            + ", ".join(dataset.file_name for dataset in datasets)
+        )
+        return (
+            replace(
+                datasets[0],
+                id=session.id,
+                file_name="all_uploaded_datasets.csv",
+                file_size=len(content),
+                file_hash=hashlib.sha256(content).hexdigest(),
+                description=description,
+            ),
+            content,
+        )
+
+    @staticmethod
+    def _read_workspace_dataframe(file_name: str, content: bytes) -> pd.DataFrame:
+        suffix = Path(file_name).suffix.lower()
+        try:
+            if suffix == ".csv":
+                frame = pd.read_csv(io.BytesIO(content), low_memory=False)
+            elif suffix == ".xlsx":
+                frame = pd.read_excel(io.BytesIO(content))
+            else:
+                raise InvalidUploadError("Only CSV and XLSX files are supported.")
+        except UnicodeDecodeError as error:
+            raise InvalidUploadError("The CSV file must use UTF-8 encoding.") from error
+        except InvalidUploadError:
+            raise
+        except Exception as error:
+            raise InvalidUploadError("The uploaded dataset could not be parsed.") from error
+
+        # Align equivalent headers (for example `Revenue` and `revenue`) before
+        # concatenation.  The generic cleaner applies the same convention later.
+        counts: dict[str, int] = {}
+        columns: list[str] = []
+        for index, column in enumerate(frame.columns, start=1):
+            base = re.sub(r"[^a-z0-9]+", "_", str(column).strip().lower()).strip("_")
+            base = base or f"unnamed_{index}"
+            occurrence = counts.get(base, 0)
+            columns.append(base if occurrence == 0 else f"{base}_{occurrence + 1}")
+            counts[base] = occurrence + 1
+        frame.columns = columns
+        return frame
+
     def _combine_workspace_executions(
         self,
         session: AnalysisSessionRecord,
         datasets: list[DatasetRecord],
         executions: list[PipelineExecution],
+        contents: list[bytes] | None = None,
     ) -> PipelineExecution:
+        if (
+            len(executions) == 1
+            and executions[0].response.status != "failed"
+            and executions[0].response.dashboard is not None
+        ):
+            return self._with_workspace_dataset_summaries(
+                session,
+                datasets,
+                contents or [],
+                executions[0],
+            )
         if any(execution.response.status == "failed" for execution in executions):
             return PipelineExecution(
                 response=self._with_dashboard_model_metadata(
@@ -1005,6 +1123,106 @@ class BusinessIntelligenceService:
             retrieval_documents=retrieval_documents,
         )
 
+    def _with_workspace_dataset_summaries(
+        self,
+        session: AnalysisSessionRecord,
+        datasets: list[DatasetRecord],
+        contents: list[bytes],
+        execution: PipelineExecution,
+    ) -> PipelineExecution:
+        """Keep source-file metadata while preserving the one merged analysis."""
+        payload = execution.response.model_dump(mode="json")
+        dashboard = dict(payload["dashboard"] or {})
+        summaries: list[dict[str, Any]] = []
+        for index, dataset in enumerate(datasets):
+            info = (
+                self._inspect_file(dataset.file_name, contents[index])
+                if index < len(contents)
+                else {
+                    "rowCount": dataset.row_count or 0,
+                    "columnCount": dataset.column_count or 0,
+                    "measures": [],
+                    "dimensions": [],
+                    "completenessPercent": 100.0,
+                    "missingValueCount": 0,
+                    "duplicateRowCount": 0,
+                }
+            )
+            summaries.append(
+                {
+                    "datasetId": dataset.id,
+                    "fileName": dataset.file_name,
+                    "rowCount": int(info["rowCount"]),
+                    "columnCount": int(info["columnCount"]),
+                    "timeField": None,
+                    "period": None,
+                    "measures": list(info["measures"]),
+                    "dimensions": list(info["dimensions"]),
+                    "quality": {
+                        "completenessPercent": float(info["completenessPercent"]),
+                        "missingValueCount": int(info["missingValueCount"]),
+                        "duplicateRowCount": int(info["duplicateRowCount"]),
+                    },
+                    "generatedAt": self._current_timestamp(),
+                }
+            )
+        dashboard["datasetSummaries"] = summaries
+        if len(datasets) > 1:
+            dashboard["title"] = "Multi-Dataset Business Intelligence Dashboard"
+        payload["sessionId"] = session.id
+        payload["dashboard"] = dashboard
+
+        retrieval_documents = self._workspace_retrieval_documents(
+            session,
+            datasets,
+            execution.retrieval_documents or [],
+        )
+
+        workflow = dict(execution.workflow or {})
+        workflow.update(
+            {
+                "session_id": session.id,
+                "dataset_ids": [dataset.id for dataset in datasets],
+                "source_datasets": [
+                    {"dataset_id": dataset.id, "file_name": dataset.file_name}
+                    for dataset in datasets
+                ],
+            }
+        )
+        return PipelineExecution(
+            response=DashboardResponse.model_validate(payload),
+            workflow=workflow,
+            retrieval_documents=retrieval_documents,
+        )
+
+    @staticmethod
+    def _workspace_retrieval_documents(
+        session: AnalysisSessionRecord,
+        datasets: list[DatasetRecord],
+        retrieval_documents: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Attach the session-wide evidence to a valid dataset foreign key."""
+        primary_dataset_id = datasets[0].id
+        output: list[dict[str, Any]] = []
+        for document in retrieval_documents:
+            item = dict(document)
+            metadata = dict(item.get("metadata") or {})
+            metadata.update(
+                {
+                    "session_id": session.id,
+                    # `document_chunks.dataset_id` is a foreign key.  The
+                    # aggregate evidence represents the whole workspace, but
+                    # must still point to one persisted source dataset.
+                    "dataset_id": primary_dataset_id,
+                    "file_name": "all_uploaded_datasets.csv",
+                    "dataset_ids": [dataset.id for dataset in datasets],
+                    "file_names": [dataset.file_name for dataset in datasets],
+                }
+            )
+            item["metadata"] = metadata
+            output.append(item)
+        return output
+
     @staticmethod
     def _combined_agent_models(
         executions: list[PipelineExecution],
@@ -1073,6 +1291,7 @@ class BusinessIntelligenceService:
         session: DatasetRecord,
         content: bytes | None = None,
         workspace_session_id: str | None = None,
+        workspace_datasets: list[DatasetRecord] | None = None,
     ) -> PipelineExecution:
         """Run the compiled workflow and return its dashboard and durable artifacts."""
         session_id = workspace_session_id or session.session_id or session.id
@@ -1091,6 +1310,15 @@ class BusinessIntelligenceService:
                 "dataset_id": session.id,
                 "file_name": session.file_name,
                 "business_description": session.description,
+                "source_datasets": [
+                    {
+                        "dataset_id": dataset.id,
+                        "file_name": dataset.file_name,
+                        "row_count": dataset.row_count,
+                        "column_count": dataset.column_count,
+                    }
+                    for dataset in (workspace_datasets or [session])
+                ],
                 "uploaded_file_path": agent_input.filePath,
                 "working_directory": str(workspace),
                 "warnings": [],
