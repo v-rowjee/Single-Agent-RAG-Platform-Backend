@@ -84,7 +84,7 @@ def multi_dashboard_model_usage(
                 {
                     "agent": _MULTI_AGENT_LABELS[agent],
                     "model": runtime.forecasting.model,
-                    "provider": "local",
+                    "provider": "engine",
                 }
             )
             continue

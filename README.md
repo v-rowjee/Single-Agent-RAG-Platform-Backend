@@ -52,7 +52,7 @@ serializes its structured system and user context as TOON before invocation.
 Mode and model settings are deliberately not read from `.env`.
 The multi-agent chat response has a 25-second generation limit. If it expires,
 the API returns already-retrieved recommendation evidence when available.
-The `[forecasting]` table configures the TimesFM model and its limits.
+The `[forecasting]` table configures the Chronos-2 model and its limits.
 Keep API keys, Supabase credentials, and other secrets in `.env` only.
 
 ## Model alignment
@@ -65,7 +65,7 @@ The checked-in multi-agent workflow mixes providers by workload:
 | Orchestrator | `groq/compound` | Groq |
 | KPI and trend analysis | `openai/gpt-oss-120b` | Groq |
 | Anomaly detection | `nvidia/nemotron-3-super-120b-a12b:free` | OpenRouter |
-| Forecasting | `google/timesfm-2.5-200m-pytorch` | Self-hosted |
+| Forecasting | `amazon/chronos-2` | Self-hosted |
 | Insight synthesis | `nvidia/nemotron-3-ultra-550b-a55b:free` | OpenRouter |
 | Dashboard generation | `poolside/laguna-xs-2.1:free` | OpenRouter |
 | Retrieval embedding | `BAAI/bge-small-en-v1.5` | Self-hosted |

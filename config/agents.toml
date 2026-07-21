@@ -2,7 +2,7 @@
 mode = "multi"
 
 [forecasting]
-model = "google/timesfm-2.5-200m-pytorch"
+model = "amazon/chronos-2"
 max_context = 1024
 max_horizon = 256
 

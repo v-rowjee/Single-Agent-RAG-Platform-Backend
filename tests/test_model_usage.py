@@ -31,5 +31,5 @@ def test_multi_dashboard_usage_lists_only_selected_specialists() -> None:
         "groq/compound",
         "nvidia/nemotron-3-ultra-550b-a55b:free",
         "poolside/laguna-xs-2.1:free",
-        "google/timesfm-2.5-200m-pytorch",
+        "amazon/chronos-2",
     }

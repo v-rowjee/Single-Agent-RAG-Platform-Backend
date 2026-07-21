@@ -174,9 +174,9 @@ def test_forecast_falls_back_and_keeps_primary_timeline_target(
     prepared = _prepared(path)
 
     async def unavailable(*_: Any, **__: Any):
-        raise RuntimeError("TimesFM offline")
+        raise RuntimeError("Chronos-2 offline")
 
-    monkeypatch.setattr(forecasting_module.timesfm_service, "forecast", unavailable)
+    monkeypatch.setattr(forecasting_module.chronos_service, "forecast", unavailable)
     result = asyncio.run(ForecastingAgent().run(prepared))
 
     assert result.measure == "net_revenue_gbp"

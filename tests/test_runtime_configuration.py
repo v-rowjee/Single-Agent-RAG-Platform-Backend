@@ -49,7 +49,7 @@ def test_checked_in_configuration_uses_the_aligned_agent_models() -> None:
         ),
         "chat": ("groq", "openai/gpt-oss-120b"),
     }
-    assert config.forecasting.model == "google/timesfm-2.5-200m-pytorch"
+    assert config.forecasting.model == "amazon/chronos-2"
     assert config.agents["chat"].timeout_seconds == 25
     assert config.agents["anomaly_detection"].supports_response_format is True
     assert config.agents["insight_synthesis"].supports_response_format is False

@@ -7,7 +7,7 @@ messages:
       agent_roles:
         kpi_trend: Calculate grounded KPIs and temporal trends.
         anomaly_detection: Identify statistically unusual observations or periods.
-        forecasting: Produce numerical future estimates with TimesFM.
+        forecasting: Produce numerical future estimates with Chronos-2.
       restrictions[5]: "select only agents listed as eligible","never invent capabilities","do not use external sources","do not calculate business results","return JSON only"
       output:
         format: JSON object
