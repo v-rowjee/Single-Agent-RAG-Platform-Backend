@@ -16,6 +16,7 @@ class ModelUsage(TypedDict):
     model: str
     provider: str
     executionStatus: NotRequired[Literal["succeeded", "fallback", "configured"]]
+    failureReason: NotRequired[str]
 
 
 _MULTI_AGENT_LABELS = {
@@ -43,15 +44,20 @@ ModelExecutionStatus = Literal["succeeded", "fallback", "configured"]
 def agent_model_usage(
     agent: str,
     execution_status: ModelExecutionStatus,
+    *,
+    failure_reason: str | None = None,
 ) -> ModelUsage:
     """Build safe execution metadata for one configured agent."""
     policy = get_runtime_config().agents[_MULTI_POLICY_KEYS[agent]]
-    return {
+    usage: ModelUsage = {
         "agent": _MULTI_AGENT_LABELS[agent],
         "model": policy.model,
         "provider": policy.provider,
         "executionStatus": execution_status,
     }
+    if failure_reason:
+        usage["failureReason"] = failure_reason
+    return usage
 
 
 def forecasting_model_usage(

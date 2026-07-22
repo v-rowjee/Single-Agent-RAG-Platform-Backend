@@ -37,6 +37,11 @@ class AgentModelUsage(AgentModelMetadata):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    failureReason: str | None = Field(
+        default=None,
+        max_length=300,
+        exclude_if=lambda value: value is None,
+    )
 
 class DashboardResponse(BaseModel):
     status: DashboardStatus

@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.core.config import agent_model_policy
-from app.core.llm import request_structured
+from app.core.llm import request_structured, safe_model_failure_reason
 from app.core.model_policy import ModelExecutionStatus, agent_model_usage
 from app.core.prompt_loader import render_agent_prompts
 from app.schemas.specialists import (
@@ -475,7 +475,7 @@ class InsightSynthesisAgent:
         anomaly_output: dict[str, Any] | None,
         forecasting_output: dict[str, Any] | None,
     ) -> InsightSynthesisOutput:
-        result, _ = await self.run_with_status(
+        result, _, _ = await self.run_with_status(
             prepared_dataset,
             kpi_trend_output,
             anomaly_output,
@@ -489,7 +489,7 @@ class InsightSynthesisAgent:
         kpi_trend_output: dict[str, Any] | None,
         anomaly_output: dict[str, Any] | None,
         forecasting_output: dict[str, Any] | None,
-    ) -> tuple[InsightSynthesisOutput, ModelExecutionStatus]:
+    ) -> tuple[InsightSynthesisOutput, ModelExecutionStatus, str | None]:
         prepared = (
             prepared_dataset if isinstance(prepared_dataset, dict) else {}
         )
@@ -530,6 +530,7 @@ class InsightSynthesisAgent:
                     }
                 ),
                 "succeeded",
+                None,
             )
         except Exception as exc:
             return (
@@ -541,6 +542,7 @@ class InsightSynthesisAgent:
                     f"Deterministic synthesis was used: {exc}",
                 ),
                 "fallback",
+                safe_model_failure_reason(exc),
             )
 
 
@@ -553,7 +555,7 @@ async def insight_synthesis_node(state: dict[str, Any]) -> dict[str, Any]:
         *(prepared.get("warnings") or []),
         *(state.get("warnings") or []),
     ]
-    result, execution_status = await insight_synthesis_agent.run_with_status(
+    result, execution_status, failure_reason = await insight_synthesis_agent.run_with_status(
         prepared,
         state.get("kpi_trend_output"),
         state.get("anomaly_output"),
@@ -563,6 +565,10 @@ async def insight_synthesis_node(state: dict[str, Any]) -> dict[str, Any]:
         "synthesis_output": result.model_dump(mode="json"),
         "completed_agents": ["insight_synthesis"],
         "model_invocations": [
-            agent_model_usage("insight_synthesis", execution_status)
+            agent_model_usage(
+                "insight_synthesis",
+                execution_status,
+                failure_reason=failure_reason,
+            )
         ],
     }

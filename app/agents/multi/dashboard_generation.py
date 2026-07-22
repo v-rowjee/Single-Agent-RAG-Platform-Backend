@@ -11,7 +11,7 @@ import pandas as pd
 
 from app.core.config import agent_model_policy
 from app.core.currency import format_currency
-from app.core.llm import request_structured
+from app.core.llm import request_structured, safe_model_failure_reason
 from app.core.model_policy import ModelExecutionStatus, agent_model_usage
 from app.core.prompt_loader import render_agent_prompts
 from app.schemas.api import DashboardResponse
@@ -1153,7 +1153,7 @@ class DashboardGenerationAgent:
         forecasting_output: dict[str, Any] | None,
         synthesis_output: dict[str, Any],
     ) -> DashboardGenerationOutput:
-        result, _ = await self.run_with_status(
+        result, _, _ = await self.run_with_status(
             prepared_dataset,
             kpi_trend_output,
             anomaly_output,
@@ -1169,7 +1169,7 @@ class DashboardGenerationAgent:
         anomaly_output: dict[str, Any] | None,
         forecasting_output: dict[str, Any] | None,
         synthesis_output: dict[str, Any],
-    ) -> tuple[DashboardGenerationOutput, ModelExecutionStatus]:
+    ) -> tuple[DashboardGenerationOutput, ModelExecutionStatus, str | None]:
         prepared = (
             prepared_dataset if isinstance(prepared_dataset, dict) else {}
         )
@@ -1223,10 +1223,12 @@ class DashboardGenerationAgent:
         try:
             plan = await _request_layout(payload)
             execution_status: ModelExecutionStatus = "succeeded"
+            failure_reason = None
         except Exception as exc:
             plan = fallback
             warning = f"Deterministic dashboard layout was used: {exc}"
             execution_status = "fallback"
+            failure_reason = safe_model_failure_reason(exc)
         plan = _validated_plan(
             plan,
             fallback,
@@ -1260,6 +1262,7 @@ class DashboardGenerationAgent:
                 warnings=[warning] if warning else [],
             ),
             execution_status,
+            failure_reason,
         )
 
 
@@ -1272,7 +1275,7 @@ async def dashboard_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         "session_id",
         prepared.get("session_id", ""),
     )
-    result, execution_status = await dashboard_generation_agent.run_with_status(
+    result, execution_status, failure_reason = await dashboard_generation_agent.run_with_status(
         prepared,
         state.get("kpi_trend_output"),
         state.get("anomaly_output"),
@@ -1284,6 +1287,10 @@ async def dashboard_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         "warnings": result.warnings,
         "completed_agents": ["dashboard_generation"],
         "model_invocations": [
-            agent_model_usage("dashboard_generation", execution_status)
+            agent_model_usage(
+                "dashboard_generation",
+                execution_status,
+                failure_reason=failure_reason,
+            )
         ],
     }

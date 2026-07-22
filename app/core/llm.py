@@ -60,6 +60,28 @@ class InvalidProviderResponse(ValueError):
     """Raised when a successful HTTP response has no usable assistant content."""
 
 
+def safe_model_failure_reason(error: Exception) -> str:
+    """Return a public failure explanation without exposing provider payloads."""
+    if isinstance(error, ProviderRequestError):
+        provider = provider_display_name(error.provider)
+        if error.status_code == 402:
+            return f"{provider} rejected the request because the account has no available paid credit."
+        if error.status_code == 429:
+            return f"{provider} rate-limited the request. Free-tier models can be temporarily unavailable."
+        if error.status_code == 408:
+            return f"{provider} timed out before the model produced a response."
+        if error.status_code is not None and error.status_code >= 500:
+            return f"{provider} was temporarily unavailable (HTTP {error.status_code})."
+        if error.category == "invalid_response":
+            return "The model response did not match the required output format."
+        return f"{provider} could not complete the model request."
+    if isinstance(error, (InvalidProviderResponse, ValidationError)):
+        return "The model response did not match the required output format."
+    if isinstance(error, TimeoutError):
+        return "The model request timed out before a response was received."
+    return "The model request did not produce a usable response."
+
+
 class _ProviderAdapter(ABC):
     provider: AgentProvider
     display_name: str

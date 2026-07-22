@@ -8,7 +8,7 @@ from typing import Any, Literal
 import pandas as pd
 
 from app.core.config import agent_model_policy
-from app.core.llm import request_structured
+from app.core.llm import request_structured, safe_model_failure_reason
 from app.core.model_policy import ModelExecutionStatus, agent_model_usage
 from app.core.prompt_loader import render_agent_prompts
 from app.schemas.specialists import (
@@ -235,13 +235,13 @@ def _detect(item: AnomalyDefinition, values: pd.Series, group: str | None = None
 
 class AnomalyDetectionAgent:
     async def run(self, prepared_dataset: dict[str, Any]) -> AnomalyDetectionOutput:
-        result, _ = await self.run_with_status(prepared_dataset)
+        result, _, _ = await self.run_with_status(prepared_dataset)
         return result
 
     async def run_with_status(
         self,
         prepared_dataset: dict[str, Any],
-    ) -> tuple[AnomalyDetectionOutput, ModelExecutionStatus]:
+    ) -> tuple[AnomalyDetectionOutput, ModelExecutionStatus, str | None]:
         if not isinstance(prepared_dataset, dict):
             raise AnomalyDetectionError("prepared_dataset must be a dictionary.")
         df = pd.read_csv(_path(prepared_dataset), low_memory=False)
@@ -254,6 +254,7 @@ class AnomalyDetectionAgent:
                 raise AnomalyDetectionError("LLM plan has no valid analyses.")
             limitations = proposed.limitations
             execution_status: ModelExecutionStatus = "succeeded"
+            failure_reason = None
         except Exception as exc:
             warnings.append(str(exc))
             fallback = _fallback(prepared_dataset, df)
@@ -261,6 +262,7 @@ class AnomalyDetectionAgent:
             warnings.extend(validation)
             limitations = fallback.limitations
             execution_status = "fallback"
+            failure_reason = safe_model_failure_reason(exc)
         analyses = _ensure_primary_temporal_analysis(
             analyses,
             prepared_dataset,
@@ -281,6 +283,7 @@ class AnomalyDetectionAgent:
                 ],
             ),
             execution_status,
+            failure_reason,
         )
 
 
@@ -289,16 +292,21 @@ anomaly_detection_agent = AnomalyDetectionAgent()
 
 async def anomaly_detection_node(state: dict[str, Any]) -> dict[str, Any]:
     try:
-        result, execution_status = await anomaly_detection_agent.run_with_status(
+        result, execution_status, failure_reason = await anomaly_detection_agent.run_with_status(
             state.get("prepared_dataset", {})
         )
     except AnomalyDetectionError as exc:
         result = AnomalyDetectionOutput(status="partial", limitations=[str(exc)])
         execution_status = "fallback"
+        failure_reason = safe_model_failure_reason(exc)
     return {
         "anomaly_output": result.model_dump(mode="json"),
         "completed_agents": ["anomaly_detection"],
         "model_invocations": [
-            agent_model_usage("anomaly_detection", execution_status)
+            agent_model_usage(
+                "anomaly_detection",
+                execution_status,
+                failure_reason=failure_reason,
+            )
         ],
     }

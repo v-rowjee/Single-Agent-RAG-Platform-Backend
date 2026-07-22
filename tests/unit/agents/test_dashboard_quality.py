@@ -270,7 +270,7 @@ def test_dashboard_has_non_temporal_charts_forecast_and_actions(
         raise RuntimeError("offline test")
 
     monkeypatch.setattr(dashboard_module, "_request_layout", no_layout)
-    result, execution_status = asyncio.run(
+    result, execution_status, failure_reason = asyncio.run(
         DashboardGenerationAgent().run_with_status(
             prepared,
             kpi_output,
@@ -307,6 +307,7 @@ def test_dashboard_has_non_temporal_charts_forecast_and_actions(
     assert len(dashboard.recommendedActions) >= 3
     assert dashboard.executiveSummary == dashboard.analysis.businessSummary
     assert execution_status == "fallback"
+    assert failure_reason == "The model request did not produce a usable response."
 
 
 def test_synthesis_fallback_is_grounded_and_has_three_actions() -> None:
