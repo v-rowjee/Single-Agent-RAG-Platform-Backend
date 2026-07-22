@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .state import BusinessIntelligenceState
+from .state import AnalysisState
 
 
 REGISTERED_SPECIALISTS = {
@@ -18,7 +18,7 @@ SPECIALIST_ORDER = (
 )
 
 
-def route_specialists(state: BusinessIntelligenceState) -> list[str]:
+def route_specialists(state: AnalysisState) -> list[str]:
     """Return selected specialist nodes in their deterministic execution order."""
     plan = state.get("orchestration_plan", {})
     selected_agents = plan.get("selected_agents", []) if isinstance(plan, dict) else []

@@ -3,8 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
 from app.core.config import get_rag_config, get_runtime_config
-from app.core.prompts import validate_prompt_bundles
+from app.core.logging import configure_logging
+from app.core.prompt_loader import validate_prompt_bundles
 
+
+configure_logging()
 
 # Fail at boot rather than during a user request when checked-in assets are invalid.
 get_runtime_config()

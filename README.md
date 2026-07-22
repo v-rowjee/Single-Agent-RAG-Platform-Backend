@@ -6,6 +6,22 @@
 uvicorn app.main:app --reload
 ```
 
+## Architecture
+
+The backend uses explicit dependency boundaries:
+
+```text
+API routes -> business-intelligence application service
+           -> analysis/chat LangGraph workflows
+           -> agents and deterministic data/forecasting services
+           -> persistence repositories and RAG adapters
+```
+
+HTTP models live in `app/schemas`, agent implementations in `app/agents`,
+workflow composition and node adapters in `app/orchestration`, and external
+storage/model integrations in `app/services` and `app/rag`. Tests mirror these
+boundaries under `tests/unit`, `tests/integration`, and `tests/end_to_end`.
+
 Copy `.env.sample` to `.env` and set the Supabase service-role key. In a new
 Supabase project, create a private Storage bucket named `uploads`, then apply
 `scripts/db.sql` once in the SQL editor before starting the API. The script is a
@@ -50,7 +66,7 @@ and reasoning effort for one LLM invocation. Each LLM agent has one versioned
 TOON bundle in `app/prompts/`; the backend validates the bundle at startup and
 serializes its structured system and user context as TOON before invocation.
 Mode and model settings are deliberately not read from `.env`.
-The multi-agent chat response has a 25-second generation limit. If it expires,
+The multi-agent chat response has a 15-second generation limit. If it expires,
 the API returns already-retrieved recommendation evidence when available.
 The `[forecasting]` table configures the Chronos-2 model and its limits.
 Keep API keys, Supabase credentials, and other secrets in `.env` only.

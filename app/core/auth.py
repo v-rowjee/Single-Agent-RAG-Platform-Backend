@@ -11,7 +11,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.core.config import get_settings
-from app.services.supabase_service import supabase_service
+from app.services.persistence.supabase import supabase_gateway
 
 
 logger = logging.getLogger(__name__)
@@ -34,7 +34,7 @@ def _unauthorized() -> HTTPException:
 
 def _claims_from_token(access_token: str) -> dict[str, Any]:
     """Verify a Supabase JWT, including the SDK's legacy-HS256 fallback."""
-    claims_response = supabase_service.client.auth.get_claims(access_token)
+    claims_response = supabase_gateway.client.auth.get_claims(access_token)
     # supabase-py 2.x returns a TypedDict, not an object with a ``claims``
     # attribute. Attribute access therefore returns None even after the JWT
     # has been successfully verified.
