@@ -5,6 +5,7 @@ from typing import Any
 
 from app.core.config import agent_model_policy
 from app.core.llm import request_structured
+from app.core.model_policy import ModelExecutionStatus, agent_model_usage
 from app.core.prompt_loader import render_agent_prompts
 from app.schemas.specialists import (
     EvidenceReference,
@@ -474,6 +475,21 @@ class InsightSynthesisAgent:
         anomaly_output: dict[str, Any] | None,
         forecasting_output: dict[str, Any] | None,
     ) -> InsightSynthesisOutput:
+        result, _ = await self.run_with_status(
+            prepared_dataset,
+            kpi_trend_output,
+            anomaly_output,
+            forecasting_output,
+        )
+        return result
+
+    async def run_with_status(
+        self,
+        prepared_dataset: dict[str, Any],
+        kpi_trend_output: dict[str, Any] | None,
+        anomaly_output: dict[str, Any] | None,
+        forecasting_output: dict[str, Any] | None,
+    ) -> tuple[InsightSynthesisOutput, ModelExecutionStatus]:
         prepared = (
             prepared_dataset if isinstance(prepared_dataset, dict) else {}
         )
@@ -500,25 +516,31 @@ class InsightSynthesisAgent:
                 anomaly_output,
                 forecasting_output,
             )
-            return result.model_copy(
-                update={
-                    "warnings": list(
-                        dict.fromkeys(
-                            [
-                                *(prepared.get("warnings") or []),
-                                *result.warnings,
-                            ]
+            return (
+                result.model_copy(
+                    update={
+                        "warnings": list(
+                            dict.fromkeys(
+                                [
+                                    *(prepared.get("warnings") or []),
+                                    *result.warnings,
+                                ]
+                            )
                         )
-                    )
-                }
+                    }
+                ),
+                "succeeded",
             )
         except Exception as exc:
-            return _fallback(
-                prepared,
-                kpi_trend_output,
-                anomaly_output,
-                forecasting_output,
-                f"Deterministic synthesis was used: {exc}",
+            return (
+                _fallback(
+                    prepared,
+                    kpi_trend_output,
+                    anomaly_output,
+                    forecasting_output,
+                    f"Deterministic synthesis was used: {exc}",
+                ),
+                "fallback",
             )
 
 
@@ -531,7 +553,7 @@ async def insight_synthesis_node(state: dict[str, Any]) -> dict[str, Any]:
         *(prepared.get("warnings") or []),
         *(state.get("warnings") or []),
     ]
-    result = await insight_synthesis_agent.run(
+    result, execution_status = await insight_synthesis_agent.run_with_status(
         prepared,
         state.get("kpi_trend_output"),
         state.get("anomaly_output"),
@@ -540,4 +562,7 @@ async def insight_synthesis_node(state: dict[str, Any]) -> dict[str, Any]:
     return {
         "synthesis_output": result.model_dump(mode="json"),
         "completed_agents": ["insight_synthesis"],
+        "model_invocations": [
+            agent_model_usage("insight_synthesis", execution_status)
+        ],
     }

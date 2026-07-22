@@ -10,6 +10,7 @@ import pandas as pd
 
 from app.core.config import agent_model_policy
 from app.core.llm import request_structured
+from app.core.model_policy import ModelExecutionStatus, agent_model_usage
 from app.core.prompt_loader import render_agent_prompts
 from app.schemas.specialists import (
     KPIDefinition,
@@ -339,23 +340,53 @@ def _calculate_trends(df: pd.DataFrame, plan: KPITrendPlan) -> tuple[list[TrendS
 
 class KPITrendAgent:
     async def run(self, prepared_dataset: dict[str, Any]) -> KPITrendOutput:
-        if not isinstance(prepared_dataset, dict): raise KPITrendError("prepared_dataset must be a dictionary.")
+        result, _ = await self.run_with_status(prepared_dataset)
+        return result
+
+    async def run_with_status(
+        self,
+        prepared_dataset: dict[str, Any],
+    ) -> tuple[KPITrendOutput, ModelExecutionStatus]:
+        if not isinstance(prepared_dataset, dict):
+            raise KPITrendError("prepared_dataset must be a dictionary.")
         df = pd.read_csv(_path(prepared_dataset), low_memory=False)
-        if df.empty: return KPITrendOutput(status="partial", limitations=["Prepared dataset contains no rows."])
+        if df.empty:
+            return (
+                KPITrendOutput(
+                    status="partial",
+                    limitations=["Prepared dataset contains no rows."],
+                ),
+                "configured",
+            )
         warnings: list[str] = []
         try:
             proposed = await _request_plan(prepared_dataset)
             plan, validation_warnings = _valid_plan(proposed, df, prepared_dataset)
             warnings.extend(validation_warnings)
-            if not plan.kpis and not plan.trends: raise KPITrendError("LLM plan has no valid definitions.")
+            if not plan.kpis and not plan.trends:
+                raise KPITrendError("LLM plan has no valid definitions.")
+            execution_status: ModelExecutionStatus = "succeeded"
         except Exception as exc:
             warnings.append(f"{exc}")
             plan = _fallback_plan(prepared_dataset, df)
+            execution_status = "fallback"
         plan = _ensure_core_definitions(plan, prepared_dataset, df)
         kpis = _calculate_kpis(df, plan, prepared_dataset)
         trends, trend_warnings = _calculate_trends(df, plan)
         warnings.extend(trend_warnings)
-        return KPITrendOutput(status="complete" if kpis or trends else "partial", kpis=kpis, trends=trends, warnings=warnings, limitations=[*(prepared_dataset.get("limitations") or []), *plan.limitations])
+        return (
+            KPITrendOutput(
+                status="complete" if kpis or trends else "partial",
+                kpis=kpis,
+                trends=trends,
+                warnings=warnings,
+                limitations=[
+                    *(prepared_dataset.get("limitations") or []),
+                    *plan.limitations,
+                ],
+            ),
+            execution_status,
+        )
 
 
 kpi_trend_agent = KPITrendAgent()
@@ -363,7 +394,16 @@ kpi_trend_agent = KPITrendAgent()
 
 async def kpi_trend_node(state: dict[str, Any]) -> dict[str, Any]:
     try:
-        result = await kpi_trend_agent.run(state.get("prepared_dataset", {}))
+        result, execution_status = await kpi_trend_agent.run_with_status(
+            state.get("prepared_dataset", {})
+        )
     except KPITrendError as exc:
         result = KPITrendOutput(status="partial", limitations=[str(exc)])
-    return {"kpi_trend_output": result.model_dump(mode="json"), "completed_agents": ["kpi_trend"]}
+        execution_status = "fallback"
+    return {
+        "kpi_trend_output": result.model_dump(mode="json"),
+        "completed_agents": ["kpi_trend"],
+        "model_invocations": [
+            agent_model_usage("kpi_trend", execution_status)
+        ],
+    }

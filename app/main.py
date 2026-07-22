@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
 from app.core.config import get_rag_config, get_runtime_config
+from app.core.llm import validate_active_provider_credentials
 from app.core.logging import configure_logging
 from app.core.prompt_loader import validate_prompt_bundles
 
@@ -13,6 +14,7 @@ configure_logging()
 get_runtime_config()
 get_rag_config()
 validate_prompt_bundles()
+validate_active_provider_credentials()
 
 
 app = FastAPI(

@@ -13,8 +13,10 @@ from app.core.config import AgentModelPolicy
 from app.core.llm import (
     OPENROUTER_BASE_URL,
     ProviderConfigurationError,
+    ProviderRequestError,
     create_chat_model,
     request_structured,
+    validate_active_provider_credentials,
 )
 
 
@@ -195,6 +197,7 @@ def test_openrouter_uses_its_endpoint_and_normalized_reasoning(
     assert request["extra_body"] == {
         "provider": {"require_parameters": True},
         "reasoning": {"effort": "low"},
+        "plugins": [{"id": "response-healing"}],
     }
 
 
@@ -231,6 +234,121 @@ def test_prompt_only_structured_request_omits_unsupported_response_format(
 
     assert result == StructuredAnswer(answer="ok")
     assert "response_format" not in captured["request"]
+    system_message = captured["request"]["messages"][0]
+    assert system_message["role"] == "system"
+    assert "JSON Schema" in system_message["content"]
+
+
+def test_invalid_response_is_retried_with_schema_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+
+    class Completions:
+        async def create(self, **request: Any) -> Any:
+            requests.append(request)
+            if len(requests) == 1:
+                return _completion('{"wrong":"shape"}')
+            return _completion('{"answer":"recovered"}')
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+            self.chat = SimpleNamespace(completions=Completions())
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setattr(llm_module, "AsyncOpenAI", FakeAsyncOpenAI)
+
+    result = asyncio.run(
+        request_structured(
+            policy=_policy(
+                "openrouter",
+                strict_json_schema=False,
+                supports_response_format=False,
+            ),
+            response_model=StructuredAnswer,
+            schema_name="structured_answer",
+            messages=[{"role": "user", "content": "Answer"}],
+        )
+    )
+
+    assert result == StructuredAnswer(answer="recovered")
+    assert len(requests) == 2
+    assert "previous response could not be validated" in requests[1]["messages"][0][
+        "content"
+    ].lower()
+
+
+def test_missing_provider_choices_are_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+
+    class Completions:
+        async def create(self, **request: Any) -> Any:
+            requests.append(request)
+            if len(requests) == 1:
+                return SimpleNamespace(choices=None, id="empty-response")
+            return _completion('{"answer":"recovered"}')
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+            self.chat = SimpleNamespace(completions=Completions())
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setattr(llm_module, "AsyncOpenAI", FakeAsyncOpenAI)
+
+    result = asyncio.run(
+        request_structured(
+            policy=_policy("openrouter"),
+            response_model=StructuredAnswer,
+            schema_name="structured_answer",
+            messages=[{"role": "user", "content": "Answer"}],
+        )
+    )
+
+    assert result == StructuredAnswer(answer="recovered")
+    assert len(requests) == 2
+
+
+def test_rejected_strict_schema_downgrades_to_json_object_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+
+    class BadRequestError(Exception):
+        status_code = 400
+
+    class Completions:
+        async def create(self, **request: Any) -> Any:
+            requests.append(request)
+            if len(requests) == 1:
+                raise BadRequestError("private provider detail")
+            return _completion('{"answer":"recovered"}')
+
+    class FakeAsyncGroq:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+            self.chat = SimpleNamespace(completions=Completions())
+
+    monkeypatch.setenv("GROQ_API_KEY", "groq-secret")
+    monkeypatch.setattr(llm_module, "AsyncGroq", FakeAsyncGroq)
+
+    result = asyncio.run(
+        request_structured(
+            policy=_policy("groq"),
+            response_model=StructuredAnswer,
+            schema_name="structured_answer",
+            messages=[{"role": "user", "content": "Answer"}],
+        )
+    )
+
+    assert result == StructuredAnswer(answer="recovered")
+    assert [
+        request["response_format"]["type"] for request in requests
+    ] == ["json_schema", "json_object"]
+    assert "JSON Schema" in requests[1]["messages"][0]["content"]
 
 
 def test_chat_model_factory_dispatches_from_the_agent_policy(
@@ -272,3 +390,115 @@ def test_only_the_selected_provider_credential_is_required(
 
     with pytest.raises(ProviderConfigurationError, match="OPENROUTER_API_KEY"):
         create_chat_model(_policy("openrouter"))
+
+
+def test_active_provider_credentials_are_validated_at_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GROQ_API_KEY", "groq-secret")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    with pytest.raises(ProviderConfigurationError, match="OPENROUTER_API_KEY"):
+        validate_active_provider_credentials()
+
+
+def test_provider_errors_are_wrapped_without_exposing_sensitive_values(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class RateLimitError(Exception):
+        status_code = 429
+
+    class Completions:
+        async def create(self, **request: Any) -> Any:
+            del request
+            raise RateLimitError("secret-key and private prompt")
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+            self.chat = SimpleNamespace(completions=Completions())
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret-key")
+    monkeypatch.setattr(llm_module, "AsyncOpenAI", FakeAsyncOpenAI)
+
+    with pytest.raises(ProviderRequestError) as error:
+        asyncio.run(
+            request_structured(
+                policy=_policy("openrouter"),
+                response_model=StructuredAnswer,
+                schema_name="structured_answer",
+                messages=[{"role": "user", "content": "private prompt"}],
+            )
+        )
+
+    assert error.value.provider == "openrouter"
+    assert error.value.status_code == 429
+    assert "secret-key" not in caplog.text
+    assert "private prompt" not in caplog.text
+
+
+def test_invalid_provider_output_raises_safe_response_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_count = 0
+
+    class Completions:
+        async def create(self, **request: Any) -> Any:
+            nonlocal call_count
+            del request
+            call_count += 1
+            return _completion("not-json sensitive output")
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+            self.chat = SimpleNamespace(completions=Completions())
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setattr(llm_module, "AsyncOpenAI", FakeAsyncOpenAI)
+
+    with pytest.raises(ProviderRequestError) as error:
+        asyncio.run(
+            request_structured(
+                policy=_policy("openrouter"),
+                response_model=StructuredAnswer,
+                schema_name="structured_answer",
+                messages=[{"role": "user", "content": "Answer"}],
+            )
+        )
+
+    assert error.value.category == "invalid_response"
+    assert call_count == llm_module.MAX_STRUCTURED_ATTEMPTS
+    assert "sensitive output" not in str(error.value)
+
+
+def test_provider_timeout_is_wrapped_as_a_safe_request_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Completions:
+        async def create(self, **request: Any) -> Any:
+            del request
+            raise TimeoutError("private timeout detail")
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+            self.chat = SimpleNamespace(completions=Completions())
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setattr(llm_module, "AsyncOpenAI", FakeAsyncOpenAI)
+
+    with pytest.raises(ProviderRequestError) as error:
+        asyncio.run(
+            request_structured(
+                policy=_policy("openrouter"),
+                response_model=StructuredAnswer,
+                schema_name="structured_answer",
+                messages=[{"role": "user", "content": "Answer"}],
+            )
+        )
+
+    assert error.value.category == "provider_error"
+    assert error.value.status_code is None
+    assert "private timeout detail" not in str(error.value)

@@ -23,12 +23,20 @@ class ApiMessage(BaseModel):
     component: str | None = None
     recoverable: bool | None = None
 
-class AgentModelUsage(BaseModel):
-    """A model assigned to an agent that contributed to a dashboard."""
-
+class AgentModelMetadata(BaseModel):
+    """A configured model assignment safe for public API responses."""
     agent: str = Field(min_length=1)
     model: str = Field(min_length=1)
     provider: str | None = None
+
+
+class AgentModelUsage(AgentModelMetadata):
+    """A model assignment and its dashboard execution outcome."""
+
+    executionStatus: Literal["succeeded", "fallback", "configured"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 class DashboardResponse(BaseModel):
     status: DashboardStatus
@@ -39,7 +47,7 @@ class DashboardResponse(BaseModel):
     pipelineMode: Literal["single", "multi"] | None = None
     model: str | None = None
     agentModels: list[AgentModelUsage] = Field(default_factory=list)
-    chatAgent: AgentModelUsage | None = None
+    chatAgent: AgentModelMetadata | None = None
 
     @model_validator(mode="after")
     def validate_dashboard_response(self) -> "DashboardResponse":
@@ -93,7 +101,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str = Field(min_length=1)
     grounding: str = Field(min_length=1)
-    agentMetadata: AgentModelUsage
+    agentMetadata: AgentModelMetadata
 
 
 class ChatMessage(BaseModel):
@@ -102,7 +110,7 @@ class ChatMessage(BaseModel):
     content: str
     grounded: bool = False
     createdAt: str
-    agentMetadata: AgentModelUsage | None = None
+    agentMetadata: AgentModelMetadata | None = None
 
 
 class ChatHistoryResponse(BaseModel):

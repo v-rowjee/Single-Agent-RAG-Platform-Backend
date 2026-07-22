@@ -78,12 +78,12 @@ The checked-in multi-agent workflow mixes providers by workload:
 | Step / agent | Model | Provider |
 | --- | --- | --- |
 | Data preparation | `openai/gpt-oss-20b` | Groq |
-| Orchestrator | `groq/compound` | Groq |
+| Orchestrator | `openai/gpt-oss-20b` | Groq |
 | KPI and trend analysis | `openai/gpt-oss-120b` | Groq |
 | Anomaly detection | `nvidia/nemotron-3-super-120b-a12b:free` | OpenRouter |
 | Forecasting | `amazon/chronos-2` | Self-hosted |
-| Insight synthesis | `nvidia/nemotron-3-ultra-550b-a55b:free` | OpenRouter |
-| Dashboard generation | `poolside/laguna-xs-2.1:free` | OpenRouter |
+| Insight synthesis | `nvidia/nemotron-3-super-120b-a12b:free` | OpenRouter |
+| Dashboard generation | `nvidia/nemotron-3-super-120b-a12b:free` | OpenRouter |
 | Retrieval embedding | `BAAI/bge-small-en-v1.5` | Self-hosted |
 | Retrieval reranking | `BAAI/bge-reranker-v2-m3` | Self-hosted |
 | Chat | `openai/gpt-oss-120b` | Groq |
@@ -104,11 +104,32 @@ OPENROUTER_API_KEY=your-openrouter-api-key
 
 Changing `provider` does not change the agent prompts, response schemas,
 deterministic validation, fallback behavior, or API contracts.
+Restart the backend after changing `config/agents.toml`; runtime configuration
+is loaded and validated once at process startup. Missing credentials for any
+provider used by the active pipeline also fail startup immediately.
+
+Structured LLM requests make up to three bounded provider attempts. Models
+without native schema enforcement receive the exact JSON Schema in their
+system instruction and retry once a response fails validation. If Groq rejects
+a strict schema with HTTP 400, the retry uses JSON Object Mode with the same
+client-side Pydantic validation. Deterministic agent fallback is used only when
+all provider recovery attempts fail.
+
+To make explicit live requests to every configured OpenRouter model and print
+only safe response metadata, run:
+
+```powershell
+python -m scripts.check_openrouter --confirm-live-request
+```
+
+This smoke check is opt-in, consumes real provider requests, and is never run by
+the automated test suite. Pass `--model <configured-model-id>` to retry or
+check one model without repeating the others.
 
 The multi-agent analysis flow is:
 
 ```text
-Upload -> Generic Cleaning -> Data Preparation -> Compound Orchestrator
+Upload -> Generic Cleaning -> Data Preparation -> LLM Orchestrator
        -> capability-gated KPI/Trend, Anomaly, and Forecast specialists
        -> Specialist Join -> Insight Synthesis
        -> Dashboard Generation ----\

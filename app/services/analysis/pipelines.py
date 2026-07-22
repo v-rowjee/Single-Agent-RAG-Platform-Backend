@@ -152,6 +152,7 @@ class AnalysisPipelineRunner:
                 "completed_agents": [],
                 "failed_agents": [],
                 "skipped_agents": [],
+                "model_invocations": [],
             }
             logger.info("Multi-agent pipeline started session_id=%s", session_id)
             try:
@@ -171,6 +172,7 @@ class AnalysisPipelineRunner:
                         "selected_agents",
                         [],
                     ),
+                    model_invocations=result.get("model_invocations") or [],
                 )
                 workflow = {
                     key: result.get(key)
@@ -181,6 +183,7 @@ class AnalysisPipelineRunner:
                         "synthesis_output", "retrieval_documents", "warnings",
                         "errors", "completed_agents", "failed_agents",
                         "skipped_agents", "workflow_status",
+                        "model_invocations",
                     )
                 }
             except Exception:
@@ -227,6 +230,7 @@ class AnalysisPipelineRunner:
                 "completed_agents": [],
                 "failed_agents": ["business_intelligence"],
                 "skipped_agents": [],
+                "model_invocations": [],
             },
             retrieval_documents=[],
         )

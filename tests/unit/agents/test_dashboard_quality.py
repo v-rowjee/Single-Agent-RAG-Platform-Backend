@@ -11,6 +11,7 @@ from app.agents.multi import dashboard_generation as dashboard_module
 from app.agents.multi import forecasting as forecasting_module
 from app.agents.multi import orchestrator as orchestrator_module
 from app.agents.multi.dashboard_generation import DashboardGenerationAgent
+from app.agents.multi.data_preparation import data_preparation_agent
 from app.agents.multi.forecasting import ForecastingAgent
 from app.agents.multi.insight_synthesis import _fallback as synthesis_fallback
 from app.agents.multi.kpi_trend import KPITrendAgent
@@ -19,6 +20,7 @@ from app.agents.multi.orchestrator import (
     _request_plan,
     build_orchestration_context,
     detect_analysis_capabilities,
+    orchestrator_agent,
 )
 from app.core.config import configured_agent_models
 from app.schemas.orchestration import AgentDecision, OrchestrationPlan
@@ -144,7 +146,9 @@ def test_kpis_use_latest_period_and_percentage_change(
         "app.agents.multi.kpi_trend._request_plan",
         no_llm,
     )
-    result = asyncio.run(KPITrendAgent().run(prepared))
+    result, execution_status = asyncio.run(
+        KPITrendAgent().run_with_status(prepared)
+    )
     revenue = next(item for item in result.kpis if item.measure == "net_revenue_gbp")
 
     assert revenue.current_period == "2024-12"
@@ -157,6 +161,7 @@ def test_kpis_use_latest_period_and_percentage_change(
     )
     assert aggregation_for_measure("discount_pct") == "mean"
     assert result.trends[0].measure == "net_revenue_gbp"
+    assert execution_status == "fallback"
 
 
 def test_multi_year_transaction_history_uses_a_readable_monthly_grain() -> None:
@@ -265,8 +270,8 @@ def test_dashboard_has_non_temporal_charts_forecast_and_actions(
         raise RuntimeError("offline test")
 
     monkeypatch.setattr(dashboard_module, "_request_layout", no_layout)
-    result = asyncio.run(
-        DashboardGenerationAgent().run(
+    result, execution_status = asyncio.run(
+        DashboardGenerationAgent().run_with_status(
             prepared,
             kpi_output,
             {
@@ -301,6 +306,7 @@ def test_dashboard_has_non_temporal_charts_forecast_and_actions(
     )
     assert len(dashboard.recommendedActions) >= 3
     assert dashboard.executiveSummary == dashboard.analysis.businessSummary
+    assert execution_status == "fallback"
 
 
 def test_synthesis_fallback_is_grounded_and_has_three_actions() -> None:
@@ -340,15 +346,20 @@ def test_deterministic_routing_and_active_model_defaults() -> None:
     assert plan.selected_agents == ["kpi_trend", "anomaly_detection", "forecasting"]
     assert configured_agent_models() == {
         "data_preparation": "openai/gpt-oss-20b",
-        "orchestrator": "groq/compound",
+        "orchestrator": "openai/gpt-oss-20b",
         "kpi_trend": "openai/gpt-oss-120b",
         "anomaly_detection": "nvidia/nemotron-3-super-120b-a12b:free",
-        "dashboard_generation": "poolside/laguna-xs-2.1:free",
-        "insight_synthesis": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "dashboard_generation": "nvidia/nemotron-3-super-120b-a12b:free",
+        "insight_synthesis": "nvidia/nemotron-3-super-120b-a12b:free",
         "chat": "openai/gpt-oss-120b",
         "single_dashboard": "nvidia/nemotron-3-ultra-550b-a55b:free",
         "single_chat": "openai/gpt-oss-120b",
     }
+
+
+def test_production_planning_agents_enable_their_llm_calls() -> None:
+    assert data_preparation_agent.enable_llm_enrichment is True
+    assert orchestrator_agent._planner is _request_plan
 
 
 def test_compound_plan_remains_inside_deterministic_capability_gates() -> None:
@@ -426,9 +437,12 @@ def test_compound_failure_uses_deterministic_capability_routing() -> None:
     ) -> OrchestrationPlan:
         raise RuntimeError("413 Request Entity Too Large")
 
-    plan = asyncio.run(OrchestratorAgent(planner=unavailable_planner).run(prepared))
+    plan, execution_status = asyncio.run(
+        OrchestratorAgent(planner=unavailable_planner).run_with_status(prepared)
+    )
 
     assert plan.selected_agents == ["kpi_trend", "anomaly_detection", "forecasting"]
+    assert execution_status == "fallback"
 
 
 def test_orchestration_context_is_metadata_only_and_bounds_samples() -> None:

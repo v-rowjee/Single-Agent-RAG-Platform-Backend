@@ -10,6 +10,10 @@ from typing import Any, TypeAlias
 
 from app.core.config import agent_model_policy
 from app.core.llm import request_structured
+from app.core.model_policy import (
+    ModelExecutionStatus,
+    agent_model_usage,
+)
 from app.core.prompt_loader import render_agent_prompts
 from app.schemas.orchestration import (
     AGENT_ORDER,
@@ -169,7 +173,7 @@ def build_orchestration_context(
     prepared_dataset: dict[str, Any],
     capabilities: dict[str, bool],
 ) -> dict[str, Any]:
-    """Build the bounded metadata-only context used for Compound routing."""
+    """Build the bounded metadata-only context used for model routing."""
     profile = prepared_dataset.get("dataset_profile")
     profile = profile if isinstance(profile, dict) else {}
     raw_columns = profile.get("column_profiles")
@@ -333,7 +337,7 @@ async def _request_plan(
     ]
     payload_size_bytes = orchestration_request_size(messages)
     logger.info(
-        "Compound orchestration request size: %s bytes",
+        "LLM orchestration request size: %s bytes",
         payload_size_bytes,
     )
     max_payload_bytes = _max_orchestration_payload_bytes()
@@ -354,7 +358,7 @@ def _capability_gated_plan(
     proposed: OrchestrationPlan,
     supported_agents: set[AgentName],
 ) -> OrchestrationPlan:
-    """Keep Compound's routing decision inside deterministic capability gates."""
+    """Keep the model's routing decision inside deterministic capability gates."""
     proposed_selected = set(proposed.selected_agents)
     proposed_decisions = {
         decision.agent: decision for decision in proposed.decisions
@@ -406,6 +410,13 @@ class OrchestratorAgent:
         self,
         prepared_dataset: dict[str, Any],
     ) -> OrchestrationPlan:
+        result, _ = await self.run_with_status(prepared_dataset)
+        return result
+
+    async def run_with_status(
+        self,
+        prepared_dataset: dict[str, Any],
+    ) -> tuple[OrchestrationPlan, ModelExecutionStatus]:
         if not isinstance(prepared_dataset, dict):
             raise OrchestratorError(
                 "prepared_dataset must be a dictionary."
@@ -425,35 +436,39 @@ class OrchestratorAgent:
 
         if self._planner is None or not supported_agents:
             result = _deterministic_routing_plan(supported_agents)
+            execution_status: ModelExecutionStatus = "configured"
             logger.info("Deterministic capability routing completed.")
         else:
             try:
                 proposed = await self._planner(routing_context, supported_agents)
                 result = _capability_gated_plan(proposed, supported_agents)
-                logger.info("Compound orchestration completed.")
+                execution_status = "succeeded"
+                logger.info("LLM orchestration completed.")
             except OrchestrationPayloadTooLarge as exc:
                 logger.warning(
-                    "Compound orchestration skipped because the compact request "
+                    "LLM orchestration skipped because the compact request "
                     "was still too large: %s",
                     exc,
                 )
                 result = _deterministic_routing_plan(supported_agents)
+                execution_status = "fallback"
             except Exception as exc:
                 logger.warning(
-                    "Compound orchestration failed; using capability routing: %s",
+                    "LLM orchestration failed; using capability routing: %s",
                     exc,
                 )
                 result = _deterministic_routing_plan(supported_agents)
+                execution_status = "fallback"
 
         logger.info(
             "Selected specialist agents: %s",
             result.selected_agents,
         )
 
-        return result
+        return result, execution_status
 
 
-orchestrator_agent = OrchestratorAgent()
+orchestrator_agent = OrchestratorAgent(planner=_request_plan)
 
 
 async def orchestrator_node(
@@ -466,11 +481,16 @@ async def orchestrator_node(
             "state.prepared_dataset is required."
         )
 
-    result = await orchestrator_agent.run(prepared_dataset)
+    result, execution_status = await orchestrator_agent.run_with_status(
+        prepared_dataset
+    )
 
     return {
         "orchestration_plan": result.model_dump(mode="json"),
         "completed_agents": ["orchestrator"],
+        "model_invocations": [
+            agent_model_usage("orchestrator", execution_status)
+        ],
         "skipped_agents": [
             agent for agent in AGENT_ORDER if agent not in result.selected_agents
         ],

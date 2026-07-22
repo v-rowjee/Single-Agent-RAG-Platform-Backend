@@ -7,6 +7,7 @@ from typing import Any
 
 from app.core.config import Settings
 from app.core.model_policy import (
+    ModelUsage,
     chat_model_usage,
     multi_dashboard_model_usage,
     single_dashboard_model_usage,
@@ -26,6 +27,7 @@ class DashboardAssembler:
         self,
         response: DashboardResponse,
         selected_agents: list[str] | tuple[str, ...] = (),
+        model_invocations: list[ModelUsage] | tuple[ModelUsage, ...] = (),
     ) -> DashboardResponse:
         payload = response.model_dump(mode="json")
         if not response.agentModels and self.settings.bi_pipeline_mode == "single":
@@ -41,7 +43,10 @@ class DashboardAssembler:
             payload.update(
                 {
                     "pipelineMode": "multi",
-                    "agentModels": multi_dashboard_model_usage(selected_agents),
+                    "agentModels": multi_dashboard_model_usage(
+                        selected_agents,
+                        model_invocations,
+                    ),
                 }
             )
         if response.chatAgent is None:

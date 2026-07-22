@@ -65,6 +65,10 @@ def _workflow_status(state: AnalysisState) -> str:
     )
     failed = set(state.get("failed_agents", []))
     completed = set(state.get("completed_agents", []))
+    used_llm_fallback = any(
+        invocation.get("executionStatus") == "fallback"
+        for invocation in state.get("model_invocations", [])
+    )
     chart_types = [chart.type for chart in dashboard.supportingCharts]
     meets_success_shape = (
         4 <= len(dashboard.kpis) <= 8
@@ -88,6 +92,7 @@ def _workflow_status(state: AnalysisState) -> str:
         and selected_complete
         and required_complete
         and not optional_failure
+        and not used_llm_fallback
     ):
         return "success"
     return "partial"

@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from app.core.model_policy import forecasting_model_usage
 from app.schemas.specialists import (
     ForecastDefinition,
     ForecastingOutput,
@@ -196,4 +197,13 @@ async def forecasting_node(state: dict[str, Any]) -> dict[str, Any]:
         result = await forecasting_agent.run(state.get("prepared_dataset", {}))
     except ForecastingError as exc:
         result = ForecastingOutput(limitations=[str(exc)])
-    return {"forecasting_output": result.model_dump(mode="json"), "completed_agents": ["forecasting"]}
+    execution_status = (
+        "succeeded"
+        if result.status == "complete" and result.model == "Chronos-2"
+        else "fallback"
+    )
+    return {
+        "forecasting_output": result.model_dump(mode="json"),
+        "completed_agents": ["forecasting"],
+        "model_invocations": [forecasting_model_usage(execution_status)],
+    }

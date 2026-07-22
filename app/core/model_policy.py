@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import TypedDict
+from typing import Literal, TypedDict
+
+from typing_extensions import NotRequired
 
 from app.core.config import get_runtime_config
 
@@ -13,6 +15,7 @@ class ModelUsage(TypedDict):
     agent: str
     model: str
     provider: str
+    executionStatus: NotRequired[Literal["succeeded", "fallback", "configured"]]
 
 
 _MULTI_AGENT_LABELS = {
@@ -34,6 +37,35 @@ _MULTI_POLICY_KEYS = {
     "dashboard_generation": "dashboard_generation",
 }
 
+ModelExecutionStatus = Literal["succeeded", "fallback", "configured"]
+
+
+def agent_model_usage(
+    agent: str,
+    execution_status: ModelExecutionStatus,
+) -> ModelUsage:
+    """Build safe execution metadata for one configured agent."""
+    policy = get_runtime_config().agents[_MULTI_POLICY_KEYS[agent]]
+    return {
+        "agent": _MULTI_AGENT_LABELS[agent],
+        "model": policy.model,
+        "provider": policy.provider,
+        "executionStatus": execution_status,
+    }
+
+
+def forecasting_model_usage(
+    execution_status: ModelExecutionStatus,
+) -> ModelUsage:
+    """Build execution metadata for the configured forecasting engine."""
+    runtime = get_runtime_config()
+    return {
+        "agent": _MULTI_AGENT_LABELS["forecasting"],
+        "model": runtime.forecasting.model,
+        "provider": "engine",
+        "executionStatus": execution_status,
+    }
+
 
 def single_dashboard_model_usage() -> list[ModelUsage]:
     """Return the configured model that generated a single-agent dashboard."""
@@ -43,6 +75,7 @@ def single_dashboard_model_usage() -> list[ModelUsage]:
             "agent": "Business intelligence",
             "model": policy.model,
             "provider": policy.provider,
+            "executionStatus": "configured",
         }
     ]
 
@@ -60,6 +93,7 @@ def chat_model_usage(pipeline_mode: str) -> ModelUsage:
 
 def multi_dashboard_model_usage(
     selected_agents: Iterable[str],
+    invocations: Iterable[ModelUsage] = (),
 ) -> list[ModelUsage]:
     """Return models for the agents selected for one multi-agent dashboard.
 
@@ -77,14 +111,21 @@ def multi_dashboard_model_usage(
     configured_agents.extend(["insight_synthesis", "dashboard_generation"])
 
     runtime = get_runtime_config()
+    invocation_by_agent = {item["agent"]: item for item in invocations}
     usage: list[ModelUsage] = []
     for agent in configured_agents:
+        label = _MULTI_AGENT_LABELS[agent]
+        invocation = invocation_by_agent.get(label)
+        if invocation is not None:
+            usage.append(invocation)
+            continue
         if agent == "forecasting":
             usage.append(
                 {
-                    "agent": _MULTI_AGENT_LABELS[agent],
+                    "agent": label,
                     "model": runtime.forecasting.model,
                     "provider": "engine",
+                    "executionStatus": "configured",
                 }
             )
             continue
@@ -92,9 +133,10 @@ def multi_dashboard_model_usage(
         policy = runtime.agents[_MULTI_POLICY_KEYS[agent]]
         usage.append(
             {
-                "agent": _MULTI_AGENT_LABELS[agent],
+                "agent": label,
                 "model": policy.model,
                 "provider": policy.provider,
+                "executionStatus": "configured",
             }
         )
 

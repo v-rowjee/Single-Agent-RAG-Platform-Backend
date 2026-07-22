@@ -34,7 +34,7 @@ def test_checked_in_configuration_uses_the_aligned_agent_models() -> None:
         if not name.startswith("single_")
     } == {
         "data_preparation": ("groq", "openai/gpt-oss-20b"),
-        "orchestrator": ("groq", "groq/compound"),
+        "orchestrator": ("groq", "openai/gpt-oss-20b"),
         "kpi_trend": ("groq", "openai/gpt-oss-120b"),
         "anomaly_detection": (
             "openrouter",
@@ -42,11 +42,11 @@ def test_checked_in_configuration_uses_the_aligned_agent_models() -> None:
         ),
         "dashboard_generation": (
             "openrouter",
-            "poolside/laguna-xs-2.1:free",
+            "nvidia/nemotron-3-super-120b-a12b:free",
         ),
         "insight_synthesis": (
             "openrouter",
-            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "nvidia/nemotron-3-super-120b-a12b:free",
         ),
         "chat": ("groq", "openai/gpt-oss-120b"),
     }
@@ -54,8 +54,9 @@ def test_checked_in_configuration_uses_the_aligned_agent_models() -> None:
     assert config.agents["data_preparation"].strict_json_schema is False
     assert config.agents["chat"].timeout_seconds == 15
     assert config.agents["anomaly_detection"].supports_response_format is True
-    assert config.agents["insight_synthesis"].supports_response_format is False
-    assert config.agents["dashboard_generation"].supports_response_format is False
+    assert config.agents["insight_synthesis"].strict_json_schema is True
+    assert config.agents["dashboard_generation"].strict_json_schema is True
+    assert config.agents["dashboard_generation"].timeout_seconds == 60
 
 
 def test_environment_does_not_override_versioned_agent_configuration(monkeypatch) -> None:
@@ -205,6 +206,15 @@ def test_prompt_bundles_validate_and_render_structured_toon() -> None:
             profile={},
             output_schema=PreparationPlan.model_json_schema(mode="serialization"),
         )
+
+
+def test_kpi_prompt_requires_four_grounded_definitions() -> None:
+    prompts = render_agent_prompts("multi/kpi_trend", payload={})
+
+    system = toons.loads(prompts.system, strict=True)
+
+    assert "4 to 8 valid KPI definitions" in system["kpi_coverage"]
+    assert "Never invent columns" in system["kpi_coverage"]
 
 
 def test_single_agent_message_sets_render_structured_toon() -> None:

@@ -35,6 +35,7 @@ class AnalysisState(TypedDict, total=False):
     completed_agents: Annotated[list[str], operator.add]
     failed_agents: Annotated[list[str], operator.add]
     skipped_agents: Annotated[list[str], operator.add]
+    model_invocations: Annotated[list[dict[str, Any]], operator.add]
 
 
 class ChatState(TypedDict, total=False):

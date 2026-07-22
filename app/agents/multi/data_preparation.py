@@ -9,6 +9,7 @@ import pandas as pd
 from app.core.config import AgentProvider, agent_model_policy
 from app.core.exceptions import DataPreparationError
 from app.core.llm import provider_display_name, request_structured
+from app.core.model_policy import agent_model_usage
 from app.core.prompt_loader import render_agent_prompts
 from app.schemas.data_preparation import (
     DatasetProfile,
@@ -222,7 +223,7 @@ class DataPreparationAgent:
         return package
 
 
-data_preparation_agent = DataPreparationAgent()
+data_preparation_agent = DataPreparationAgent(enable_llm_enrichment=True)
 
 
 async def data_preparation_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -277,4 +278,14 @@ async def data_preparation_node(state: dict[str, Any]) -> dict[str, Any]:
         "prepared_dataset": prepared_dataset,
         "warnings": result.warnings,
         "completed_agents": ["data_preparation"],
+        "model_invocations": [
+            agent_model_usage(
+                "data_preparation",
+                (
+                    "fallback"
+                    if result.preparation_report.plan_source == "deterministic"
+                    else "succeeded"
+                ),
+            )
+        ],
     }

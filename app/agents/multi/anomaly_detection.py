@@ -9,6 +9,7 @@ import pandas as pd
 
 from app.core.config import agent_model_policy
 from app.core.llm import request_structured
+from app.core.model_policy import ModelExecutionStatus, agent_model_usage
 from app.core.prompt_loader import render_agent_prompts
 from app.schemas.specialists import (
     AnomalyDefinition,
@@ -234,15 +235,32 @@ def _detect(item: AnomalyDefinition, values: pd.Series, group: str | None = None
 
 class AnomalyDetectionAgent:
     async def run(self, prepared_dataset: dict[str, Any]) -> AnomalyDetectionOutput:
-        if not isinstance(prepared_dataset, dict): raise AnomalyDetectionError("prepared_dataset must be a dictionary.")
+        result, _ = await self.run_with_status(prepared_dataset)
+        return result
+
+    async def run_with_status(
+        self,
+        prepared_dataset: dict[str, Any],
+    ) -> tuple[AnomalyDetectionOutput, ModelExecutionStatus]:
+        if not isinstance(prepared_dataset, dict):
+            raise AnomalyDetectionError("prepared_dataset must be a dictionary.")
         df = pd.read_csv(_path(prepared_dataset), low_memory=False)
         warnings: list[str] = []
         try:
-            proposed = await _request_plan(prepared_dataset); analyses, validation = _validate(proposed, df); warnings.extend(validation)
-            if not analyses: raise AnomalyDetectionError("LLM plan has no valid analyses.")
+            proposed = await _request_plan(prepared_dataset)
+            analyses, validation = _validate(proposed, df)
+            warnings.extend(validation)
+            if not analyses:
+                raise AnomalyDetectionError("LLM plan has no valid analyses.")
             limitations = proposed.limitations
+            execution_status: ModelExecutionStatus = "succeeded"
         except Exception as exc:
-            warnings.append(str(exc)); fallback = _fallback(prepared_dataset, df); analyses, validation = _validate(fallback, df); warnings.extend(validation); limitations = fallback.limitations
+            warnings.append(str(exc))
+            fallback = _fallback(prepared_dataset, df)
+            analyses, validation = _validate(fallback, df)
+            warnings.extend(validation)
+            limitations = fallback.limitations
+            execution_status = "fallback"
         analyses = _ensure_primary_temporal_analysis(
             analyses,
             prepared_dataset,
@@ -253,7 +271,17 @@ class AnomalyDetectionAgent:
             for group, values in _series(df, item):
                 anomalies.extend(_detect(item, values, group))
         anomalies.sort(key=lambda result: (result.severity != "critical", result.severity != "warning", -(abs(result.anomaly_score or result.deviation_percentage or 0))))
-        return AnomalyDetectionOutput(anomalies=anomalies[:MAX_ANOMALIES], warnings=warnings, limitations=[*(prepared_dataset.get("limitations") or []), *limitations])
+        return (
+            AnomalyDetectionOutput(
+                anomalies=anomalies[:MAX_ANOMALIES],
+                warnings=warnings,
+                limitations=[
+                    *(prepared_dataset.get("limitations") or []),
+                    *limitations,
+                ],
+            ),
+            execution_status,
+        )
 
 
 anomaly_detection_agent = AnomalyDetectionAgent()
@@ -261,7 +289,16 @@ anomaly_detection_agent = AnomalyDetectionAgent()
 
 async def anomaly_detection_node(state: dict[str, Any]) -> dict[str, Any]:
     try:
-        result = await anomaly_detection_agent.run(state.get("prepared_dataset", {}))
+        result, execution_status = await anomaly_detection_agent.run_with_status(
+            state.get("prepared_dataset", {})
+        )
     except AnomalyDetectionError as exc:
         result = AnomalyDetectionOutput(status="partial", limitations=[str(exc)])
-    return {"anomaly_output": result.model_dump(mode="json"), "completed_agents": ["anomaly_detection"]}
+        execution_status = "fallback"
+    return {
+        "anomaly_output": result.model_dump(mode="json"),
+        "completed_agents": ["anomaly_detection"],
+        "model_invocations": [
+            agent_model_usage("anomaly_detection", execution_status)
+        ],
+    }
