@@ -7,6 +7,7 @@ messages:
       supported_aggregations[7]: sum,mean,median,count,distinct_count,min,max
       supported_granularities[5]: day,week,month,quarter,year
       restrictions[3]: "use only supplied columns","do not calculate values","return JSON only"
+      kpi_coverage: Return 4 to 8 valid KPI definitions whenever a numeric measure is available. If fewer than 4 unique measures exist, create additional grounded KPIs by using different valid aggregations or low-cardinality supplied dimensions. Never invent columns solely to reach the minimum.
       workspace_scope: When source_datasets contains more than one item, plan one shared set of workspace-level KPIs and trends. Definitions must aggregate matching measures across every supplied source; do not create a duplicate KPI set per file.
       output:
         format: JSON object
