@@ -4,7 +4,7 @@ from typing import Annotated, Any
 from typing_extensions import TypedDict
 
 
-class BusinessIntelligenceState(TypedDict, total=False):
+class AnalysisState(TypedDict, total=False):
     session_id: str
     dataset_id: str
     business_description: str | None
@@ -14,7 +14,6 @@ class BusinessIntelligenceState(TypedDict, total=False):
     working_directory: str
     generic_cleaned_file_path: str
     prepared_file_path: str
-    prepared_temporal_file_path: str | None
 
     generic_cleaning_report: dict[str, Any]
     prepared_dataset: dict[str, Any]
@@ -27,8 +26,6 @@ class BusinessIntelligenceState(TypedDict, total=False):
 
     synthesis_output: dict[str, Any]
     dashboard_output: dict[str, Any]
-    dashboard_layout_plan: dict[str, Any]
-    retrieval_output: dict[str, Any]
     retrieval_documents: list[dict[str, Any]]
 
     workflow_status: str
@@ -38,3 +35,17 @@ class BusinessIntelligenceState(TypedDict, total=False):
     completed_agents: Annotated[list[str], operator.add]
     failed_agents: Annotated[list[str], operator.add]
     skipped_agents: Annotated[list[str], operator.add]
+    model_invocations: Annotated[list[dict[str, Any]], operator.add]
+
+
+class ChatState(TypedDict, total=False):
+    """State exchanged by the guarded retrieval and chat workflow."""
+
+    session_id: str
+    query: str
+    history: list[dict[str, Any]]
+    retrieval_query: str
+    retrieved_documents: list[Any]
+    reranked_documents: list[Any]
+    draft: Any
+    blocked: bool

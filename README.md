@@ -6,6 +6,22 @@
 uvicorn app.main:app --reload
 ```
 
+## Architecture
+
+The backend uses explicit dependency boundaries:
+
+```text
+API routes -> business-intelligence application service
+           -> analysis/chat LangGraph workflows
+           -> agents and deterministic data/forecasting services
+           -> persistence repositories and RAG adapters
+```
+
+HTTP models live in `app/schemas`, agent implementations in `app/agents`,
+workflow composition and node adapters in `app/orchestration`, and external
+storage/model integrations in `app/services` and `app/rag`. Tests mirror these
+boundaries under `tests/unit`, `tests/integration`, and `tests/end_to_end`.
+
 Copy `.env.sample` to `.env` and set the Supabase service-role key. In a new
 Supabase project, create a private Storage bucket named `uploads`, then apply
 `scripts/db.sql` once in the SQL editor before starting the API. The script is a
@@ -50,7 +66,7 @@ and reasoning effort for one LLM invocation. Each LLM agent has one versioned
 TOON bundle in `app/prompts/`; the backend validates the bundle at startup and
 serializes its structured system and user context as TOON before invocation.
 Mode and model settings are deliberately not read from `.env`.
-The multi-agent chat response has a 25-second generation limit. If it expires,
+The multi-agent chat response has a 15-second generation limit. If it expires,
 the API returns already-retrieved recommendation evidence when available.
 The `[forecasting]` table configures the Chronos-2 model and its limits.
 Keep API keys, Supabase credentials, and other secrets in `.env` only.
@@ -62,12 +78,12 @@ The checked-in multi-agent workflow mixes providers by workload:
 | Step / agent | Model | Provider |
 | --- | --- | --- |
 | Data preparation | `openai/gpt-oss-20b` | Groq |
-| Orchestrator | `groq/compound` | Groq |
+| Orchestrator | `openai/gpt-oss-20b` | Groq |
 | KPI and trend analysis | `openai/gpt-oss-120b` | Groq |
 | Anomaly detection | `nvidia/nemotron-3-super-120b-a12b:free` | OpenRouter |
 | Forecasting | `amazon/chronos-2` | Self-hosted |
-| Insight synthesis | `nvidia/nemotron-3-ultra-550b-a55b:free` | OpenRouter |
-| Dashboard generation | `poolside/laguna-xs-2.1:free` | OpenRouter |
+| Insight synthesis | `nvidia/nemotron-3-super-120b-a12b:free` | OpenRouter |
+| Dashboard generation | `nvidia/nemotron-3-super-120b-a12b:free` | OpenRouter |
 | Retrieval embedding | `BAAI/bge-small-en-v1.5` | Self-hosted |
 | Retrieval reranking | `BAAI/bge-reranker-v2-m3` | Self-hosted |
 | Chat | `openai/gpt-oss-120b` | Groq |
@@ -88,11 +104,32 @@ OPENROUTER_API_KEY=your-openrouter-api-key
 
 Changing `provider` does not change the agent prompts, response schemas,
 deterministic validation, fallback behavior, or API contracts.
+Restart the backend after changing `config/agents.toml`; runtime configuration
+is loaded and validated once at process startup. Missing credentials for any
+provider used by the active pipeline also fail startup immediately.
+
+Structured LLM requests make up to three bounded provider attempts. Models
+without native schema enforcement receive the exact JSON Schema in their
+system instruction and retry once a response fails validation. If Groq rejects
+a strict schema with HTTP 400, the retry uses JSON Object Mode with the same
+client-side Pydantic validation. Deterministic agent fallback is used only when
+all provider recovery attempts fail.
+
+To make explicit live requests to every configured OpenRouter model and print
+only safe response metadata, run:
+
+```powershell
+python -m scripts.check_openrouter --confirm-live-request
+```
+
+This smoke check is opt-in, consumes real provider requests, and is never run by
+the automated test suite. Pass `--model <configured-model-id>` to retry or
+check one model without repeating the others.
 
 The multi-agent analysis flow is:
 
 ```text
-Upload -> Generic Cleaning -> Data Preparation -> Compound Orchestrator
+Upload -> Generic Cleaning -> Data Preparation -> LLM Orchestrator
        -> capability-gated KPI/Trend, Anomaly, and Forecast specialists
        -> Specialist Join -> Insight Synthesis
        -> Dashboard Generation ----\
